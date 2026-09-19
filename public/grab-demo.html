@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Holomodel - grab bench</title>
+<!--
+  A bench for public/js/interact: pick the model up, move it, put it down, with no hardware plugged in.
+
+  Run it by serving the REPOSITORY ROOT (so test/fixtures is reachable) and opening /public/grab-demo.html.
+  Serving only public/ also works; the teapot then falls back to a built-in shape.
+  Needs public/vendor/three (npm run vendor).
+
+  Two ways to drive it:
+    mouse  - the pointer is a hand, the left button is the pinch. Tab parks that hand and moves the other, so
+             you can pinch with both and test turn/resize. The wheel pushes the hand in and out.
+    track  - a recorded reach/pinch/lift/carry/drop, replayed through the same jitter, dropouts and lag the
+             real sensors will have. This is the one to tune against: it is the same generator the tests use.
+
+  The scene is in METRES, matching the rig's working volume, so every number on screen is the number in
+  public/js/interact/config.js.
+-->
+<style>
+  :root { --line:#1d3b55; --text:#cfe8ff; --dim:#7fa3bf; --cyan:#35d0ff; --amber:#ffb23e; --green:#7cff9b; --red:#ff6b7a; }
+  html, body { margin:0; height:100%; background:#000; color:var(--text); overflow:hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  canvas { display:block; width:100vw; height:100vh; }
+  .panel { position:fixed; z-index:5; background:rgba(4,10,18,.86); border:1px solid var(--line);
+    border-radius:10px; padding:10px 12px; font-size:12px; backdrop-filter:blur(3px); }
+  #hud { left:10px; top:10px; width:250px; white-space:pre-wrap; font:11.5px/1.5 ui-monospace, Consolas, monospace; }
+  #tune { right:10px; top:10px; width:264px; max-height:calc(100vh - 20px); overflow-y:auto; }
+  #bar { left:50%; bottom:10px; transform:translateX(-50%); display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    justify-content:center; max-width:92vw; }
+  h2 { margin:0 0 6px; font-size:12px; color:var(--cyan); text-transform:uppercase; letter-spacing:.08em; }
+  .row { display:flex; align-items:center; gap:7px; margin:5px 0; }
+  .row label { flex:1 1 auto; color:var(--dim); }
+  .row output { width:52px; text-align:right; font:11px ui-monospace, Consolas, monospace; color:var(--text); }
+  input[type=range] { width:96px; accent-color:var(--cyan); }
+  button { background:#0e2a40; color:var(--text); border:1px solid #2b5a80; border-radius:7px; padding:6px 11px;
+    font-size:12px; cursor:pointer; }
+  button:hover { background:#123551; }
+  button.on { background:#0f4a6e; border-color:var(--cyan); color:#fff; }
+  .k { color:var(--dim); }
+  .ok { color:var(--green); } .warn { color:var(--amber); } .bad { color:var(--red); }
+  small { color:var(--dim); display:block; margin-top:7px; line-height:1.45; }
+  hr { border:0; border-top:1px solid var(--line); margin:9px 0; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+
+<div class="panel" id="hud">loading…</div>
+
+<div class="panel" id="tune">
+  <h2>tuning</h2>
+  <div id="sliders"></div>
+  <hr>
+  <h2>synthetic sensor</h2>
+  <div id="noise"></div>
+  <small id="notes"></small>
+</div>
+
+<div class="panel" id="bar">
+  <button id="m-mouse" class="on">mouse hand</button>
+  <button id="m-track">recorded track</button>
+  <button id="play">replay track</button>
+  <button id="two">2-hand track</button>
+  <button id="reset">reset model</button>
+  <button id="undo">undo</button>
+  <span class="k">Tab: other hand &nbsp; wheel: depth &nbsp; drag: pinch</span>
+</div>
+
+<script type="importmap">
+{ "imports": {
+    "three": "./vendor/three/build/three.module.js",
+    "three/addons/": "./vendor/three/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { createGrab, applyRecord } from './js/interact/grab.js';
+import { GRAB_CONFIG, TUNING_NOTES, cloneConfig } from './js/interact/config.js';
+import { createFeedback } from './js/interact/feedback.js';
+import { bindBody } from './js/interact/bodies.js';
+import { createTracker, demoScript, twoHandScripts, rng, gauss } from './js/interact/track.js';
+import { stepJitter, residualJitter, spread } from './js/interact/replay.js';
+
+// ---------- scene, in metres, sized to the rig's working volume ----------
+const canvas = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+renderer.setClearColor(0x000000, 1);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(34, 1, 0.05, 6);
+camera.position.set(0.02, 0.30, 0.62);
+camera.lookAt(0, 0.13, 0);
+
+const config = cloneConfig(GRAB_CONFIG);
+const V = config.volume;
+
+// Lights: bright and few. On the rig the model has to glow out of black, so a key plus a rim, no ambient wash.
+scene.add(new THREE.HemisphereLight(0x88c8ff, 0x101820, 0.55));
+const key = new THREE.DirectionalLight(0xffffff, 2.2); key.position.set(0.4, 0.8, 0.5); scene.add(key);
+const rim = new THREE.DirectionalLight(0x66ccff, 1.4); rim.position.set(-0.5, 0.2, -0.4); scene.add(rim);
+
+// The working volume, drawn the way the rig needs it: bright marks on black, never a dark grid.
+const guides = new THREE.Group();
+{
+  const mat = new THREE.MeshBasicMaterial({ color: 0x0d3a52, blending: THREE.AdditiveBlending, transparent: true,
+                                            depthWrite: false, toneMapped: false });
+  for (const r of [0.04, 0.08, 0.12]) {
+    const ring = new THREE.Mesh(new THREE.RingGeometry(r, r + 0.0009, 72), mat);
+    ring.rotation.x = -Math.PI / 2; ring.position.y = config.floorY + 0.0004;
+    guides.add(ring);
+  }
+  const post = new THREE.CylinderGeometry(0.0012, 0.0012, V.maxY - V.minY, 6);
+  for (const [x, z] of [[V.minX, V.minZ], [V.maxX, V.minZ], [V.minX, V.maxZ], [V.maxX, V.maxZ]]) {
+    const p = new THREE.Mesh(post, mat);
+    p.position.set(x, (V.minY + V.maxY) / 2, z);
+    guides.add(p);
+  }
+  scene.add(guides);
+}
+
+// ---------- the model ----------
+const GLB_CANDIDATES = ['../test/fixtures/teapot.glb', '/test/fixtures/teapot.glb', './fixtures/teapot.glb', '/fixtures/teapot.glb'];
+const holder = new THREE.Group();
+scene.add(holder);
+let bindings = [], bodies = [], source = 'built-in shape';
+
+// Centre the geometry on the mesh's own origin and scale the mesh to `size`, so the body's pose.position IS the
+// middle of the part. Baking the centring into the geometry (not a wrapper) keeps grab writing straight onto
+// the mesh, which is how the real part registry will hand parts over.
+function fit(mesh, size, at) {
+  mesh.geometry.computeBoundingBox();
+  const box = mesh.geometry.boundingBox;
+  const c = box.getCenter(new THREE.Vector3());
+  mesh.geometry.translate(-c.x, -c.y, -c.z);
+  mesh.geometry.computeBoundingBox();
+  mesh.geometry.computeBoundingSphere();
+  mesh.scale.setScalar(size / Math.max(1e-6, box.getSize(new THREE.Vector3()).length()));
+  mesh.position.copy(at);
+  return mesh;
+}
+
+function makeMaterial(hex, rough = 0.42) {
+  return new THREE.MeshStandardMaterial({ color: hex, roughness: rough, metalness: 0.15 });
+}
+
+async function loadTeapot() {
+  for (const url of GLB_CANDIDATES) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const buf = await res.arrayBuffer();
+      const gltf = await new Promise((ok, no) => new GLTFLoader().parse(buf, '', ok, no));
+      let mesh = null;
+      gltf.scene.traverse(o => { if (o.isMesh && (!mesh || o.geometry.attributes.position.count > mesh.geometry.attributes.position.count)) mesh = o; });
+      if (!mesh) continue;
+      const clean = new THREE.Mesh(mesh.geometry, makeMaterial(0xdfe9f5, 0.35));
+      source = url;
+      return clean;
+    } catch (e) { /* try the next candidate */ }
+  }
+  return new THREE.Mesh(new THREE.TorusKnotGeometry(1, 0.32, 160, 24), makeMaterial(0xdfe9f5, 0.35));
+}
+
+function buildScene(teapot) {
+  holder.clear();          // the parts hang off `holder`; clearing it is enough, nothing else is detached
+  const parts = [
+    { object: fit(teapot, 0.115, new THREE.Vector3(0, 0.145, 0)), id: 'teapot' },
+    // two small extra parts, off to the sides: they are what makes "which one did I mean" testable
+    { object: fit(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), makeMaterial(0x63d6ff)), 0.046, new THREE.Vector3(-0.115, 0.05, 0.05)), id: 'block' },
+    { object: fit(new THREE.Mesh(new THREE.IcosahedronGeometry(1, 2), makeMaterial(0xffc06a)), 0.042, new THREE.Vector3(0.115, 0.05, -0.06)), id: 'bead' },
+  ];
+  bindings = parts.map(p => { holder.add(p.object); return bindBody(p.object, { id: p.id }); });
+  bodies = bindings.map(b => b.body);
+  home = bodies.map(b => structuredClone(b.pose));
+}
+let home = [];
+
+// ---------- grab + feedback ----------
+const grab = createGrab({ config });
+const feedback = createFeedback({ scene, config });
+const flash = [];
+grab.on('grabStart', e => flash.push(`grab ${e.bodyId} (${e.kind})`));
+grab.on('grabEnd', e => flash.push(`drop ${e.bodyId} (${e.reason})`));
+grab.on('settleEnd', e => flash.push(`settled ${e.bodyId}`));
+
+// ---------- hand sources ----------
+const MODES = { mouse: 'mouse', track: 'track' };
+let mode = MODES.mouse;
+let activeHand = 0;
+const noiseRng = rng(1234);
+const mouseHands = [
+  { id: 0, at: new THREE.Vector3(-0.05, 0.12, 0.04), pinch: false, depth: 0, enabled: true },
+  { id: 1, at: new THREE.Vector3(0.05, 0.12, 0.04), pinch: false, depth: 0, enabled: false },
+];
+const noise = { jitterSd: 0.008, lagMs: 150, rateHz: 30, dropEveryMs: 1400, dropForMs: 180, mouseNoise: false };
+
+let tracker = null, trackStart = 0, trackTwo = false;
+function startTrack(two = false) {
+  trackTwo = two;
+  resetModel();            // the scripts aim at the model's home pose, so put it back first
+  const sources = two
+    ? twoHandScripts({ target: { x: 0, y: 0.145, z: 0 } }).map((script, id) => ({ id, script }))
+    : [{ id: 0, script: demoScript({ target: { x: 0, y: 0.145, z: 0 } }) }];
+  tracker = createTracker({
+    sources, rateHz: noise.rateHz, jitterSd: noise.jitterSd, lagMs: noise.lagMs,
+    dropout: noise.dropEveryMs > 0 ? { everyMs: noise.dropEveryMs, forMs: noise.dropForMs } : null,
+    seed: 11,
+  });
+  tracker.reset(performance.now());
+  trackStart = performance.now();
+  mode = MODES.track;
+  setModeButtons();
+}
+
+// a 30 Hz, lagged, jittery view of the mouse, so the mouse hand feels like the real sensor will
+const mouseTrack = { queue: [], next: 0, last: new Map(), t0: 0 };
+function mouseFrames(now) {
+  if (!noise.mouseNoise) {
+    return mouseHands.filter(h => h.enabled)
+      .map(h => handFrame(h.id, h.at, h.pinch ? 0.012 : 0.070, now));
+  }
+  if (!mouseTrack.t0) { mouseTrack.t0 = now; mouseTrack.next = 0; }
+  const period = 1000 / noise.rateHz;
+  while (mouseTrack.t0 + mouseTrack.next <= now) {
+    const t = mouseTrack.t0 + mouseTrack.next;
+    mouseTrack.queue.push({
+      deliverAt: t + noise.lagMs,
+      frames: mouseHands.filter(h => h.enabled).map(h => {
+        const dropped = noise.dropEveryMs > 0 && ((t - mouseTrack.t0) % noise.dropEveryMs) < noise.dropForMs;
+        if (dropped) return null;
+        const g = { x: h.at.x + gauss(noiseRng) * noise.jitterSd, y: h.at.y + gauss(noiseRng) * noise.jitterSd, z: h.at.z + gauss(noiseRng) * noise.jitterSd };
+        return handFrame(h.id, g, h.pinch ? 0.012 : 0.070, 0);
+      }).filter(Boolean),
+    });
+    mouseTrack.next += period;
+  }
+  while (mouseTrack.queue.length && mouseTrack.queue[0].deliverAt <= now) {
+    const q = mouseTrack.queue.shift();
+    for (const f of q.frames) mouseTrack.last.set(f.id, { ...f, seenAt: now });
+  }
+  return [...mouseTrack.last.values()].filter(f => mouseHands[f.id]?.enabled);
+}
+function handFrame(id, grip, gap, now) {
+  const h = gap / 2;
+  return { id, active: true, seenAt: now, thumb: { x: grip.x + h, y: grip.y, z: grip.z }, index: { x: grip.x - h, y: grip.y, z: grip.z } };
+}
+
+// ---------- mouse -> a point in the volume ----------
+const ray = new THREE.Raycaster();
+const plane = new THREE.Plane();
+const ndc = new THREE.Vector2();
+const hit = new THREE.Vector3();
+function moveHandTo(clientX, clientY) {
+  const h = mouseHands[activeHand];
+  ndc.set((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const forward = camera.getWorldDirection(new THREE.Vector3());
+  const anchor = new THREE.Vector3(0, 0.13, 0).addScaledVector(forward, -h.depth);
+  plane.setFromNormalAndCoplanarPoint(forward, anchor);
+  if (ray.ray.intersectPlane(plane, hit)) {
+    h.at.set(THREE.MathUtils.clamp(hit.x, V.minX, V.maxX),
+             THREE.MathUtils.clamp(hit.y, V.minY, V.maxY),
+             THREE.MathUtils.clamp(hit.z, V.minZ, V.maxZ));
+  }
+}
+addEventListener('pointermove', e => { if (mode === MODES.mouse) moveHandTo(e.clientX, e.clientY); });
+addEventListener('pointerdown', e => { if (mode === MODES.mouse && e.target === canvas) mouseHands[activeHand].pinch = true; });
+addEventListener('pointerup', () => { mouseHands[activeHand].pinch = false; });
+addEventListener('wheel', e => {
+  if (mode !== MODES.mouse) return;
+  const h = mouseHands[activeHand];
+  h.depth = THREE.MathUtils.clamp(h.depth - e.deltaY * 0.00012, -0.14, 0.14);
+}, { passive: true });
+addEventListener('keydown', e => {
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    activeHand = 1 - activeHand;
+    mouseHands[activeHand].enabled = true;
+    return;
+  }
+  if (e.key === '1') mouseHands[1].enabled = !mouseHands[1].enabled;
+  if (e.key === ' ') { e.preventDefault(); mouseHands[activeHand].pinch = !mouseHands[activeHand].pinch; }
+  if (e.key === 'r') resetModel();
+  if (e.key === 'u') undo();
+});
+
+// ---------- controls ----------
+const SLIDERS = [
+  ['pinchOn', 0.010, 0.050, 0.001, 1000, 'mm'],
+  ['pinchOff', 0.012, 0.060, 0.001, 1000, 'mm'],
+  ['grabRadius', 0.02, 0.15, 0.005, 1000, 'mm'],
+  ['dropoutMs', 0, 600, 10, 1, 'ms'],
+  ['releaseLagMs', 0, 300, 10, 1, 'ms'],
+  ['holdFollowHz', 0, 30, 0.5, 1, 'Hz'],
+  ['holdDeadband', 0, 0.006, 0.0002, 1000, 'mm'],
+  ['intentMs', 0, 900, 20, 1, 'ms'],
+  ['settleGravity', 0, 9.81, 0.1, 1, 'm/s2'],
+  ['throwGain', 0, 1, 0.05, 1, ''],
+];
+const NOISE_SLIDERS = [
+  ['jitterSd', 0, 0.025, 0.001, 1000, 'mm'],
+  ['lagMs', 0, 300, 10, 1, 'ms'],
+  ['rateHz', 10, 60, 5, 1, 'Hz'],
+  ['dropForMs', 0, 400, 20, 1, 'ms'],
+];
+function buildSliders(host, spec, get, set) {
+  host.innerHTML = '';
+  for (const [key, lo, hi, step, mul, unit] of spec) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<label>${key}</label><input type=range min=${lo} max=${hi} step=${step}><output></output>`;
+    const input = row.querySelector('input'), out = row.querySelector('output');
+    const show = () => { input.value = get(key); out.textContent = `${(get(key) * mul).toFixed(mul > 1 ? 1 : 2)}${unit}`; };
+    input.addEventListener('input', () => { set(key, Number(input.value)); show(); });
+    show();
+    host.appendChild(row);
+  }
+}
+buildSliders(document.getElementById('sliders'), SLIDERS, k => config[k], (k, v) => { config[k] = v; });
+buildSliders(document.getElementById('noise'), NOISE_SLIDERS, k => noise[k], (k, v) => {
+  noise[k] = v;
+  if (tracker) { tracker.jitterSd = noise.jitterSd; tracker.lagMs = noise.lagMs;
+                 tracker.dropout = noise.dropForMs > 0 ? { everyMs: noise.dropEveryMs, forMs: noise.dropForMs } : null; }
+  mouseTrack.queue.length = 0;
+});
+document.getElementById('notes').textContent =
+  'What matters most, from the research pass:\n' +
+  TUNING_NOTES.filter(n => n[1] === 'critical').map(n => `- ${n[0]}`).join('\n');
+
+const setModeButtons = () => {
+  document.getElementById('m-mouse').classList.toggle('on', mode === MODES.mouse);
+  document.getElementById('m-track').classList.toggle('on', mode === MODES.track);
+};
+document.getElementById('m-mouse').onclick = () => { mode = MODES.mouse; setModeButtons(); };
+document.getElementById('m-track').onclick = () => startTrack(false);
+document.getElementById('play').onclick = () => startTrack(trackTwo);
+document.getElementById('two').onclick = () => startTrack(true);
+document.getElementById('reset').onclick = () => resetModel();
+document.getElementById('undo').onclick = () => undo();
+
+function resetModel() {
+  grab.reset();
+  bodies.forEach((b, i) => { b.pose = structuredClone(home[i]); bindings[i].apply(); });
+  flash.push('reset');
+}
+function undo() {
+  const rec = grab.undos.pop();
+  if (!rec) { flash.push('nothing to undo'); return; }
+  const i = bodies.findIndex(b => b.id === rec.bodyId);
+  if (i < 0) return;
+  applyRecord(bodies[i], rec, 'undo');
+  bindings[i].apply();
+  flash.push(`undo ${rec.bodyId}`);
+}
+
+// ---------- the loop ----------
+const heldTrail = [];
+let last = performance.now(), state = null, fps = 60;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  fps += ((1 / Math.max(1e-3, dt)) - fps) * 0.08;
+
+  const hands = mode === MODES.track && tracker ? tracker.poll(now) : mouseFrames(now);
+  state = grab.update({ hands, bodies, now });
+  for (const b of bindings) b.apply();
+  feedback.update({ state, bodies, camera, dt });
+
+  // measured output jitter of whatever is held, over the last ~1.5 s
+  const heldId = state.holds[0]?.bodyId;
+  const body = heldId && bodies.find(b => b.id === heldId);
+  if (body) heldTrail.push({ ...body.pose.position }); else heldTrail.length = 0;
+  while (heldTrail.length > 90) heldTrail.shift();
+
+  renderer.render(scene, camera);
+  if (now - lastHud > 100) { drawHud(now); lastHud = now; }
+}
+let lastHud = 0;
+
+function drawHud(now) {
+  const j = residualJitter(heldTrail), step = stepJitter(heldTrail), s = spread(heldTrail);
+  const mm = v => (v * 1000).toFixed(1);
+  const cls = v => (v < 1.5 ? 'ok' : v < 3 ? 'warn' : 'bad');
+  const lines = [];
+  lines.push(`<b style="color:var(--cyan)">${mode === MODES.track ? 'recorded track' : 'mouse hand'}</b>  ${fps.toFixed(0)} fps`);
+  if (mode === MODES.track && tracker) {
+    const t = now - trackStart;
+    const held = (state?.holds || []).length > 0;
+    lines.push(`t ${(t / 1000).toFixed(2)}s  ${held ? 'holding' : t < 1200 ? 'reaching' : 'let go'}`);
+  }
+  lines.push(`model: ${source.split('/').pop()}`);
+  lines.push('');
+  for (const h of state?.hands || []) {
+    const tag = h.holdId ? `holding ${h.holdId}` : h.hoverId ? `over ${h.hoverId}` : '-';
+    lines.push(`hand ${h.id} ${h.live ? (h.pinched ? 'PINCH' : 'open ') : 'LOST '} gap ${isFinite(h.gap) ? mm(h.gap) : ' inf'}mm  ${tag}`);
+  }
+  lines.push('');
+  lines.push(`shake   <span class="${cls(j.rms * 1000)}">${mm(j.rms)} mm</span> rms  (travel removed)`);
+  lines.push(`step    ${mm(step.rms)} mm/frame, ${mm(step.max)} worst`);
+  lines.push(`undo records ${grab.undos.length}`);
+  lines.push('');
+  lines.push(flash.slice(-4).map(f => `<span class="k">${f}</span>`).join('\n'));
+  document.getElementById('hud').innerHTML = lines.join('\n');
+}
+
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+
+// ---------- test hooks (used by the headless check) ----------
+window.__grab = {
+  grab, config, noise,
+  get bodies() { return bodies; },
+  get state() { return state; },
+  get source() { return source; },
+  setMode: m => { mode = m === 'track' ? MODES.track : MODES.mouse; setModeButtons(); },
+  play: (two = false) => startTrack(two),
+  trackMs: () => (mode === MODES.track ? performance.now() - trackStart : -1),
+  setHand(id, p, pinch) {
+    mode = MODES.mouse; setModeButtons();
+    mouseHands[id].enabled = true;
+    mouseHands[id].at.set(p.x, p.y, p.z);
+    mouseHands[id].pinch = !!pinch;
+  },
+  stats: () => ({
+    mode, source,
+    held: (state?.holds || []).map(h => ({ body: h.bodyId, kind: h.kind, hands: h.handIds })),
+    hands: (state?.hands || []).map(h => ({ id: h.id, live: h.live, pinched: h.pinched, hover: h.hoverId, hold: h.holdId })),
+    poses: bodies.map(b => ({ id: b.id, y: +b.pose.position.y.toFixed(4), x: +b.pose.position.x.toFixed(4), z: +b.pose.position.z.toFixed(4), scale: +b.pose.scale.toFixed(3) })),
+    shakeMm: +(residualJitter(heldTrail).rms * 1000).toFixed(2),
+    stepMm: +(stepJitter(heldTrail).rms * 1000).toFixed(2),
+    undos: grab.undos.length,
+  }),
+  ready: false,
+};
+
+buildScene(new THREE.Mesh(new THREE.TorusKnotGeometry(1, 0.32, 160, 24), makeMaterial(0xdfe9f5, 0.35)));
+requestAnimationFrame(frame);
+loadTeapot().then(m => { buildScene(m); window.__grab.ready = true; });
+</script>
+</body>
+</html>

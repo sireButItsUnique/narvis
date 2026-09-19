@@ -31,16 +31,30 @@ Third-party code in this repository or served by the app:
   least-squares similarity fit (IEEE PAMI 1991), the 1 euro filter (Casiez, Roussel & Vogel, CHI 2012) and
   Kooima's generalised perspective projection for the off-axis frustum. No third-party source is included.
 
-- The pinch thresholds in public/js/track/landmarks.js, public/js/input/cameras.js and
-  public/js/interact/config.js (25 mm to close, 30 mm to open, with hysteresis) are the published defaults
-  of Ultraleap's PinchDetector, from the Ultraleap Unity Plugin (https://github.com/ultraleap/UnityPlugin),
-  Apache License 2.0, Copyright Ultraleap Ltd. They are cited parameters, not code; no Ultraleap source is
-  used.
+- Ultraleap Unity Plugin (https://github.com/ultraleap/UnityPlugin), Apache License 2.0, Copyright Ultraleap
+  Ltd. No code is copied; only published parameters are reused, and Apache-2.0 is GPL-3.0 compatible. The
+  pinch thresholds in public/js/track/landmarks.js, public/js/input/cameras.js and
+  public/js/interact/config.js (25 mm to close, 30 mm to open, with hysteresis) are the shipped defaults of
+  PinchDetector.cs, and the grab thresholds in public/js/interact/config.js are read from
+  GrabHelperObject.cs (THOWN_GRAB_COOLDOWNTIME 0.5 s, VELOCITY_HISTORY_LENGTH 45 ms, MAX_VELOCITY_SQUARED
+  100, and the 0.85 stickiness factor on a finger that is already pinching).
 
-- The ZED calibration file format read by parseZedConf() in public/js/track/calibrate.js is documented by
-  Stereolabs (https://support.stereolabs.com), and the file itself is data Stereolabs supplies per camera
-  serial. No part of the proprietary ZED SDK is used or linked: the optional bridge is a separate process
-  that sends plain numbers over a socket, so this GPL-3.0 code never links against it.
+- The 1 Euro filter in public/js/interact/math.js implements Casiez, Roussel and Vogel, "1 Euro Filter: A
+  Simple Speed-based Low-pass Filter for Noisy Input in Interactive Systems", CHI 2012, from the paper. The
+  speedFloor term is ours, not theirs.
+
+- The anchor in public/js/interact/grab.js follows the idea in Hilliges, Kim, Izadi, Weiss and Wilson,
+  "HoloDesk: Direct 3D Interactions with a Situated See-Through Display", CHI 2012 - a kinematic proxy the
+  tracker drives and a dynamic body springed to it - reduced to fingertip proxies, which that paper's
+  Limitations section explicitly sanctions where only sparse tracking is available. No code was available to
+  copy; there is no open implementation.
+
+- The ZED calibration file format read by parseZedConf() in public/js/track/calibrate.js and
+  public/js/input/stereo.js is documented by Stereolabs (https://support.stereolabs.com), and the file
+  itself is data Stereolabs supplies per camera serial. No part of the proprietary ZED SDK is used or
+  linked: the optional bridge is a separate process that sends plain numbers over a socket, so this GPL-3.0
+  code never links against it.
+
 - tools/zed-bridge/ is a standalone helper program, not part of the app. When it is run against a real
   camera it imports the Stereolabs ZED SDK Python bindings (pyzed) and, in its default mode, MediaPipe's
   Python package (Apache License 2.0). The ZED SDK is proprietary and is NOT distributed here; the bridge
