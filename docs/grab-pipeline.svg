@@ -1,0 +1,190 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 900" width="1280" height="900" font-family="Segoe UI, system-ui, sans-serif">
+<defs>
+  <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#4e7fa0"/>
+  </marker>
+  <marker id="ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#35d0ff"/>
+  </marker>
+  <marker id="aw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#ffb23e"/>
+  </marker>
+  <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#ff6b7a"/>
+  </marker>
+</defs>
+
+<rect width="1280" height="900" fill="#04060b"/>
+
+<text x="34" y="44" fill="#35d0ff" font-size="22" font-weight="600">Picking the model up, moving it, putting it down</text>
+<text x="34" y="66" fill="#7fa3bf" font-size="13">public/js/interact — what happens between a noisy pair of fingertips and a model that feels solid. Lengths in millimetres; defaults from config.js.</text>
+
+<!-- ============ ROW 1: the pipeline ============ -->
+<text x="34" y="106" fill="#7fa3bf" font-size="11.5" letter-spacing="1.6">THE FRAME, LEFT TO RIGHT — grab.js update({ hands, bodies, now })</text>
+
+<g font-size="12">
+  <rect x="34" y="120" width="192" height="118" rx="9" fill="#08131f" stroke="#1d3b55"/>
+  <text x="48" y="142" fill="#35d0ff" font-size="12.5" font-weight="600">1 · sensor</text>
+  <text x="48" y="163" fill="#cfe8ff">ZED pair → MediaPipe</text>
+  <text x="48" y="181" fill="#cfe8ff">landmark 4 (thumb tip)</text>
+  <text x="48" y="199" fill="#cfe8ff">landmark 8 (index tip)</text>
+  <text x="48" y="221" fill="#7fa3bf">per hand, rig metres, 30 Hz</text>
+
+  <rect x="248" y="120" width="184" height="118" rx="9" fill="#08131f" stroke="#1d3b55"/>
+  <text x="262" y="142" fill="#35d0ff" font-size="12.5" font-weight="600">2 · smooth the hand</text>
+  <text x="262" y="163" fill="#cfe8ff">1 Euro, driven by 3D speed</text>
+  <text x="262" y="181" fill="#cfe8ff">holding: 0.8 Hz, β 12</text>
+  <text x="262" y="199" fill="#cfe8ff">pointing: 1.2 Hz, β 40</text>
+  <text x="262" y="221" fill="#ffb23e">+ speedFloor 0.10 m/s</text>
+
+  <rect x="454" y="120" width="184" height="118" rx="9" fill="#08131f" stroke="#1d3b55"/>
+  <text x="468" y="142" fill="#35d0ff" font-size="12.5" font-weight="600">3 · is it a pinch?</text>
+  <text x="468" y="163" fill="#cfe8ff">close under 25 mm</text>
+  <text x="468" y="181" fill="#cfe8ff">open over 30 mm</text>
+  <text x="468" y="199" fill="#cfe8ff">hold 40 ms / 60 ms</text>
+  <text x="468" y="221" fill="#7fa3bf">once closed: gap × 0.85</text>
+
+  <rect x="660" y="120" width="184" height="118" rx="9" fill="#08131f" stroke="#1d3b55"/>
+  <text x="674" y="142" fill="#35d0ff" font-size="12.5" font-weight="600">4 · which part?</text>
+  <text x="674" y="163" fill="#cfe8ff">nearest within 70 mm</text>
+  <text x="674" y="181" fill="#cfe8ff">of the pinch point —</text>
+  <text x="674" y="199" fill="#cfe8ff">but from 400 ms ago,</text>
+  <text x="674" y="221" fill="#7fa3bf">before the fingers moved</text>
+
+  <rect x="866" y="120" width="184" height="118" rx="9" fill="#08131f" stroke="#1d3b55"/>
+  <text x="880" y="142" fill="#35d0ff" font-size="12.5" font-weight="600">5 · carry it</text>
+  <text x="880" y="163" fill="#cfe8ff">keep the offset it had</text>
+  <text x="880" y="181" fill="#cfe8ff">deadband 1.5 mm</text>
+  <text x="880" y="199" fill="#cfe8ff">spring 9 Hz, no overshoot</text>
+  <text x="880" y="221" fill="#7fa3bf">clamped to the volume</text>
+
+  <rect x="1072" y="120" width="164" height="118" rx="9" fill="#0a1a12" stroke="#2c5f3f"/>
+  <text x="1086" y="142" fill="#7cff9b" font-size="12.5" font-weight="600">6 · out</text>
+  <text x="1086" y="163" fill="#cfe8ff">pose → the part</text>
+  <text x="1086" y="181" fill="#cfe8ff">grabStart/Move/End</text>
+  <text x="1086" y="199" fill="#cfe8ff">one undo record</text>
+  <text x="1086" y="221" fill="#7fa3bf">feedback.js draws it</text>
+
+  <g stroke="#4e7fa0" stroke-width="1.6" marker-end="url(#a)" fill="none">
+    <path d="M228,179 L246,179"/><path d="M434,179 L452,179"/>
+    <path d="M640,179 L658,179"/><path d="M846,179 L864,179"/><path d="M1052,179 L1070,179"/>
+  </g>
+</g>
+
+<!-- ============ ROW 2: the three things that break it ============ -->
+<text x="34" y="292" fill="#7fa3bf" font-size="11.5" letter-spacing="1.6">WHAT THE SENSORS ACTUALLY DO TO US, AND THE ANSWER TO EACH</text>
+
+<g font-size="12">
+  <rect x="34" y="306" width="392" height="140" rx="9" fill="#150a0e" stroke="#4a2430"/>
+  <text x="50" y="330" fill="#ff6b7a" font-size="13" font-weight="600">the hand shakes — 8 mm of jitter at 30 Hz</text>
+  <text x="50" y="352" fill="#cfe8ff">Plain 1 Euro reads its own noise as speed and opens</text>
+  <text x="50" y="370" fill="#cfe8ff">the cutoff exactly when the hand is still. speedFloor</text>
+  <text x="50" y="388" fill="#cfe8ff">subtracts that first; the deadband eats the last</text>
+  <text x="50" y="406" fill="#cfe8ff">millimetre; the spring stops per-frame stepping.</text>
+  <text x="50" y="432" fill="#7cff9b" font-size="12.5">⇒ measured: 1.1 mm of shake on a held model</text>
+
+  <rect x="442" y="306" width="392" height="140" rx="9" fill="#150a0e" stroke="#4a2430"/>
+  <text x="458" y="330" fill="#ff6b7a" font-size="13" font-weight="600">the hand vanishes — a few frames at a time</text>
+  <text x="458" y="352" fill="#cfe8ff">Releasing every time the tracker blinks is the single</text>
+  <text x="458" y="370" fill="#cfe8ff">worst failure, and no threshold fixes it. The grab</text>
+  <text x="458" y="388" fill="#cfe8ff">survives 200 ms, keeps its offset, and re-seeds the</text>
+  <text x="458" y="406" fill="#cfe8ff">filter from the last FILTERED point, never a raw one.</text>
+  <text x="458" y="432" fill="#7cff9b" font-size="12.5">⇒ 5 dropouts through a carry: 3 mm of slip, 0 drops</text>
+
+  <rect x="850" y="306" width="386" height="140" rx="9" fill="#150a0e" stroke="#4a2430"/>
+  <text x="866" y="330" fill="#ff6b7a" font-size="13" font-weight="600">the fingers flick as they open — 40-60 mm</text>
+  <text x="866" y="352" fill="#cfe8ff">The pinch midpoint lurches while the gap is still</text>
+  <text x="866" y="370" fill="#cfe8ff">under the threshold, so "100 ms ago" is too late.</text>
+  <text x="866" y="388" fill="#cfe8ff">Release rolls back to 50 ms before the pinch was</text>
+  <text x="866" y="406" fill="#cfe8ff">last FIRMLY shut, and throws from there.</text>
+  <text x="866" y="432" fill="#7cff9b" font-size="12.5">⇒ 62 mm of flick becomes under 12 mm of drift</text>
+</g>
+
+<!-- ============ ROW 3 left: the state machine ============ -->
+<text x="34" y="486" fill="#7fa3bf" font-size="11.5" letter-spacing="1.6">ONE HAND'S STATE MACHINE</text>
+
+<g font-size="11.5">
+  <rect x="250" y="500" width="128" height="52" rx="26" fill="#1c1408" stroke="#ffb23e"/>
+  <text x="314" y="525" fill="#ffb23e" font-size="13" text-anchor="middle">holding</text>
+  <text x="314" y="542" fill="#b58a4e" text-anchor="middle">two hands</text>
+
+  <rect x="40" y="592" width="128" height="52" rx="26" fill="#08131f" stroke="#2b5a80"/>
+  <text x="104" y="617" fill="#cfe8ff" font-size="13" text-anchor="middle">open</text>
+  <text x="104" y="634" fill="#7fa3bf" text-anchor="middle">hovering, aiming</text>
+
+  <rect x="250" y="592" width="128" height="52" rx="26" fill="#1c1408" stroke="#ffb23e"/>
+  <text x="314" y="617" fill="#ffb23e" font-size="13" text-anchor="middle">holding</text>
+  <text x="314" y="634" fill="#b58a4e" text-anchor="middle">one hand</text>
+
+  <rect x="490" y="592" width="128" height="52" rx="26" fill="#08131f" stroke="#2b5a80"/>
+  <text x="554" y="617" fill="#cfe8ff" font-size="13" text-anchor="middle">settling</text>
+  <text x="554" y="634" fill="#7fa3bf" text-anchor="middle">falling to the table</text>
+
+  <g fill="none" stroke-width="1.7">
+    <path d="M168,618 L246,618" stroke="#ffb23e" marker-end="url(#aw)"/>
+    <path d="M378,618 L486,618" stroke="#35d0ff" marker-end="url(#ac)"/>
+    <path d="M300,590 L300,556" stroke="#ffb23e" marker-end="url(#aw)"/>
+    <path d="M330,556 L330,590" stroke="#35d0ff" marker-end="url(#ac)"/>
+    <path d="M282,646 C266,694 362,694 346,648" stroke="#ff6b7a" marker-end="url(#ar)"/>
+    <path d="M554,646 L554,672" stroke="#4e7fa0" marker-end="url(#a)"/>
+  </g>
+
+  <text x="207" y="606" fill="#ffb23e" text-anchor="middle">gap &lt; 25 mm</text>
+  <text x="192" y="662" fill="#b58a4e" text-anchor="middle">for 40 ms, on</text>
+  <text x="192" y="677" fill="#b58a4e" text-anchor="middle">the part it meant</text>
+
+  <text x="432" y="606" fill="#35d0ff" text-anchor="middle">gap × 0.85 &gt; 30 mm</text>
+  <text x="432" y="662" fill="#4e7fa0" text-anchor="middle">for 60 ms — or the</text>
+  <text x="432" y="677" fill="#4e7fa0" text-anchor="middle">hand is gone 200 ms</text>
+
+  <text x="292" y="574" fill="#b58a4e" text-anchor="end">the other hand</text>
+  <text x="292" y="588" fill="#b58a4e" text-anchor="end">joins</text>
+  <text x="340" y="574" fill="#4e7fa0">one lets go —</text>
+  <text x="340" y="588" fill="#4e7fa0">no jump either way</text>
+
+  <text x="314" y="714" fill="#ff6b7a" text-anchor="middle">hand lost under 200 ms:</text>
+  <text x="314" y="729" fill="#ff6b7a" text-anchor="middle">nothing changes at all</text>
+
+  <text x="554" y="690" fill="#7fa3bf" text-anchor="middle">back to open — and that hand</text>
+  <text x="554" y="705" fill="#7fa3bf" text-anchor="middle">is locked out of that part 500 ms</text>
+</g>
+
+<!-- ============ ROW 3 right: two hands, and what you see ============ -->
+<text x="672" y="486" fill="#7fa3bf" font-size="11.5" letter-spacing="1.6">BOTH HANDS ON ONE PART</text>
+<g font-size="12">
+  <rect x="672" y="500" width="278" height="150" rx="9" fill="#08131f" stroke="#1d3b55"/>
+  <text x="688" y="524" fill="#cfe8ff">Anchored on the pose at the moment the</text>
+  <text x="688" y="542" fill="#cfe8ff">second hand arrives, so nothing jumps:</text>
+  <text x="688" y="568" fill="#ffb23e" font-size="11.5" font-family="ui-monospace, Consolas, monospace">R = rotation(axis₀ → axis)</text>
+  <text x="688" y="587" fill="#ffb23e" font-size="11.5" font-family="ui-monospace, Consolas, monospace">k = span / span₀  (2% deadband)</text>
+  <text x="688" y="606" fill="#ffb23e" font-size="11.5" font-family="ui-monospace, Consolas, monospace">pos = mid + k·R·(pos₀ − mid₀)</text>
+  <text x="688" y="625" fill="#ffb23e" font-size="11.5" font-family="ui-monospace, Consolas, monospace">quat = R·quat₀   scale = k·s₀</text>
+  <text x="688" y="644" fill="#7fa3bf">Hands under 50 mm apart: hold the last turn.</text>
+</g>
+
+<text x="972" y="486" fill="#7fa3bf" font-size="11.5" letter-spacing="1.6">WHAT YOU SEE, ON A BLACK RIG</text>
+<g font-size="12">
+  <rect x="972" y="500" width="264" height="228" rx="9" fill="#08131f" stroke="#1d3b55"/>
+  <text x="988" y="524" fill="#ff6b7a" font-size="12.5">A shadow is impossible here.</text>
+  <text x="988" y="544" fill="#cfe8ff">The acrylic reflects 4-5%, so black is</text>
+  <text x="988" y="562" fill="#cfe8ff">transparent — you cannot draw darker</text>
+  <text x="988" y="580" fill="#cfe8ff">than nothing. Every cue is bright,</text>
+  <text x="988" y="598" fill="#cfe8ff">additive and chunky:</text>
+  <circle cx="996" cy="620" r="3.4" fill="#35d0ff"/>
+  <text x="1010" y="624" fill="#cfe8ff">rim glow on the part you are over</text>
+  <circle cx="996" cy="644" r="3.4" fill="#dff2ff"/>
+  <text x="1010" y="648" fill="#cfe8ff">a ring that closes as you pinch</text>
+  <circle cx="996" cy="668" r="3.4" fill="#ffb23e"/>
+  <text x="1010" y="672" fill="#cfe8ff">a ground ring + stem for height,</text>
+  <text x="1010" y="688" fill="#cfe8ff">spreading and dimming as it rises</text>
+  <circle cx="996" cy="708" r="3.4" fill="#ffb23e"/>
+  <text x="1010" y="712" fill="#cfe8ff">one 4% pulse on grab, never a blink</text>
+</g>
+
+<!-- footer -->
+<line x1="34" y1="762" x2="1236" y2="762" stroke="#1d3b55"/>
+<text x="34" y="788" fill="#7fa3bf" font-size="12">No hardware needed to try any of this: <tspan fill="#cfe8ff">public/grab-demo.html</tspan> drives it from the mouse or from a recorded track carrying the same jitter, dropouts</text>
+<text x="34" y="808" fill="#7fa3bf" font-size="12">and lag, and <tspan fill="#cfe8ff">test/grab-*.test.js</tspan> asserts every number on this page under <tspan fill="#cfe8ff">node --test</tspan>. The knobs, and what each is worth, are in <tspan fill="#cfe8ff">public/js/interact/config.js</tspan>.</text>
+<text x="34" y="838" fill="#4e7fa0" font-size="11">Pinch thresholds, re-grab lockout, throw window and speed clamp are Ultraleap's shipped defaults (UnityPlugin, Apache-2.0). The kinematic/dynamic idea behind the anchor</text>
+<text x="34" y="856" fill="#4e7fa0" font-size="11">is HoloDesk's (Hilliges et al., CHI 2012), reduced to fingertip proxies — which that paper explicitly sanctions when only sparse tracking is available.</text>
+</svg>

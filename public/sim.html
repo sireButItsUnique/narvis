@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Holomodel rig simulator</title>
+<style>
+  :root { --bg:#04060b; --panel:#07111c; --line:#1d3b55; --text:#cfe8ff; --dim:#7fa3bf;
+          --cyan:#35d0ff; --amber:#ffb23e; --green:#7cff9b; --red:#ff6b7a; --violet:#b58bff; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); overflow:hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #app { display:flex; height:100vh; }
+  #left { position:relative; flex:1 1 auto; min-width:0; }
+  canvas#scene { display:block; width:100%; height:100%; cursor:grab; }
+  canvas#scene:active { cursor:grabbing; }
+  #hint { position:absolute; left:12px; bottom:12px; font:12px/1.5 ui-monospace, Consolas, monospace;
+    color:var(--dim); background:rgba(4,6,11,.72); border:1px solid var(--line); border-radius:8px; padding:7px 10px; }
+  #legend { position:absolute; left:12px; top:12px; font:12px/1.7 ui-monospace, Consolas, monospace;
+    color:var(--dim); background:rgba(4,6,11,.72); border:1px solid var(--line); border-radius:8px; padding:7px 10px; }
+  #legend i { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:6px; vertical-align:middle; }
+  #panel { flex:0 0 360px; overflow-y:auto; background:var(--panel); border-left:1px solid var(--line); padding:14px 16px; }
+  h1 { margin:0 0 2px; font-size:17px; color:var(--cyan); letter-spacing:.2px; }
+  h2 { margin:18px 0 8px; font-size:12px; color:var(--cyan); text-transform:uppercase; letter-spacing:.9px;
+    border-bottom:1px solid var(--line); padding-bottom:5px; }
+  p.sub { margin:0 0 4px; font-size:12px; color:var(--dim); line-height:1.5; }
+  .row { display:flex; align-items:center; gap:8px; margin:7px 0; }
+  .row label { flex:1 1 auto; font-size:12px; color:var(--dim); }
+  .row output { flex:0 0 66px; text-align:right; font:12px ui-monospace, Consolas, monospace; color:var(--text); }
+  input[type=range] { flex:0 0 130px; accent-color:var(--cyan); }
+  select, button { background:#0b1a29; color:var(--text); border:1px solid var(--line); border-radius:7px;
+    padding:6px 9px; font-size:13px; cursor:pointer; }
+  select { width:100%; }
+  button:hover { background:#123551; }
+  button.on { background:#0f4a6e; border-color:var(--cyan); }
+  .buttons { display:flex; gap:7px; flex-wrap:wrap; margin:8px 0; }
+  .note { font-size:12px; color:var(--dim); line-height:1.5; margin:6px 0 0; }
+  table.read { width:100%; border-collapse:collapse; font:12px ui-monospace, Consolas, monospace; }
+  table.read td { padding:3px 0; }
+  table.read td:first-child { color:var(--dim); }
+  table.read td:last-child { text-align:right; }
+  .big { font-size:15px; }
+  .good { color:var(--green); } .fair { color:var(--amber); } .poor { color:var(--red); }
+  .rigwrap { position:relative; flex:0 0 auto; }
+  canvas#rig { width:150px; height:200px; background:#000; border:1px solid var(--line); border-radius:4px; display:block; }
+  /* the 4:3 strip of the portrait panel that the sheet actually covers; everything outside it stays black */
+  #active-area { position:absolute; left:1px; top:1px; width:150px; height:150px; pointer-events:none;
+    border:1px dashed rgba(53,208,255,.45); border-radius:3px; }
+  canvas#coverage { width:100%; height:150px; background:#050a11; border:1px solid var(--line); border-radius:4px; display:block; }
+  .side { display:flex; gap:12px; align-items:flex-start; }
+  .side .note { flex:1 1 auto; margin:0; }
+  #error { color:var(--amber); font-size:12px; margin-top:8px; line-height:1.5; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="left">
+    <canvas id="scene"></canvas>
+    <div id="legend">
+      <span><i style="background:#7cff9b"></i>truth</span><br>
+      <span><i style="background:#ffb23e"></i>what the solver recovers</span><br>
+      <span><i style="background:#35d0ff"></i>cameras and their view</span><br>
+      <span><i style="background:#b58bff"></i>floating image + hand volume</span>
+    </div>
+    <div id="hint">drag to orbit &middot; wheel to zoom &middot; drag the head or the hand to move them</div>
+  </div>
+
+  <div id="panel">
+    <h1>Rig simulator</h1>
+    <p class="sub">The whole Pepper's-ghost rig as numbers: it makes up what each camera would see, runs that
+      through the real tracking code, and shows you how far off the answer is. No hardware needed.</p>
+
+    <h2>Camera layout</h2>
+    <select id="layout"></select>
+    <p class="note" id="layout-note"></p>
+
+    <h2>Accuracy right now</h2>
+    <table class="read">
+      <tr><td>eye</td><td class="big" id="r-eye">—</td></tr>
+      <tr><td>fingertip</td><td class="big" id="r-tip">—</td></tr>
+      <tr><td>&nbsp;&nbsp;cameras alone</td><td id="r-geom">—</td></tr>
+      <tr><td>pinch point</td><td id="r-grip">—</td></tr>
+      <tr><td>source / views</td><td id="r-source">—</td></tr>
+      <tr><td>reprojection</td><td id="r-rms">—</td></tr>
+      <tr><td>latency</td><td id="r-lat">—</td></tr>
+      <tr><td>pinch</td><td id="r-pinch">—</td></tr>
+      <tr><td>floating image moves</td><td id="r-gain">—</td></tr>
+    </table>
+    <p class="note" id="r-note"></p>
+
+    <h2>What the monitor shows</h2>
+    <div class="side">
+      <div class="rigwrap"><canvas id="rig" width="300" height="400"></canvas><span id="active-area"></span></div>
+      <p class="note">The portrait panel. Only the 4:3 area the sheet covers is used; the rest stays black,
+        because black is what the acrylic lets you see straight through. The view inside it is drawn from the
+        <em>recovered</em> eye position, so tracking error shows up here as the image sliding around.</p>
+    </div>
+
+    <h2>Where the hands are seen</h2>
+    <canvas id="coverage" width="600" height="300"></canvas>
+    <p class="note" id="cov-note"></p>
+
+    <h2>Sensors</h2>
+    <div class="row"><label>landmark noise</label><input type="range" id="noise" min="0" max="4" step="0.1" value="1"><output id="noise-out">1.0 px</output></div>
+    <div class="row"><label>dropped frames</label><input type="range" id="drop" min="0" max="0.3" step="0.01" value="0.02"><output id="drop-out">2%</output></div>
+    <div class="row"><label>ZED range</label><input type="range" id="zedz" min="240" max="620" step="10" value="380"><output id="zedz-out">380 mm</output></div>
+    <div class="row"><label>ZED baseline</label><input type="range" id="base" min="40" max="200" step="1" value="120"><output id="base-out">120 mm</output></div>
+    <div class="row"><label>head camera spacing</label><input type="range" id="headbase" min="0" max="600" step="10" value="300"><output id="headbase-out">300 mm</output></div>
+    <div class="buttons">
+      <button id="unsync">ZED eyes free-running</button>
+      <button id="interp" class="on">line frames up in time</button>
+      <button id="extrap" class="on">pull laggards forward</button>
+    </div>
+    <p class="note">Cameras that are not hardware-synced fire at different instants. Lining them up fixes the
+      geometry; pulling the slow one forward instead of waiting for it keeps the latency down, and past two
+      cameras latency is the larger error.</p>
+
+    <h2>Rig</h2>
+    <div class="row"><label>monitor size</label><input type="range" id="diag" min="13" max="32" step="0.5" value="24"><output id="diag-out">24 in</output></div>
+    <div class="row"><label>monitor tilt</label><input type="range" id="tilt" min="0" max="60" step="1" value="30"><output id="tilt-out">30&deg;</output></div>
+    <div class="row"><label>monitor height</label><input type="range" id="height" min="150" max="420" step="5" value="260"><output id="height-out">260 mm</output></div>
+    <div class="row"><label>viewer distance</label><input type="range" id="viewz" min="300" max="900" step="10" value="520"><output id="viewz-out">520 mm</output></div>
+
+    <h2>Motion</h2>
+    <div class="buttons">
+      <button id="play" class="on">pause</button>
+      <button id="pinch">close the pinch</button>
+      <button id="reset">release the head and hand</button>
+    </div>
+    <div class="row"><label>hand speed</label><input type="range" id="hspeed" min="0.25" max="3" step="0.25" value="1"><output id="hspeed-out">x1</output></div>
+
+    <h2>Measure it</h2>
+    <div class="buttons">
+      <button id="run300">run 300 frames</button>
+      <button id="compare">compare every layout</button>
+    </div>
+    <p class="note" id="bench">Runs the same scripted reach-pinch-carry-release that the tests use, and prints
+      the millimetres.</p>
+    <div id="error"></div>
+  </div>
+</div>
+
+<script type="module">
+  import { start } from './js/sim/sim-view.js';
+  start().catch(err => {
+    document.getElementById('error').textContent = 'The simulator could not start: ' + (err && err.message ? err.message : err);
+    console.error(err);
+  });
+</script>
+</body>
+</html>
