@@ -2,11 +2,13 @@
   "name": "holomodel",
   "version": "0.1.0",
   "private": true,
-  "description": "Say \"make a ___\" and shape the 3D model with your hands in a head-tracked window.",
+  "description": "Say what you want and Claude models it in Blender; your hand is the mouse. Also: a head-tracked 3D window.",
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test"
+    "blender": "node scripts/blender-mode.js",
+    "handmouse": "py handmouse/handmouse.py",
+    "test": "node --test && py -m unittest discover -s handmouse"
   },
   "engines": {
     "node": ">=20.12"
@@ -14,6 +16,9 @@
   "dependencies": {
     "@anthropic-ai/bedrock-sdk": "^0.33.7",
     "@anthropic-ai/sdk": "^0.127.0",
+    "@elevenlabs/elevenlabs-js": "^2.68.0",
+    "@sentry/node": "^10.75.0",
+    "mongodb": "^7.6.0",
     "openai": "^7.19.0"
   },
   "devDependencies": {

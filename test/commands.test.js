@@ -63,6 +63,26 @@ const cases = [
   ['brush size smaller', { type: 'brush', factor: 1 / 1.35 }],
   ['turn it', { type: 'spin', on: true }],
   ['change the colour to blue', { type: 'change', prompt: 'change the colour to blue' }],
+  // Blender mode
+  ['edit mode', { type: 'mode', mode: 'edit' }],
+  ['object mode', { type: 'mode', mode: 'move' }],
+  ['clay strips brush', { type: 'brush_pick', name: 'Clay Strips' }],
+  ['use the grab brush', { type: 'brush_pick', name: 'Grab' }],
+  ['switch to inflate brush', { type: 'brush_pick', name: 'Inflate/Deflate' }],
+  ['bigger brush', { type: 'brush', factor: 1.35 }],   // size, not a brush called "bigger"
+  ['redo', { type: 'redo' }],
+  ['frame it', { type: 'focus' }],
+  ['make the mona lisa', { type: 'make', prompt: 'the mona lisa' }],
+  ['make the eiffel tower', { type: 'make', prompt: 'the eiffel tower' }],
+  ['make the legs longer', { type: 'change', prompt: 'make the legs longer' }],
+  ['make the handle red', { type: 'change', prompt: 'make the handle red' }],
+  ['make the roof more pointy', { type: 'change', prompt: 'make the roof more pointy' }],
+  ['make the legs thicker', { type: 'change', prompt: 'make the legs thicker' }],
+  ['make the blade sharper', { type: 'change', prompt: 'make the blade sharper' }],
+  ['make the head pointy', { type: 'change', prompt: 'make the head pointy' }],
+  ['make the monster', { type: 'make', prompt: 'the monster' }],
+  ['make the leaning tower', { type: 'make', prompt: 'the leaning tower' }],
+  ['make the silver surfer', { type: 'change', prompt: 'make the silver surfer' }],   // -er word that isn't listed: goes to change (Blender mode lets Fable decide anyway)
 ];
 
 for (const [said, expected] of cases) {

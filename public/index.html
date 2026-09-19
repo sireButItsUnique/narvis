@@ -76,6 +76,29 @@
     animation:spin .8s linear infinite; }
   @keyframes spin { to { transform:rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { #ai-busy .spin, #mic-state::before { animation:none !important; } }
+  /* Blender mode: this page is the voice console; Blender and the hand mouse do the rest */
+  body.blender-mode canvas#htw-view { display:none; }
+  #blender-panel { position:fixed; inset:0; display:flex; flex-direction:column; gap:10px; box-sizing:border-box;
+    padding:16px 16px 70px; max-width:760px; margin:0 auto; }
+  .bp-head { display:flex; gap:10px; align-items:center; font-size:14px; color:var(--text); }
+  #bp-conn { width:10px; height:10px; border-radius:50%; background:var(--red); flex:none; }
+  #bp-conn[data-on="1"] { background:var(--green); }
+  #bp-cost { margin-left:auto; color:var(--dim); font-size:13px; white-space:nowrap; }
+  #bp-status { min-height:22px; font-size:15px; color:var(--cyan); }
+  body.building #bp-status::before { content:""; display:inline-block; width:11px; height:11px; margin-right:8px;
+    vertical-align:-1px; border:2px solid var(--line); border-top-color:var(--cyan); border-radius:50%; animation:spin .8s linear infinite; }
+  #bp-log { flex:1; overflow-y:auto; margin:0; padding:10px 12px 10px 30px; list-style:decimal; background:var(--panel);
+    border:1px solid var(--line); border-radius:10px; font-size:14px; line-height:1.5; }
+  #bp-log li { margin:3px 0; color:var(--text); }
+  #bp-log li.request { color:var(--cyan); font-weight:600; }
+  #bp-log li.thinking { color:var(--dim); font-style:italic; }
+  #bp-log li.look { color:#c79bff; }
+  #bp-log li.warn { color:var(--amber); }
+  #bp-log li.error { color:var(--red); }
+  #bp-log li.done { color:var(--green); }
+  #bp-help { font-size:13px; color:var(--dim); line-height:1.5; }
+  #bp-help b { color:var(--text); font-weight:600; }
+  body.blender-mode #voice-bar { max-width:calc(100vw - 40px); }
   [hidden] { display:none !important; }
 </style>
 </head>
@@ -89,6 +112,17 @@
 <div id="voice-bar" hidden><span id="mic-state"></span><span id="heard"></span></div>
 <input id="cmd" type="text" hidden autocomplete="off" spellcheck="false"
        placeholder='Type a command: "make a red chair", "add cube", "undo"…' aria-label="Command">
+
+<div id="blender-panel" hidden>
+  <div class="bp-head"><span id="bp-conn" data-on="0"></span><span id="bp-title">Connecting to Blender…</span><span id="bp-cost"></span></div>
+  <div id="bp-status"></div>
+  <ol id="bp-log"></ol>
+  <div id="bp-help">
+    Say <b>"make the Mona Lisa"</b> and Claude Fable builds it in Blender, checks renders of it, and fixes it. Then <b>"make the frame gold"</b> to change it.
+    <b>"sculpt mode"</b>, <b>"clay brush"</b>, <b>"grab brush"</b>, <b>"bigger brush"</b>, <b>"mirror on"</b>, <b>"object mode"</b>, <b>"edit mode"</b>, <b>"frame it"</b>, <b>"undo"</b>, <b>"cancel"</b>.
+    Your hand is the mouse (<b>npm run blender</b> starts it, or <b>npm run handmouse</b> on its own). Pinch to click and drag, pinch-drag with your other hand to orbit, make a fist to pause.
+  </div>
+</div>
 
 <div id="htw-panel" hidden>
   <h2>Calibration</h2>
@@ -108,6 +142,9 @@
 <div id="htw-start" class="overlay">
   <div class="card">
     <h1>Holo Modeler</h1>
+    <p><b>Blender mode</b>: say what you want and Claude Fable models it in Blender; your hand (via the hand mouse) is the cursor for sculpting and editing it.</p>
+    <div class="row"><button id="btn-blender" class="primary">Blender mode</button></div>
+    <p style="margin-top:14px"><b>Head-tracked box</b>: the model floats in a 3D window behind your screen.</p>
     <p>Say what you want and it appears in a 3D box behind your screen. The webcam tracks your eyes so the box looks deep, and your hand can reach in and grab what you made.</p>
     <ol>
       <li>Use <b>Microsoft Edge</b>: its speech recognition is what hears you. Enter your screen size, press <b>Start with webcam</b>, then allow the camera and microphone.</li>

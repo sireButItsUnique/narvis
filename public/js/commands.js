@@ -36,12 +36,33 @@ const MODES = [
   [/^(?:sculpt|sculpting|sculpt mode|clay|clay mode|start sculpting)$/, 'sculpt'],
   [/^(?:smooth|smoothing|smooth mode|smooth it(?: out)?)$/, 'smooth'],
   [/^(?:part|parts|part mode|parts mode|select parts?|move parts?|pick parts?)$/, 'part'],
-  [/^(?:move|move mode|grab mode|normal mode|done|done sculpting|stop sculpting|stop smoothing|exit (?:sculpt|smooth|part)(?: mode)?)$/, 'move'],
+  [/^(?:move|move mode|grab mode|normal mode|object mode|done|done sculpting|stop sculpting|stop smoothing|exit (?:sculpt|smooth|part|edit)(?: mode)?)$/, 'move'],
+  [/^(?:edit|edit mode)$/, 'edit'],   // Blender's edit mode (in the browser it acts like part mode)
 ];
 
+// Blender sculpt brushes by what people call them -> the brush's name in Blender's built-in library
+export const BRUSHES = {
+  draw: 'Draw', 'draw sharp': 'Draw Sharp', clay: 'Clay', 'clay strips': 'Clay Strips', 'clay thumb': 'Clay Thumb',
+  smooth: 'Smooth', grab: 'Grab', 'elastic grab': 'Elastic Grab', 'snake hook': 'Snake Hook', inflate: 'Inflate/Deflate',
+  deflate: 'Inflate/Deflate', crease: 'Crease Sharp', flatten: 'Flatten/Contrast', scrape: 'Scrape/Fill', fill: 'Fill/Deepen',
+  pinch: 'Pinch/Magnify', layer: 'Layer', mask: 'Mask', blob: 'Blob', pose: 'Pose', thumb: 'Thumb', nudge: 'Nudge',
+  pull: 'Pull', twist: 'Twist', boundary: 'Boundary', plateau: 'Plateau', trim: 'Trim',
+};
+
 const FILLER = /^(?:(?:hey|ok|okay|so|um+|uh+|and|now|then|please|can you|could you|would you|will you|let's|lets|go ahead and|i want you to)\s+)+/;
-// "make it/the/this ..." edits the current model instead of making a new one
-const REFERS = /^(?:it|its|it's|the|this|that|these|those|them|everything|all)\b/;
+// "make it/this ..." edits the current model instead of making a new one
+const REFERS = /^(?:it|its|it's|this|that|these|those|them|everything|all)\b/;
+// "make the handle bigger" is a change but "make the Mona Lisa" is a new thing: "the ..." counts as a change
+// only when it ends in how to change it
+// nouns that end like comparatives, so "make the eiffel tower" stays a new thing
+const ER_NOUNS = 'tower|flower|computer|poster|burger|sticker|speaker|container|printer|heater|blender|hammer|ladder|player|'
+  + 'spider|monster|anchor|cooler|mixer|toaster|charger|controller|river|silver|number|paper|letter|feather|finger|dinner|'
+  + 'corner|tiger|lobster|water|soldier|sweater|sneaker|trailer|tractor|butter|border|cylinder|sphere|master|rover|slider';
+const CHANGE_TAIL = new RegExp(`\\b(?:(?!(?:${ER_NOUNS})$)[a-z]{2,}(?:er|ier)|more \\w+|less \\w+|`
+  + `round|square|flat|curved|straight|shiny|matte|smooth|rough|glossy|transparent|metallic|golden|thick|thin|long|short|`
+  + `tall|wide|narrow|big|small|large|tiny|huge|sharp|soft|pointed|pointy|hollow|heavy|bumpy|wavy|curvy|twisted|bent|`
+  + `rounded|spiky|fluffy|furry|symmetrical|visible|invisible|bald|open|closed|upright|sideways|`
+  + `into .+|look .+|(?:dark |light |bright )?(?:${Object.keys(COLORS).join('|')}))$`);
 const THAT_WORDS = 'it|this|that|this part|that part|this one|that one';
 const THAT = `(?:${THAT_WORDS})`;
 
@@ -62,6 +83,12 @@ export function parseCommand(text) {
 
   if (/^(?:cancel|never ?mind|forget it|abort)$/.test(t)) return { type: 'cancel' };
   if (/^(?:undo|undo that|go back|take that back|oops)$/.test(t)) return { type: 'undo' };
+  if (/^(?:redo|redo that)$/.test(t)) return { type: 'redo' };
+  if (/^(?:focus|focus on it|frame it|zoom to it|show me|show it|center it|centre it|find it)$/.test(t)) return { type: 'focus' };
+  // "clay brush", "use the grab brush", "switch to smooth brush"
+  if ((m = t.match(/^(?:(?:use|switch to|change to|give me|pick) )?(?:the |a )?([a-z ]+?) brush$/)) && BRUSHES[m[1]]) {
+    return { type: 'brush_pick', name: BRUSHES[m[1]] };
+  }
   if (/^(?:(?:stop|quit) listening|mute(?: the)?(?: mic)?|mic off)$/.test(t)) return { type: 'mic', on: false };
   // "switch to sculpt mode", "go back to move mode", "use smooth"
   const modeText = t.replace(/^(?:(?:switch|change|go|swap)(?: back)? (?:to|into)|use|enter) (?:the )?/, '');
@@ -111,7 +138,7 @@ export function parseCommand(text) {
   }
 
   if ((m = t.match(/^(make|create|build|generate|design|model|draw|give me|show me|i want|i need)(?: me)? (.+)$/))) {
-    if (m[1] === 'make' && REFERS.test(m[2])) return { type: 'change', prompt: t };
+    if (m[1] === 'make' && (REFERS.test(m[2]) || (/^the\b/.test(m[2]) && CHANGE_TAIL.test(m[2])))) return { type: 'change', prompt: t };
     return { type: 'make', prompt: m[2] };
   }
   if (/^(?:change|modify|edit|adjust|update|alter|tweak|replace|swap|recolou?r|colou?r|paint|turn (?:it|this|that) into|give (?:it|this|that)|add|attach|put|place|remove|delete|take (?:off|away)|get rid of|move|raise|lower|widen|stretch|flatten|round|thicken|lengthen|shorten|rotate|tilt|flip|mirror|resize|scale|duplicate|copy|double) .+/.test(t)) {

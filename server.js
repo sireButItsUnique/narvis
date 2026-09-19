@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { providerInfo, generateModel, NoKeyError } from './server/ai.js';
+import { bridge, buildInBlender, blenderModel, BridgeError } from './server/blender.js';
 import { sanitizeSpec } from './public/js/spec.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -61,6 +62,65 @@ async function handleModel(req, res) {
   }
 }
 
+// ---------- Blender mode ----------
+let building = null;   // one build at a time: { controller }
+
+async function blenderStatus(res) {
+  const base = { model: blenderModel(), key: !!(process.env.ANTHROPIC_API_KEY || '').trim(), building: !!building };
+  try {
+    const r = await bridge('ping', {}, { timeout: 3000 });
+    sendJson(res, 200, { ...base, connected: !!r.ok, blender: r.blender, file: r.file, objects: r.objects });
+  } catch (err) {
+    sendJson(res, 200, { ...base, connected: false, message: err.message });
+  }
+}
+
+// Streams progress as server-sent events while Fable builds in Blender.
+async function blenderBuild(req, res) {
+  let body;
+  try { body = await readJson(req); } catch (err) { return sendJson(res, 400, { error: 'bad_request', message: err.message }); }
+  const prompt = typeof body.prompt === 'string' ? body.prompt.trim().slice(0, 600) : '';
+  if (!prompt) return sendJson(res, 400, { error: 'bad_request', message: 'say what to make' });
+  if (building) return sendJson(res, 409, { error: 'busy', message: 'Still building the last one. Say "cancel" to stop it.' });
+
+  const controller = new AbortController();
+  building = { controller };
+  res.on('close', () => {   // the page cancelled or went away: stop, and free the lock right away
+    if (!res.writableEnded) { controller.abort(); if (building?.controller === controller) building = null; }
+  });
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
+  const emit = ev => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(ev)}\n\n`); };
+  const t0 = Date.now();
+  try {
+    const { usd = 0 } = await buildInBlender({ prompt, mode: body.mode === 'change' ? 'change' : 'make', emit, signal: controller.signal });
+    console.log(`[blender] "${prompt}" done in ${((Date.now() - t0) / 1000).toFixed(0)}s, about $${usd.toFixed(2)}`);
+  } catch (err) {
+    if (!controller.signal.aborted) {
+      console.error('[blender] failed:', err.message);
+      emit({ type: 'error', message: err instanceof BridgeError ? err.message : `Couldn't build it: ${err.message}` });
+    } else {
+      console.log(`[blender] "${prompt}" cancelled`);
+    }
+  } finally {
+    if (building?.controller === controller) building = null;
+    res.end();
+  }
+}
+
+const QUICK = new Set(['undo', 'redo', 'mode', 'brush', 'brush_size', 'symmetry', 'focus', 'delete', 'scene', 'add']);
+async function blenderCommand(req, res) {
+  let body;
+  try { body = await readJson(req); } catch (err) { return sendJson(res, 400, { error: 'bad_request', message: err.message }); }
+  if (!QUICK.has(body.cmd)) return sendJson(res, 400, { error: 'bad_request', message: `unknown command ${body.cmd}` });
+  if (building && body.cmd !== 'scene') return sendJson(res, 409, { error: 'busy', message: 'Wait for the build to finish (or say "cancel").' });
+  try {
+    const { cmd, ...args } = body;
+    sendJson(res, 200, await bridge(cmd, args, { timeout: 20000 }));
+  } catch (err) {
+    sendJson(res, 502, { ok: false, error: err.message });
+  }
+}
+
 function serveStatic(pathname, res) {
   let p;
   try { p = decodeURIComponent(pathname); } catch { p = ''; }
@@ -81,10 +141,16 @@ http.createServer((req, res) => {
   if (pathname === '/api/model') {
     return req.method === 'POST' ? handleModel(req, res) : sendJson(res, 405, { error: 'method_not_allowed', message: 'POST only' });
   }
+  if (pathname === '/api/blender/status') return blenderStatus(res);
+  if (pathname === '/api/blender/build' || pathname === '/api/blender/command') {
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'method_not_allowed', message: 'POST only' });
+    return pathname.endsWith('build') ? blenderBuild(req, res) : blenderCommand(req, res);
+  }
   if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method_not_allowed' });
   serveStatic(pathname, res);
 }).listen(PORT, '127.0.0.1', () => {
   const ai = providerInfo();
   console.log(`serving on http://localhost:${PORT}  (open it in Edge for voice)`);
   console.log(ai.provider ? `AI: ${ai.provider} (${ai.model})` : 'AI: no key in .env yet, so "make a ___" is off; local commands still work');
+  console.log(`Blender mode builds with ${blenderModel()}`);
 });

@@ -11,6 +11,7 @@ import { parseCommand, parseTyped } from './commands.js';
 import { createVoice } from './voice.js';
 import { exportGlb, glbBytes } from './export.js';
 import { sanitizeSpec } from './spec.js';
+import { startBlenderMode, runBlenderCommand } from './blendermode.js';
 
 // ---------- UI ----------
 const $ = id => document.getElementById(id);
@@ -44,6 +45,7 @@ function flash(msg, ms = 2500) { flashMsg = msg; flashUntil = performance.now() 
 
 // ---------- start ----------
 let started = false;
+let blenderMode = false;   // voice console for Blender: no 3D box, no webcam (the hand mouse has it)
 function begin() {
   $('htw-start').hidden = true;
   buildRoom(); layout();
@@ -83,6 +85,15 @@ $('btn-cam').addEventListener('click', async () => {
     status(`Couldn't start the webcam or models (${e.name || 'error'}: ${e.message || e}). Try Mouse mode, or serve this page with "npm start".`);
   }
 });
+$('btn-blender').addEventListener('click', () => {
+  blenderMode = true;
+  started = true;
+  $('htw-start').hidden = true;
+  $('voice-bar').hidden = false;
+  startBlenderMode({ flash });
+  if (S.mic) voice.start();
+});
+if (location.hash === '#blender') $('btn-blender').focus();
 $('btn-mouse').addEventListener('click', async () => {
   const v = parseFloat($('s-diag').value); if (v > 5) { S.diagIn = v; saveSettings(); }
   input.mode = 'mouse';
@@ -177,6 +188,7 @@ async function requestModel(prompt, change) {
 // ---------- commands ----------
 function runCommand(cmd) {
   if (!started) return;
+  if (blenderMode && cmd.type !== 'mic') return runBlenderCommand(cmd);
   switch (cmd.type) {
     case 'make':   return requestModel(cmd.prompt, false);
     case 'change': return requestModel(cmd.prompt, true);
@@ -196,7 +208,8 @@ function runCommand(cmd) {
       recolorPart(part, cmd.color);
       return flash(`Recoloured ${part.name}`);
     }
-    case 'mode':   return setTool(cmd.mode);
+    case 'mode':   return setTool(cmd.mode === 'edit' ? 'part' : cmd.mode);
+    case 'redo': case 'focus': case 'brush_pick': return flash('That one is for Blender mode');
     case 'mirror': tool.mirror = cmd.on; showTool(); return flash(`Mirror ${cmd.on ? 'on: sculpting copies across the middle' : 'off'}`);
     case 'brush':  setBrush(tool.brush * cmd.factor); showTool(); return flash(`Brush ${tool.brush.toFixed(1)} cm`);
     case 'turn':   return flash(turnBy(cmd.deg) ? `Turned ${cmd.deg === 180 ? 'around' : cmd.deg < 0 ? 'left' : 'right'}` : 'Nothing to turn');
@@ -257,6 +270,11 @@ function tick(now) {
     catch (err) { if (now > flashUntil) { console.error('tracking failed', err); flash('Tracking error (see console). Press M for mouse mode.'); } }
   }
   if (!started) { renderer.render(scene, camera); return; }
+  if (blenderMode) {   // nothing 3D to draw here; just the message banner
+    const banner = $('htw-banner'), msg = now < flashUntil ? flashMsg : '';
+    banner.textContent = msg; banner.hidden = !msg;
+    return;
+  }
 
   updateInteraction();
   updateModel(dt);
