@@ -549,7 +549,13 @@ export function createSculptEngine(engineOptions = {}) {
     const { normal, center } = calcAreaNormalAndCenter(proxy, {
       verts,
       positions: useOriginal ? proxy.getOrigPositions() : undefined,
-      normals: useOriginal ? proxy.getOrigNormals() : undefined,
+      // Always the STROKE-START normals, even with accumulate on. Measured against Blender 5.2.1:
+      // replaying the golden strokes with live normals here puts an accumulating Draw 24.9% out
+      // and Crease Sharp 8.5% out, while stroke-start normals with live positions bring them to
+      // 1.3% and 2.0%. Blender reads these through the evaluated mesh's normal cache, which the
+      // brush loop does not refresh between dabs, so the area normal keeps weighing the shape the
+      // stroke began with while the dab itself lands on the live surface.
+      normals: proxy.getOrigNormals(),
       location: cache.locationSymm,
       viewNormal: cache.viewNormalSymm,
       normalRadius: cache.radius * nrf,

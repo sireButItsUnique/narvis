@@ -37,7 +37,8 @@ Pinned at commit 235621eec717437a8dfe0a9dfbf78a3f7eb4c32f (blender/blender).
   source/blender/editors/sculpt_paint/mesh/brushes/enhance_details.cc
   source/blender/editors/sculpt_paint/mesh/sculpt_smooth.cc
       -> smooth.js, brushes/smooth.js   pass splitting, the border and corner rule, Enhance Details
-  source/blender/editors/sculpt_paint/mesh/brushes/draw.cc      -> brushes/draw.js (Draw, Nudge)
+  source/blender/editors/sculpt_paint/mesh/brushes/draw.cc      -> brushes/draw.js (Draw),
+                                                                   brushes/nudge.js (Nudge)
   source/blender/editors/sculpt_paint/mesh/brushes/inflate.cc   -> brushes/inflate.js
   source/blender/editors/sculpt_paint/mesh/brushes/grab.cc      -> brushes/grab.js
   source/blender/editors/sculpt_paint/mesh/sculpt_undo.cc       -> undo.js (the first-touch model)
@@ -54,13 +55,32 @@ Brush set A (brushes/set-a.js):
   source/blender/editors/sculpt_paint/mesh/sculpt.cc
       -> brushes/brush-frame.js   calc_local_positions, calc_brush_cube_distances (the square tip)
 
-Brush kernels added later (brushes/set-b.js) name their own sources in their file headers; the
-list above is what exists today.
+Brush set B (brushes/set-b.js):
+  source/blender/editors/sculpt_paint/mesh/brushes/snake_hook.cc
+      -> brushes/snake_hook.js   the hand-following dab centre, pinch influence, rake rotation
+  source/blender/editors/sculpt_paint/mesh/brushes/elastic_deform.cc
+      -> brushes/elastic.js      Elastic Grab / Biscale / Triscale / Scale / Twist
+  source/blender/blenkernel/intern/kelvinlet.cc
+      -> kelvinlet.js            the regularised Kelvinlets (Pixar TM #17-03) and the RK4 walk
+  source/blender/editors/sculpt_paint/mesh/brushes/crease.cc    -> brushes/crease.js (Crease, Blob)
+  source/blender/editors/sculpt_paint/mesh/brushes/pinch.cc     -> brushes/pinch.js
+  source/blender/editors/sculpt_paint/mesh/brushes/mask.cc      -> brushes/mask.js
+  source/blender/editors/sculpt_paint/mesh/brushes/thumb.cc     -> brushes/thumb.js
+  source/blender/editors/sculpt_paint/mesh/sculpt.cc
+      -> brushes/*.js            grab_delta_get, the restore / anchored-origin / frozen-normal
+                                 brush lists, rake_data_update, SCULPT_RAKE_BRUSH_FACTOR
+  filters.js reuses smooth.js and enhance_details.cc's direction for the whole-part filters; its
+  two length-based filters (inflate, scale) size themselves from the part's bounding box, which is
+  our own choice, not Blender's.
+
+Both sets are registered together in brushes/registry.js; each kernel file also names its own
+Blender sources in its header.
 
 Where Blender main @235621e and the shipped Blender 5.2.1 disagree, the behaviour here follows
-5.2.1, because that is the build the parity fixtures are recorded from. The two places this
-matters are named in the code: the accumulate rule for Draw Sharp (cache.js) and the
-"inverse smooth pressure" auto-smooth rule (index.js).
+5.2.1, because that is the build the parity fixtures are recorded from. The places this matters
+are named in the code: the accumulate rule for Draw Sharp (cache.js), the "inverse smooth
+pressure" auto-smooth rule (index.js), and the SUBTRACT direction the Essentials library ships on
+Crease Sharp, Crease Polish and Draw Sharp (presets.json).
 
 presets.json is a measurement of Blender 5.2.1's Essentials brush library
 (datafiles/assets/brushes/essentials_brushes-mesh_sculpt.blend), dumped headless.
@@ -72,4 +92,9 @@ MIT COMPONENTS (kept under their own licence)
       three.js r186 examples/jsm/misc/Sculptor*, which is itself adapted from SculptGL by
       Stephane Ginier. MIT; see vendor/LICENSE-SculptGL.txt. Our fork is marked inline with
       "HOLOMODEL:" comments and stays MIT.
+  public/js/sculpt/mask-ops.js
+      blur, sharpen, invert and clear are adapted from SculptGL's src/editing/tools/Masking.js
+      (MIT, Copyright (c) Stephane Ginier), with Blender's mask convention (1 = protected) and a
+      Float32 mask channel of our own. The file as a whole is GPL-3.0-or-later, which the MIT
+      licence permits; the MIT notice above is kept for the parts it covers.
   three.js itself (MIT) is a peer dependency, imported as "three".
