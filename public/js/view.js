@@ -43,7 +43,12 @@ sun.shadow.mapSize.set(1024, 1024);
 sun.shadow.bias = -0.0005;
 scene.add(sun, sun.target);
 
-let room = new THREE.Group(); scene.add(room);
+let room = new THREE.Group(); room.name = 'room'; scene.add(room);
+// Rig mode renders the scene on pure black, where the grid box would show up as a lit cage around the
+// hologram. buildRoom() REPLACES the group on every resize, so the flag - not a reference the caller holds -
+// is what has to survive; the rebuilt group reads it back.
+let roomVisible = true;
+export function setRoomVisible(on) { roomVisible = !!on; room.visible = roomVisible; }
 export let rect = canvasRect();
 export let boxDepth = 30;
 
@@ -63,7 +68,7 @@ function gridLines(origin, u, v, uLen, vLen, step, pts) {
 export function buildRoom() {
   scene.remove(room);
   room.traverse(o => { o.geometry?.dispose?.(); o.material?.dispose?.(); });
-  room = new THREE.Group(); scene.add(room);
+  room = new THREE.Group(); room.name = 'room'; room.visible = roomVisible; scene.add(room);
 
   rect = canvasRect();
   const { x0, x1, y0, y1, cx, cy, w, h } = rect;

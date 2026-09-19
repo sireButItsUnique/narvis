@@ -7,9 +7,17 @@
 // INTEGRATION (this is the whole contract with view.js / main.js; nothing here edits them):
 //
 //   import { RigView } from './rig/output.js';
-//   import { views, renderer, canvas, scene, camera } from './view.js';
+//   import { views, renderer, canvas, scene, camera, webcamPos, setRoomVisible } from './view.js';
+//   import { S } from './settings.js';
 //
-//   const rigView = new RigView({ renderer, canvas, scene });   // rig comes from localStorage
+//   // webcam is REQUIRED for tracker input: webcam.js has already baked webcamPos() into input.eye
+//   // (world = webcam + (-x, -y, z) of the camera frame), so this is what undoes it. Leaving it out puts
+//   // the eye ~9.5 cm high on a laptop, which is 3-4 cm of hologram in the wrong place.
+//   // nudgeYCm undoes S.eyeYNudgeCm the same way: it is a fudge the user dialled in for the desktop window,
+//   // and rig mode has its own head calibration. Leave it out if the nudge corrects a real tracker bias.
+//   const rigView = new RigView({ renderer, canvas, scene,
+//                                 webcam: webcamPos().toArray(), nudgeYCm: S.eyeYNudgeCm });   // rig from localStorage
+//   setRoomVisible(false);                                       // the desktop grid box is not hologram content
 //   rigView.enter();                                            // black, HUD hidden, canvas flipped
 //   views.length = 0;
 //   views.push({ camera: rigView.camera, viewport: null });      // the views[] loop renders the rig view
@@ -19,14 +27,18 @@
 //   // hands, for interaction.js, converted the same way:
 //   const tipRig = rigView.handToRig(input.hands[0].tip);
 //   // leaving:
-//   rigView.exit(); views.length = 0; views.push({ camera, viewport: null });
+//   rigView.exit(); setRoomVisible(true); views.length = 0; views.push({ camera, viewport: null });
+//
+// Anything else already in the scene that is not hologram content (rig mode renders on pure black, so every
+// lit pixel becomes hologram) goes in `sceneHide`. view.js's room is the exception: buildRoom() REPLACES the
+// group on every resize, so it needs setRoomVisible(), which survives the rebuild, rather than a reference.
 //
 // The scene's world frame IS the rig frame in this mode (centimetres, origin at the sheet centre), which is
 // why placeModel() moves the model rather than the camera. For a scene that must stay in its own frame,
 // pass the rig-to-world matrix as the second argument of applyRigCamera() instead.
 
 import * as THREE from 'three';
-import { rigCamera, applyRigCamera, modelRigMatrix, virtualScreen, rectPoint, rigCheck, DEFAULT_EYE }
+import { rigCamera, applyRigCamera, modelRigMatrix, virtualScreen, rectPoint, rigCheck, v3, DEFAULT_EYE }
   from './geometry.js';
 import { loadRig, trackerToRig, handToRig } from './calibrate.js';
 
@@ -34,8 +46,11 @@ const BLACK = new THREE.Color(0x000000);
 
 export class RigView {
   // { rig, renderer, canvas, scene,
-  //   webcam: the tracker camera's position in the display frame (view.js webcamPos()),
-  //   hide: elements or selectors to hide instead of the automatic list,
+  //   webcam: the tracker camera's position in the display frame (view.js webcamPos()) - required for any
+  //           tracker-space input, since webcam.js has already added it to input.eye,
+  //   nudgeYCm: S.eyeYNudgeCm, to undo the desktop-window eye fudge (0 keeps it),
+  //   hide: DOM elements or selectors to hide instead of the automatic list,
+  //   sceneHide: Object3Ds, names, or a predicate over scene.children to hide while rig mode is on,
   //   keep: one element that must stay visible (the calibration panel, say),
   //   assumeFullscreen: the canvas IS the whole panel, so skip the window-position viewport }
   constructor(opts = {}) {
@@ -44,7 +59,10 @@ export class RigView {
     this.renderer = opts.renderer;
     this.canvas = opts.canvas || opts.renderer?.domElement;
     this.scene = opts.scene;
-    this.webcam = opts.webcam || [0, 0, 0];
+    // No silent [0, 0, 0]: that default is a plausible-looking eye that is wrong by the camera's height above
+    // the display centre, and nothing downstream can tell. trackerOrigin() says so out loud instead.
+    this.webcam = opts.webcam ? v3(opts.webcam) : null;
+    this.nudgeYCm = opts.nudgeYCm || 0;
     this.camera = new THREE.PerspectiveCamera();
     this.camera.matrixAutoUpdate = false;
     this.eyeRig = DEFAULT_EYE.slice();
@@ -61,8 +79,23 @@ export class RigView {
   // ---------- frames ----------
   setRig(rig) { this.rig = rig; this.update(); this.refreshPattern(); return this; }
   // Tracker-space (what input/state.js holds) -> rig frame.
-  eyeToRig(p) { return trackerToRig(this.rig, p, this.webcam); }
-  handToRig(p) { return handToRig(this.rig, p, this.webcam); }
+  eyeToRig(p) { return trackerToRig(this.rig, p, this.trackerOrigin(), this.nudgeYCm); }
+  handToRig(p) {
+    // a fitted hand transform was measured in tracker space, so it already absorbs the tracker origin
+    return handToRig(this.rig, p, this.rig.hand?.fit ? [0, 0, 0] : this.trackerOrigin());
+  }
+  // Where the tracker's own origin sits in the display frame. Missing it is a 9.5 cm error that looks like a
+  // perfectly ordinary eye position, so it is worth one loud complaint rather than a quiet wrong hologram.
+  trackerOrigin() {
+    if (this.webcam) return this.webcam;
+    if (!this._warnedWebcam) {
+      this._warnedWebcam = true;
+      console.warn('RigView: no `webcam` given, so tracker points are converted as if the camera sat at the '
+        + 'centre of the display. Pass webcam: webcamPos().toArray() from view.js, or use update(eye, '
+        + '{ rigFrame: true }) for points that are already in rig coordinates.');
+    }
+    return [0, 0, 0];
+  }
 
   // Once a frame. `eye` is the tracked eye in tracker space, or null to keep the last one; pass
   // { rigFrame: true } if it is already in rig coordinates (a Kinect calibrated straight into the rig).
@@ -96,10 +129,18 @@ export class RigView {
   // the scene (rig mode makes the world frame the rig frame).
   placeModel(root) {
     if (!root) return null;
+    // Box3.setFromObject returns a WORLD-space AABB, and mapping that back into the root's frame re-AABBs it,
+    // which inflates the box whenever the root carries a rotation - including the Ry(model.yawDeg) this very
+    // function installs, so a second call used to shrink the model by a third. Measure with the root's own
+    // transform lifted off instead. (Rig mode hangs the display root straight off the scene, so with the
+    // root at identity "world" and "the root's own frame" are then the same thing.)
+    const keep = root.matrix.clone(), keepAuto = root.matrixAutoUpdate;
+    root.matrixAutoUpdate = false;
+    root.matrix.identity();
     root.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(root);
+    root.matrix.copy(keep); root.matrixAutoUpdate = keepAuto; root.updateMatrixWorld(true);
     if (box.isEmpty()) return null;
-    box.applyMatrix4(new THREE.Matrix4().copy(root.matrixWorld).invert());   // -> the root's own frame
     const m = modelRigMatrix(this.rig, { min: box.min.toArray(), max: box.max.toArray() });
     root.matrixAutoUpdate = false;
     root.matrix.fromArray(m);
@@ -115,13 +156,17 @@ export class RigView {
     const style = this.canvas?.style;
     this._saved = {
       background: this.scene?.background, clear: this.renderer?.getClearColor(new THREE.Color()).clone(),
-      alpha: this.renderer?.getClearAlpha?.(), transform: style?.transform || '', hidden: [],
+      alpha: this.renderer?.getClearAlpha?.(), transform: style?.transform || '', hidden: [], sceneHidden: [],
     };
     if (this.scene) { this.scene.background = BLACK; }
     this.renderer?.setClearColor(0x000000, 1);
     for (const el of this.hideList()) {
       this._saved.hidden.push([el, el.style.visibility]);
       el.style.visibility = 'hidden';
+    }
+    for (const o of this.sceneHideList()) {
+      this._saved.sceneHidden.push([o, o.visible]);
+      o.visible = false;
     }
     this.applyFlip();
     this.refreshPattern();
@@ -133,6 +178,7 @@ export class RigView {
     if (this.scene) this.scene.background = this._saved.background ?? null;
     if (this._saved.clear) this.renderer?.setClearColor(this._saved.clear, this._saved.alpha ?? 1);
     for (const [el, vis] of this._saved.hidden) el.style.visibility = vis;
+    for (const [o, vis] of this._saved.sceneHidden) o.visible = vis;
     if (this.canvas) this.canvas.style.transform = this._saved.transform;
     this._flip = '';
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -142,13 +188,28 @@ export class RigView {
   // from the canvas and hiding each level's other children keeps the canvas's own ancestors visible, however
   // deeply the page nests it.
   hideList() {
-    if (this.opts.hide) return [...this.opts.hide].map((h) => typeof h === 'string' ? document.querySelectorAll(h) : [h]).flatMap((n) => [...n]);
+    // DOM only - scene contents go through sceneHide, which is why this filters rather than throwing on the
+    // first Object3D somebody passes here.
+    if (this.opts.hide) return [...this.opts.hide].map((h) => typeof h === 'string' ? document.querySelectorAll(h) : [h])
+      .flatMap((n) => [...n]).filter((el) => el && el.style);
     if (typeof document === 'undefined' || !this.canvas) return [];
     const out = [];
     for (let node = this.canvas; node && node.parentElement && node !== document.body; node = node.parentElement)
       for (const sib of node.parentElement.children)
         if (sib !== node && sib !== this.opts.keep && !['SCRIPT', 'STYLE', 'TEMPLATE'].includes(sib.tagName)) out.push(sib);
     return out;
+  }
+  // Scene contents rig mode must not draw: the desktop room, a ground plane, anything lit that is not the
+  // hologram. Object3Ds, names, or a predicate over the scene's own children; .visible is restored on exit().
+  // A group the page REBUILDS while rig mode is on (view.js's room) cannot be handled here - the rebuilt
+  // group is a different object - so view.js has setRoomVisible() for that one.
+  sceneHideList() {
+    const h = this.opts.sceneHide;
+    if (!h || !this.scene) return [];
+    if (typeof h === 'function') return this.scene.children.filter((o) => { try { return !!h(o); } catch { return false; } });
+    return (Array.isArray(h) ? h : [h])
+      .map((o) => typeof o === 'string' ? this.scene.getObjectByName(o) : o)
+      .filter((o) => o && typeof o.visible === 'boolean');
   }
   // One reflection mirrors the picture, so the canvas is flipped on its way to the panel. Doing it in CSS
   // costs nothing and, unlike negating a column of the projection matrix, does not invert face winding.

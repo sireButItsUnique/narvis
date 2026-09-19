@@ -61,12 +61,12 @@
 <script type="module">
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { makeRig, DEFAULT_RIG, DEFAULT_EYE, FOLD_EXAMPLE, monitorRect, virtualScreen,
+import { makeRig, DEFAULT_RIG, DEFAULT_EYE, FOLD_EXAMPLE, panelRect, virtualScreen,
          mirrorRect, planeOf, planeAxes, rigCheck, tracePath, rigMirrors,
          projectToMonitor, projectPoint, rectFrom, rectUV, rayPlane, reflectPoint, lineDist,
-         sub, add, scale, v3 } from './js/rig/geometry.js';
+         sub, add, scale, dist, v3 } from './js/rig/geometry.js';
 import { RigView } from './js/rig/output.js';
-import { openCalibration, fitSimilarity } from './js/rig/calibrate.js';
+import { openCalibration, fitSimilarity, poseMatrix3, m3apply } from './js/rig/calibrate.js';
 
 // ---------- state ----------
 const state = { eye: DEFAULT_EYE.slice(), tilt: 20, monY: 30, monZ: -18, sheetY: 0, anchorY: -13,
@@ -175,7 +175,7 @@ const lines = (pts, color, opacity = 1) => new THREE.LineSegments(
 // ---------- build the simulated rig ----------
 function buildSim(rc) {
   simParts.clear();
-  const mon = monitorRect(rig.monitor), V = virtualScreen(rig), uvs = panelUVs(rc);
+  const mon = panelRect(rig), V = virtualScreen(rig), uvs = panelUVs(rc);   // where the panel physically hangs
   // the panel, showing exactly what the rig camera drew
   simParts.add(quad(mon, uvs, new THREE.MeshBasicMaterial({ map: panelTex, side: THREE.DoubleSide, toneMapped: false })));
   simParts.add(lines([mon.tl, mon.tr, mon.tr, mon.br, mon.br, mon.bl, mon.bl, mon.tl], 0xffd479));
@@ -236,11 +236,9 @@ loader.load('/test/fixtures/teapot.glb', (gltf) => {
 }, undefined, (e) => { console.warn('teapot did not load', e); modelReady = 'failed'; });
 
 function placeModel() {
-  for (const root of [holoModel, ghost]) {
-    root.matrixAutoUpdate = false;
-    root.matrix.identity(); root.updateMatrixWorld(true);
-    rigView.placeModel(root);                   // the same call the app makes on its display root
-  }
+  // Exactly the call the app makes on its display root, with no reset first: placeModel measures the model
+  // with the root's own transform lifted off, so calling it again on an already-placed root is a no-op.
+  for (const root of [holoModel, ghost]) rigView.placeModel(root);
 }
 
 // ---------- panels ----------
@@ -436,19 +434,95 @@ window.rigDemo = {
     const fit = fitSimilarity(src, targets);
     return { rmsMm: fit.rmsMm, maxMm: fit.maxMm, scale: fit.s };
   },
-  // Rig output mode, on this page: black, HUD hidden, canvas flipped, then everything back.
+  // the same fit, written to the rig, so the UI checks can exercise "copy from hand fit"
+  applyHandFit(noiseCm = 0.3) {
+    const targets = [[-8, -13, 0], [8, -13, 0], [0, -7, 0], [0, -13, 8], [0, -19, 0], [0, -13, -8]];
+    const inv = (p) => {
+      const q = sub(v3(p), fakeTracker.t), R = fakeTracker.R, s = 1 / fakeTracker.s;
+      return [s * (R[0] * q[0] + R[3] * q[1] + R[6] * q[2]), s * (R[1] * q[0] + R[4] * q[1] + R[7] * q[2]),
+              s * (R[2] * q[0] + R[5] * q[1] + R[8] * q[2])];
+    };
+    rig.hand.fit = fitSimilarity(targets.map((t) => inv(t).map((c) => c + (Math.random() - 0.5) * noiseCm)), targets);
+    dirty = true;
+    return { scale: +rig.hand.fit.s.toFixed(4), maxMm: +rig.hand.fit.maxMm.toFixed(2) };
+  },
+  // Rig output mode, on this page: black, HUD hidden, canvas flipped, scene content that is not hologram
+  // hidden, then everything back.
   enterExit() {
-    const view = new RigView({ rig, renderer, canvas, scene: holo });
+    const marker = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial());
+    marker.name = 'not-hologram';
+    holo.add(marker);
+    const view = new RigView({ rig, renderer, canvas, scene: holo, webcam: [0, 9.52, 0], sceneHide: ['not-hologram'] });
     view.update(state.eye, { rigFrame: true });
-    const before = { transform: canvas.style.transform, sidebar: document.getElementById('side').style.visibility };
+    const side = document.getElementById('side');
+    const before = { transform: canvas.style.transform, sidebar: side.style.visibility, marker: marker.visible };
     view.enter();
-    const during = { transform: canvas.style.transform, sidebar: document.getElementById('side').style.visibility,
+    const during = { transform: canvas.style.transform, sidebar: side.style.visibility, marker: marker.visible,
                      background: holo.background.getHex(), flipX: view.rc.flipX,
                      pattern: (view.setTestPattern(true), view.group.children.length) };
     view.exit();
     view.dispose();
-    const after = { transform: canvas.style.transform, sidebar: document.getElementById('side').style.visibility };
+    const after = { transform: canvas.style.transform, sidebar: side.style.visibility, marker: marker.visible };
+    holo.remove(marker); marker.geometry.dispose(); marker.material.dispose();
     return { before, during, after };
+  },
+  // The documented integration recipe, end to end: take a known rig-frame eye, write it the way webcam.js
+  // writes input.eye, and see what RigView gives back with the webcam position and without it.
+  eyeRoundTrip(webcam = [0, 9.52, 0], nudgeYCm = 1.5, eyeRig = [3, 36.7, 71.1]) {
+    const head = rig.head, R = poseMatrix3(head), s = head.scale ?? 1;
+    const Rt = [R[0], R[3], R[6], R[1], R[4], R[7], R[2], R[5], R[8]];            // rig -> camera frame
+    const local = m3apply(Rt, sub(v3(eyeRig), v3(head.position))).map((c) => c / s);
+    const tracker = [webcam[0] - local[0], webcam[1] - local[1] + nudgeYCm, webcam[2] + local[2]];
+    const opts = { rig, renderer, canvas, scene: holo, assumeFullscreen: true };
+    const withCam = new RigView({ ...opts, webcam, nudgeYCm }), without = new RigView(opts);
+    const out = { eyeRig, tracker: tracker.map((n) => +n.toFixed(3)),
+                  withWebcamCm: withCam.eyeToRig(tracker), withoutWebcamCm: without.eyeToRig(tracker) };
+    out.withWebcamErrCm = dist(out.withWebcamCm, v3(eyeRig));
+    out.withoutWebcamErrCm = dist(out.withoutWebcamCm, v3(eyeRig));
+    withCam.dispose(); without.dispose();
+    return out;
+  },
+  // placeModel must be idempotent: measuring the box through the root's world matrix shrank a rotated model
+  // by a third on the second call. The largest dimension has to stay at model.fitCm however often it runs.
+  placeRepeat(yawDeg = 30, times = 3) {
+    const was = rig.model.yawDeg;
+    rig.model = { ...rig.model, yawDeg };
+    const sizes = [], scales = [];
+    for (let i = 0; i < times; i++) {
+      rigView.placeModel(holoModel);
+      const size = new THREE.Box3().setFromObject(holoModel).getSize(new THREE.Vector3());
+      sizes.push(+Math.max(size.x, size.y, size.z).toFixed(4));
+      scales.push(+holoModel.scale.x.toFixed(6));           // the number the bug actually shrank
+    }
+    rig.model = { ...rig.model, yawDeg: was };
+    placeModel();
+    return { yawDeg, fitCm: rig.model.fitCm, sizes, scales };
+  },
+  // Auto-capture must need the hand to MOVE. Holding still used to refill the sample buffer in ~117 ms and
+  // fire again a second later, recording every remaining target at the first spot. Real panel, virtual clock.
+  dwellProbe() {
+    const keep = rig.hand;
+    rig.hand = { ...rig.hand, fit: null };
+    let tip = null, t = 0;
+    const panel = openCalibration({ rig, getEye: () => state.eye, getTip: () => tip,
+                                    onTargets: () => {}, onChange: () => {} });
+    panel.setStep(2);
+    const run = (ms) => { for (const end = t + ms; t <= end; t += 1000 / 60) panel.tick(t); };
+    const spots = panel.targets.map((p) => p.slice());        // tracker frame = rig frame for this probe
+    tip = spots[0].slice();
+    run(6000);                                                // six seconds of a perfectly still fingertip
+    const whileStill = panel.captures.filter(Boolean).length;
+    for (let i = 1; i < spots.length; i++) { tip = spots[i].slice(); run(1500); }   // then touch each spot
+    const captured = panel.captures.filter(Boolean);
+    const worstCm = Math.max(...captured.map((c, i) => dist(c, spots[i])));
+    tip = add(spots[spots.length - 1], [20, 0, 0]);            // hand parked elsewhere after finishing
+    run(3000);
+    const strayCm = dist(panel.captures[spots.length - 1], spots[spots.length - 1]);
+    const fitScale = rig.hand.fit ? rig.hand.fit.s : null;
+    panel.close();
+    rig.hand = keep;
+    return { spots: spots.length, whileStill, captured: captured.length, worstCm: +worstCm.toFixed(6),
+             strayCm: +strayCm.toFixed(6), fitScale: fitScale === null ? null : +fitScale.toFixed(6) };
   },
   summary() {
     const V = virtualScreen(rig);

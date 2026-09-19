@@ -128,6 +128,9 @@ export function makeRig(partial = {}) {
   for (const k of ['monitor', 'sheet', 'model', 'head', 'hand'])
     rig[k] = { ...DEFAULT_RIG[k], ...(partial[k] || {}) };
   rig.fold = partial.fold ? { widthCm: 40, heightCm: 30, ...partial.fold } : null;
+  // A rotation matrix stored on head would outrank the yaw/pitch/roll fields and silently deaden them, so it
+  // never survives into a rig - not even out of a saved one (older builds copied one out of the hand fit).
+  delete rig.head.R;
   return rig;
 }
 
@@ -153,13 +156,29 @@ export function monitorRect(m) {
   rect.pixelW = m.pixelW; rect.pixelH = m.pixelH;
   return rect;
 }
+// Where the physical panel actually is, which is what every ray trace and pixel lookup needs.
+// rig.monitor is the SOURCE rectangle: the pose the picture optically comes from. Without a fold mirror that
+// is the panel itself. With one, the panel hangs at the mirror image of that pose (see foldRig), so deriving
+// it here - rather than freezing a copy into monitor.corners - keeps the monitor's own size and pose fields
+// live and meaningful while the fold is on.
+export function panelRect(rig) {
+  const src = monitorRect(rig.monitor);
+  if (!rig.fold) return src;
+  const m = reflectRect(src, planeOf(rig.fold));
+  // A real panel is never a mirror image of a panel: its pixel frame always turns the right way about its own
+  // face. So the panel sits on the reflected rectangle with its columns the other way round (tl<->tr,
+  // bl<->br), which negating `right` does exactly - and that is also why a folded rig needs no flip.
+  const rect = rectFrom(m.centre, scale(m.right, -1), m.up, m.widthCm, m.heightCm);
+  rect.pixelW = src.pixelW; rect.pixelH = src.pixelH;
+  return rect;
+}
 // The mirrors the light meets, in the order it meets them (fold mirror first, sheet last).
 export const rigMirrors = (rig) => rig.fold ? [planeOf(rig.fold), planeOf(rig.sheet)] : [planeOf(rig.sheet)];
 
-// The virtual screen: the monitor reflected through every mirror, keeping the pixel-corner correspondence.
+// The virtual screen: the panel reflected through every mirror, keeping the pixel-corner correspondence.
 // `mirrored` (an odd number of reflections) is what makes the rendered image need a flip.
 export function virtualScreen(rig) {
-  let rect = monitorRect(rig.monitor);
+  let rect = panelRect(rig);
   const ms = rigMirrors(rig);
   for (const pl of ms) rect = reflectRect(rect, pl);
   rect.reflections = ms.length;
@@ -173,16 +192,14 @@ export function virtualScreen(rig) {
 // the image is no longer mirrored, so no flip is needed.
 // The catch is optical path length: the panel ends up as far behind the mirror as its image is in front, so
 // only a rig whose image is well away from the sheet can fold the panel below the sheet (see FOLD_EXAMPLE).
+// Adding the fold changes nothing but the fold plane: the monitor block keeps describing the same source
+// pose, and panelRect() moves the physical panel to its mirror image. Freezing the folded corners into
+// monitor.corners instead would silently deaden the size and pose fields, since monitorRect prefers corners.
 export function foldRig(rig, foldPlane) {
   const pl = planeOf(foldPlane || autoFoldPlane(rig));
-  const m = reflectRect(monitorRect(rig.monitor), pl);
-  // A real panel cannot be a mirror image of a panel: its pixel frame always turns the right way about its
-  // own face. So the panel goes on the reflected rectangle with its columns the other way round, which is
-  // also why the folded rig shows the picture un-mirrored.
   return makeRig({ ...rig,
     fold: { point: pl.point, normal: pl.normal,
-            widthCm: foldPlane?.widthCm ?? rig.monitor.widthCm * 1.2, heightCm: foldPlane?.heightCm ?? rig.monitor.heightCm * 1.4 },
-    monitor: { ...rig.monitor, corners: { tl: m.tr, tr: m.tl, br: m.bl, bl: m.br } } });
+            widthCm: foldPlane?.widthCm ?? rig.monitor.widthCm * 1.2, heightCm: foldPlane?.heightCm ?? rig.monitor.heightCm * 1.4 } });
 }
 // The mirror that drops the panel to `target` (by default under the sheet, at the back): the perpendicular
 // bisector of the monitor centre and that target.
@@ -332,7 +349,7 @@ export function projectPoint(rc, p) {
 export function projectToMonitor(rig, rc, p) {
   const pr = projectPoint(rc, p);
   const { u, v } = ndcToMonitorUV(rc, pr.ndc[0], pr.ndc[1]);
-  const mon = monitorRect(rig.monitor);
+  const mon = panelRect(rig);
   return { ...pr, u, v, point: rectPoint(mon, u, v),
            pixel: [u * (rig.monitor.pixelW || 1), v * (rig.monitor.pixelH || 1)],
            inside: u >= 0 && u <= 1 && v >= 0 && v <= 1 && !pr.behind };
@@ -351,7 +368,7 @@ export function tracePath(rig, eyeRig, apparentDir) {
     points.push(o);
     d = sub(d, scale(pl.normal, 2 * dot(d, pl.normal)));
   }
-  const mon = monitorRect(rig.monitor);
+  const mon = panelRect(rig);
   const t = rayPlane(o, d, rectPlane(mon));
   if (t === null || t <= 1e-9) return { ok: false, points, monitorPoint: null };
   const monitorPoint = add(o, scale(d, t));
@@ -362,7 +379,7 @@ export function tracePath(rig, eyeRig, apparentDir) {
 // The whole light path for one monitor pixel, in the direction the light actually travels:
 // monitor -> mirrors -> eye. Handy for drawing the rig diagram.
 export function pixelPath(rig, u, v, eyeRig) {
-  const mon = monitorRect(rig.monitor);
+  const mon = panelRect(rig);
   const start = rectPoint(mon, u, v);
   let img = start;
   for (const pl of rigMirrors(rig)) img = reflectPoint(pl, img);   // the virtual image of that pixel
@@ -395,7 +412,7 @@ export function modelRigMatrix(rig, box) {
 // sheet too small for the cone of sight, the monitor itself in the way, the model above the sheet.
 export function rigCheck(rig, eyeRig) {
   const eye = v3(eyeRig), warnings = [];
-  const V = virtualScreen(rig), mon = monitorRect(rig.monitor), sheet = planeOf(rig.sheet);
+  const V = virtualScreen(rig), mon = panelRect(rig), sheet = planeOf(rig.sheet);
   const rc = rigCamera(rig, eye);
   if (!rc.eyeInFront) warnings.push('The eye is behind the virtual screen: the monitor is facing the wrong way (raise the tilt).');
   if (signedDist(sheet, eye) <= 0) warnings.push('The eye is under the sheet.');

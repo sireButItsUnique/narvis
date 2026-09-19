@@ -11,7 +11,7 @@
 //
 // The maths here is pure and DOM-free (node --test imports it); only openCalibration() touches the page.
 
-import { DEG, v3, add, sub, scale, dot, dist, makeRig, monitorRect, virtualScreen, planeOf,
+import { DEG, v3, add, sub, scale, dot, dist, makeRig, monitorRect, panelRect, virtualScreen, planeOf,
          rigCheck, planeAxes, foldRig } from './geometry.js';
 
 // ---------- 3x3 helpers (row-major, r*3+c) ----------
@@ -40,8 +40,9 @@ export function cameraLocalFromTracker(p, webcam = [0, 0, 0], nudgeYCm = 0) {
   return [-(q[0] - w[0]), -(q[1] - w[1] - nudgeYCm), q[2] - w[2]];
 }
 // Rotation rig <- camera. pitch is positive looking down, yaw positive turning toward +X, roll about the lens.
+// The three angle fields are the only source: a matrix stashed on head used to outrank them, which left the
+// yaw/pitch/roll inputs live-looking but inert for the rest of the session (and in localStorage after a save).
 export function poseMatrix3(head) {
-  if (head.R) return head.R.slice();
   return m3mul(m3mul(m3mul(Ry((head.yawDeg || 0) * DEG), Rx((head.pitchDeg || 0) * DEG)), CAM_AXES),
                Rz((head.rollDeg || 0) * DEG));
 }
@@ -136,7 +137,9 @@ export function fitSimilarity(src, dst, { withScale = true } = {}) {
     s = num / varP;
   }
   const t = sub(mq, scale(m3apply(R, mp), s));
-  const fit = { s, R, t, quat: [x, y, z, w], n };
+  // No spread in the source points (every capture taken at the same spot) leaves the scale at 1 and the
+  // rotation an arbitrary identity, which looks like a fit but is not one. Say so rather than hide it.
+  const fit = { s, R, t, quat: [x, y, z, w], n, degenerate: varP <= 1e-12 };
   const residualsMm = P.map((pt, i) => dist(applyFit(fit, pt), Q[i]) * 10);
   fit.residualsMm = residualsMm;
   fit.rmsMm = Math.sqrt(residualsMm.reduce((a, b) => a + b * b, 0) / n);
@@ -156,9 +159,11 @@ export const fitMatrix = (fit) => {
 };
 // The head-tracker pose implied by a hand fit, when the same camera tracks both (rig = s*Rf*tracker + tf and
 // tracker = webcam + CAM_AXES * local, so the camera sits at s*Rf*webcam + tf with rotation Rf * CAM_AXES).
+// The angles are returned, not the matrix: they reproduce it to ~2e-16 (poseAngles round-trips exactly) and
+// they are what the step-2 fields edit, so Object.assign-ing this onto rig.head leaves those fields working.
 export function poseFromHandFit(fit, webcam = [0, 0, 0]) {
   const R = m3mul(fit.R, CAM_AXES);
-  return { position: add(scale(m3apply(fit.R, v3(webcam)), fit.s), fit.t), R, scale: fit.s, ...poseAngles(R) };
+  return { position: add(scale(m3apply(fit.R, v3(webcam)), fit.s), fit.t), scale: fit.s, ...poseAngles(R) };
 }
 
 // ---------- targets to touch ----------
@@ -187,7 +192,7 @@ export function clearRig(key = RIG_KEY) { try { localStorage.removeItem(key); } 
 export function drawSideView(ctx, rig, eyeRig = null, opts = {}) {
   const w = ctx.canvas.width, h = ctx.canvas.height;
   const pts = [];
-  const mon = monitorRect(rig.monitor), vs = virtualScreen(rig);
+  const mon = panelRect(rig), vs = virtualScreen(rig);   // the panel where it physically hangs, fold included
   const sheetAx = planeAxes(planeOf(rig.sheet)), sp = v3(rig.sheet.point);
   for (const r of [mon, vs]) pts.push(r.tl, r.tr, r.br, r.bl);
   pts.push(v3(rig.model.anchor), add(sp, scale(sheetAx.v, rig.sheet.depthCm / 2)), add(sp, scale(sheetAx.v, -rig.sheet.depthCm / 2)));
@@ -243,6 +248,10 @@ const HEAD_FIELDS = [
   ['head.yawDeg', 'camera yaw deg', 1], ['head.pitchDeg', 'camera pitch deg (+ looks down)', 1],
   ['head.rollDeg', 'camera roll deg', 1], ['head.scale', 'tracker scale', 0.01],
 ];
+// monitorRect prefers four measured corners over these, so with corners set they would accept input and
+// change nothing. pixelW/pixelH are NOT in the list: those are read either way.
+const CORNER_SHADOWED = new Set(['monitor.widthCm', 'monitor.heightCm', 'monitor.centre.0', 'monitor.centre.1',
+                                 'monitor.centre.2', 'monitor.tiltDeg', 'monitor.yawDeg']);
 const getPath = (o, path) => path.split('.').reduce((v, k) => v?.[k], o);
 const setPath = (o, path, val) => {
   const ks = path.split('.'), last = ks.pop();
@@ -274,6 +283,10 @@ const CSS = `
 //   onTargets(points, activeIndex) -> the rig renderer draws these spots floating under the sheet
 //   onChange(rig) -> the rig changed (re-render, re-place the model)
 // Call ctrl.tick() once a frame while step 3 is open; it does the dwell detection and auto-capture.
+
+// How far the fingertip must travel after a capture before the dwell can fire again. The targets are 10 cm
+// or more apart in every default layout, so this never suppresses a real move to the next spot.
+const REARM_CM = 2;
 export function openCalibration(opts = {}) {
   const mount = opts.mount || document.body;
   const rig = opts.rig || loadRig();
@@ -294,17 +307,22 @@ export function openCalibration(opts = {}) {
   const body = el.querySelector('.body'), msg = el.querySelector('.msg');
 
   let step = 0, targets = defaultTargets(rig), captures = [], active = 0, samples = [], dwellSince = 0;
-  let plainMonitor = rig.fold ? null : rig.monitor;   // the un-folded monitor, kept so the fold toggle is reversible
+  // The fingertip has to leave the spot it was captured at before the dwell can fire again (see tick).
+  let lastCaptureP = null, armed = true;
 
-  const numberRow = (path, label, stepSize) => {
+  const numberRow = (path, label, stepSize, disabled = false) => {
     const row = document.createElement('label');
     row.innerHTML = `<span class="muted">${label}</span>`;
     const inp = document.createElement('input');
     inp.type = 'number'; inp.step = stepSize; inp.value = getPath(rig, path);
+    inp.disabled = disabled;                        // a dead field must look dead, not just behave dead
+    if (disabled) { row.style.opacity = '0.45'; inp.title = 'the four measured corners below are in use'; }
     inp.oninput = () => { setPath(rig, path, parseFloat(inp.value) || 0); refresh(); onChange(rig); };
     row.appendChild(inp);
     return row;
   };
+  const noteRow = (text, cls = 'muted') =>
+    Object.assign(document.createElement('div'), { className: cls, textContent: text });
   // a field that is not stored directly on the rig (an angle standing in for a plane normal, say)
   const derivedRow = (label, stepSize, get, set) => {
     const row = document.createElement('label');
@@ -322,7 +340,9 @@ export function openCalibration(opts = {}) {
     body.innerHTML = '';
     el.querySelectorAll('.tabs button').forEach((b, i) => b.setAttribute('aria-selected', String(i === step)));
     if (step === 0) {
-      for (const [p, l, s] of FIELDS) body.appendChild(numberRow(p, l, s));
+      const measured = !!rig.monitor.corners;
+      for (const [p, l, s] of FIELDS) body.appendChild(numberRow(p, l, s, measured && CORNER_SHADOWED.has(p)));
+      if (measured) body.appendChild(noteRow('the greyed fields are overridden by the four measured corners below; clear the box to use them again'));
       // the sheet may be any plane; the one number worth exposing is its tilt about X
       body.appendChild(derivedRow('sheet tilt deg', 1,
         () => Math.atan2(rig.sheet.normal[2], rig.sheet.normal[1]) / DEG,
@@ -346,12 +366,13 @@ export function openCalibration(opts = {}) {
       fold.innerHTML = '<span class="muted">fold mirror (monitor below, no flip)</span>';
       const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!rig.fold;
       cb.onchange = () => {
-        // Folding keeps the same virtual screen, so nothing else in the rig has to change.
-        if (cb.checked) { plainMonitor = rig.monitor; const f = foldRig(rig); rig.fold = f.fold; rig.monitor = f.monitor; }
-        else { rig.fold = null; rig.monitor = plainMonitor || { ...rig.monitor, corners: null }; }
+        // Folding keeps the same virtual screen, so nothing else in the rig has to change - and because only
+        // the fold plane is stored, the numbers above stay live and the toggle is exactly reversible.
+        rig.fold = cb.checked ? foldRig(rig).fold : null;
         render(); onChange(rig);
       };
       fold.appendChild(cb); body.appendChild(fold);
+      if (rig.fold) body.appendChild(noteRow('folded: the numbers above are the monitor pose the fold reproduces; the panel itself hangs at its mirror image (shown below)'));
       body.appendChild(diagram);
       const note = document.createElement('div'); note.className = 'checks'; body.appendChild(note);
     } else if (step === 1) {
@@ -380,7 +401,11 @@ export function openCalibration(opts = {}) {
       const cap = document.createElement('button'); cap.className = 'act'; cap.textContent = 'capture (space)';
       cap.onclick = () => capture();
       const again = document.createElement('button'); again.className = 'act'; again.textContent = 'start over';
-      again.onclick = () => { captures = []; active = 0; targets = defaultTargets(rig); onTargets(targets, active); render(); };
+      again.onclick = () => {
+        captures = []; active = 0; targets = defaultTargets(rig);
+        samples = []; dwellSince = 0; lastCaptureP = null; armed = true;
+        onTargets(targets, active); render();
+      };
       const fitb = document.createElement('button'); fitb.className = 'act'; fitb.textContent = 'fit';
       fitb.onclick = () => doFit();
       body.append(cap, fitb, again);
@@ -423,8 +448,10 @@ export function openCalibration(opts = {}) {
   function capture() {
     if (!samples.length) { msg.textContent = 'no fingertip'; return; }
     const recent = samples.slice(-10);
-    captures[active] = scale(recent.reduce((a, s) => add(a, s.p), [0, 0, 0]), 1 / recent.length);
+    const p = scale(recent.reduce((a, s) => add(a, s.p), [0, 0, 0]), 1 / recent.length);
+    captures[active] = p;
     samples = [];
+    lastCaptureP = p; armed = false; dwellSince = 0;   // disarm until the tip has left this spot
     if (active < targets.length - 1) active++;
     else if (captures.filter(Boolean).length >= 3) doFit();
     onTargets(targets, active);
@@ -434,7 +461,10 @@ export function openCalibration(opts = {}) {
     const src = [], dst = [];
     captures.forEach((c, i) => { if (c) { src.push(c); dst.push(targets[i]); } });
     if (src.length < 3) { msg.textContent = 'need at least 3 captured spots'; return; }
-    rig.hand.fit = fitSimilarity(src, dst);
+    const fit = fitSimilarity(src, dst);
+    // A fit with no spread in the captures is worse than no fit: handToRig would use it unconditionally.
+    if (fit.degenerate) { msg.textContent = 'every spot was captured in the same place - start over and touch each target'; return; }
+    rig.hand.fit = fit;
     rig.hand.rmsMm = rig.hand.fit.rmsMm; rig.hand.maxMm = rig.hand.fit.maxMm;
     rig.hand.capturedAt = Date.now();
     onChange(rig); render();
@@ -456,13 +486,25 @@ export function openCalibration(opts = {}) {
       const p = opts.getTip();
       const read = body.querySelector('.tipread');
       if (!p) { samples = []; dwellSince = 0; if (read) read.textContent = 'no fingertip tracked'; return; }
-      samples.push({ t: now, p: v3(p) });
+      const q = v3(p);
+      samples.push({ t: now, p: q });
       while (samples.length > 60) samples.shift();
+      // Re-arming is latched on having LEFT the last captured spot, not tested on the frame the dwell fires:
+      // a tip that wanders back through the old spot on its way to the next target still counts as having
+      // left. Without it, holding still records every remaining target at the first spot (~1 s apart), and
+      // the fit ends up built from five copies of one point. A lost tip does not re-arm - a one-frame
+      // tracking dropout is not the user moving their hand.
+      if (!armed && (!lastCaptureP || dist(q, lastCaptureP) > REARM_CM)) armed = true;
+      const done = captures.filter(Boolean).length >= targets.length;   // all spots done: explicit capture only
       const old = samples.find((s) => now - s.t < 500) || samples[0];
-      const moved = dist(old.p, v3(p));
-      if (moved < 0.6 && samples.length > 6) { if (!dwellSince) dwellSince = now; }
+      const moved = dist(old.p, q);
+      if (moved < 0.6 && samples.length > 6 && armed && !done) { if (!dwellSince) dwellSince = now; }
       else dwellSince = 0;
-      if (read) read.textContent = `fingertip ${v3(p).map((n) => n.toFixed(1)).join(', ')} - ${dwellSince ? 'holding ' + Math.round(now - dwellSince) + ' ms' : 'move to the spot and hold still'}`;
+      const why = dwellSince ? 'holding ' + Math.round(now - dwellSince) + ' ms'
+        : done ? 'every spot captured - press capture (space) to redo one'
+        : !armed ? 'move to the next spot'
+        : 'move to the spot and hold still';
+      if (read) read.textContent = `fingertip ${q.map((n) => n.toFixed(1)).join(', ')} - ${why}`;
       if (dwellSince && now - dwellSince > 900) { dwellSince = 0; capture(); }
     },
     close() { removeEventListener('keydown', onKey); el.remove(); onTargets([], -1); (opts.onClose || (() => {}))(); },

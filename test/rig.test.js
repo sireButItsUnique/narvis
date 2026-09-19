@@ -6,12 +6,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
-import { makeRig, DEFAULT_RIG, monitorRect, virtualScreen, rigCamera, applyRigCamera, projectPoint,
+import { makeRig, DEFAULT_RIG, monitorRect, panelRect, virtualScreen, rigCamera, applyRigCamera, projectPoint,
          projectToMonitor, ndcToMonitorUV, rectPoint, rectUV, tracePath, pixelPath, foldRig, modelRigMatrix,
          rigCheck, reflectPoint, planeOf, lineDist, dist, sub, add, scale, dot, unit, len, FOLD_EXAMPLE,
-         mat4Apply, invertRigid } from '../public/js/rig/geometry.js';
+         mat4Apply, invertRigid, v3 } from '../public/js/rig/geometry.js';
 import { fitSimilarity, applyFit, invertFit, poseMatrix3, poseAngles, applyPose, cameraLocalFromTracker,
          trackerToRig, poseFromHandFit, defaultTargets, m3apply } from '../public/js/rig/calibrate.js';
+import { RigView } from '../public/js/rig/output.js';
 
 const rng = (seed) => () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
 const rand = rng(12345);
@@ -158,7 +159,7 @@ test('fold mirror: two reflections, no flip, same image', () => {
   // panel, not a mirror image of one), which is what saves the flip
   for (const [x, y] of [['tl', 'tr'], ['tr', 'tl'], ['bl', 'br'], ['br', 'bl']]) nearV(b[x], a[y], 1e-9, `folded virtual ${x}`);
   assert.ok(dot(b.normal, sub(EYE, b.centre)) > 0, 'the folded image faces the viewer');
-  const panel = monitorRect(folded.monitor);
+  const panel = panelRect(folded);                                  // derived, not frozen into monitor.corners
   assert.ok(panel.centre[1] < -5, `the panel is below the sheet (y ${panel.centre[1].toFixed(1)})`);
   assert.ok(panel.centre[2] < -30, 'and at the back');
   assert.equal(rigCheck(folded, EYE).ok, true, rigCheck(folded, EYE).warnings.join(' | '));
@@ -330,4 +331,108 @@ test('a full rig-mode frame: tracked eye in, monitor pixels out', () => {
   const tr = tracePath(rig, eye, sub(rig.model.anchor, eye));
   nearV(pm.point, tr.monitorPoint, 1e-6, 'pixel matches the traced light path');
   assert.ok(pm.pixel[0] >= 0 && pm.pixel[0] <= rig.monitor.pixelW);
+});
+
+// ---------- regressions ----------
+test('a folded rig keeps its monitor size and pose fields live', () => {
+  const tall = makeRig({ monitor: { ...DEFAULT_RIG.monitor, centre: [0, 75, -45], tiltDeg: 48 },
+                         sheet: { ...DEFAULT_RIG.sheet, widthCm: 60, depthCm: 50 } });
+  const folded = foldRig(tall, { point: [0, 30.4, -13.3], normal: [0, 29, 1], widthCm: 50, heightCm: 39 });
+  assert.equal(folded.monitor.corners, null, 'the fold stores a plane, not a frozen panel rectangle');
+  // the panel is derived, so editing the numbers still moves both the panel and the image it makes
+  const panel0 = panelRect(folded).centre, image0 = virtualScreen(folded).centre;
+  folded.monitor.centre = [0, 85, -45];
+  assert.ok(dist(panelRect(folded).centre, panel0) > 5, 'raising the monitor moves the panel');
+  assert.ok(dist(virtualScreen(folded).centre, image0) > 5, 'and the image with it');
+  folded.monitor.heightCm = 40;
+  near(panelRect(folded).heightCm, 40, 1e-12, 'and the size fields are read too');
+
+  // unfolding is exact: the panel goes back to the pose the numbers describe
+  const plain = { ...folded, fold: null };
+  for (const k of ['tl', 'tr', 'br', 'bl']) nearV(panelRect(plain)[k], monitorRect(plain.monitor)[k], 1e-12, k);
+  // four genuinely measured corners still outrank the numbers (which is what the greyed-out fields say)
+  const measured = makeRig({ monitor: { ...DEFAULT_RIG.monitor,
+    corners: { tl: [-20, 30, -5], tr: [20, 30, -5], br: [20, 30, 15], bl: [-20, 30, 15] } } });
+  nearV(v3(panelRect(measured).centre), [0, 30, 5], 1e-9, 'measured corners win');
+});
+
+test('RigView converts a tracked eye only when it is told where the camera is', () => {
+  const rig = makeRig({ head: { position: [1, 9, 22], yawDeg: 8, pitchDeg: -30, rollDeg: 3, scale: 1 } });
+  const webcam = [0, 9.517, 0];        // view.js webcamPos() with the shipped defaults: 14", camera 0.8 cm up
+  const nudgeYCm = 1.5;                // S.eyeYNudgeCm, which webcam.js has already added to input.eye
+  const eyeRig = [3, 36.7, 71.1];
+  // written the way webcam.js writes input.eye: world = webcam + (-x, -y, z) of the camera frame, plus nudge
+  const R = poseMatrix3(rig.head), Rt = [R[0], R[3], R[6], R[1], R[4], R[7], R[2], R[5], R[8]];
+  const local = m3apply(Rt, sub(eyeRig, rig.head.position)).map((c) => c / rig.head.scale);
+  const tracker = [webcam[0] - local[0], webcam[1] - local[1] + nudgeYCm, webcam[2] + local[2]];
+
+  const view = new RigView({ rig, webcam, nudgeYCm });
+  nearV(view.eyeToRig(tracker), eyeRig, 1e-9, 'the documented recipe recovers the eye');
+  nearV(view.update(tracker).eye, eyeRig, 1e-9, 'and update() hands that eye to the camera');
+
+  const warned = [];
+  const realWarn = console.warn;
+  console.warn = (m) => warned.push(m);
+  try {
+    const blind = new RigView({ rig });                       // webcam left out
+    const off = dist(blind.eyeToRig(tracker), eyeRig);
+    near(off, len([webcam[0], webcam[1] + nudgeYCm, webcam[2]]) * rig.head.scale, 1e-9, 'off by the camera offset');
+    assert.ok(off > 9, `${off} cm of pure eye error, and nothing downstream can see it`);
+    blind.eyeToRig(tracker);                                  // still only one complaint
+    // rig-frame input needs no tracker origin at all
+    nearV(new RigView({ rig }).update(eyeRig, { rigFrame: true }).eye, eyeRig, 1e-12, 'rigFrame passthrough');
+  } finally { console.warn = realWarn; }
+  assert.equal(warned.length, 1, `a missing tracker origin is said out loud, once (${warned.length})`);
+});
+
+test('copying the head pose from a hand fit leaves the angle fields working', () => {
+  const rig = makeRig();
+  const webcam = [0, 12.5, 0];
+  const truth = makeTransform(0.92, [0.2, 1, -0.1], 0.5, [3, -9, 7]);
+  const src = Array.from({ length: 5 }, () => [rnd(-20, 20), rnd(-20, 20), rnd(20, 60)]);
+  const fit = fitSimilarity(src, src.map((p) => applyFit(truth, p)));
+  const pose = poseFromHandFit(fit, webcam);
+  assert.equal(pose.R, undefined, 'no rotation matrix to outrank yaw/pitch/roll');
+  Object.assign(rig.head, pose);                             // what the "copy from hand fit" button does
+  const tracker = [2, 14, 38];
+  nearV(trackerToRig(rig, tracker, webcam), applyFit(fit, tracker), 1e-9, 'the copied angles reproduce the fit');
+
+  const before = trackerToRig(rig, tracker, webcam);
+  rig.head.yawDeg += 20;
+  const after = trackerToRig(rig, tracker, webcam);
+  assert.ok(dist(before, after) > 1, `editing the yaw still moves the eye (${dist(before, after).toFixed(3)} cm)`);
+  // and a matrix smuggled in through a saved rig is dropped rather than obeyed
+  const loaded = makeRig({ head: { ...rig.head, R: [1, 0, 0, 0, 1, 0, 0, 0, 1] } });
+  assert.equal(loaded.head.R, undefined, 'a stored pose matrix does not survive makeRig');
+  nearV(trackerToRig(loaded, tracker, webcam), after, 1e-12, 'the angles decide');
+});
+
+test('a fit with no spread in the captures is reported, not returned as usable', () => {
+  const targets = defaultTargets(RIG, 4);
+  const bad = fitSimilarity(targets.map(() => [4, -2, 30]), targets);    // every spot captured in one place
+  assert.equal(bad.degenerate, true);
+  near(bad.s, 1, 1e-12, 'nothing to scale');
+  assert.equal(fitSimilarity(targets.map((p) => add(p, [1, 0, 0])), targets).degenerate, false,
+               'a real spread is not degenerate');
+});
+
+test('placing the model twice leaves it the same size', () => {
+  const rig = makeRig({ model: { ...DEFAULT_RIG.model, yawDeg: 30 } });   // a yaw that is not a multiple of 90
+  const view = new RigView({ rig, webcam: [0, 0, 0] });
+  const boxy = () => { const g = new THREE.Group(); g.add(new THREE.Mesh(new THREE.BoxGeometry(40, 10, 25))); return g; };
+  const root = boxy();
+  // the model's own 40 cm axis, measured through whatever transform placeModel left on the root
+  const span = (o) => { o.updateMatrixWorld(true);
+    return o.localToWorld(new THREE.Vector3(20, 0, 0)).distanceTo(o.localToWorld(new THREE.Vector3(-20, 0, 0))); };
+  for (let i = 0; i < 3; i++) {
+    view.placeModel(root);
+    near(span(root), rig.model.fitCm, 1e-9, `largest dimension after call ${i + 1}`);
+  }
+  nearV([root.position.x, root.position.y, root.position.z], rig.model.anchor, 1e-9, 'centred on the anchor');
+  // a root that arrives already rotated (a loader's up-axis fix, say) is measured, not mis-measured
+  const tilted = boxy();
+  tilted.rotation.y = 37 * Math.PI / 180;
+  tilted.updateMatrixWorld(true);
+  view.placeModel(tilted);
+  near(span(tilted), rig.model.fitCm, 1e-9, 'pre-rotated root');
 });
