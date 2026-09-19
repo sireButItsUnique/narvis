@@ -5,7 +5,8 @@ request per line. Requests run on Blender's main thread, one at a time:
   ping, scene            what's open and what's in it
   exec {code, label}     run AI-written modelling code (bpy/bmesh/mathutils/numpy only), as one undo step
   render {views, objects, size}   PNG previews so the AI can look at what it built
-  undo, redo, mode, brush, brush_size, symmetry, focus, delete   voice commands
+  undo, redo, mode, brush, brush_size, symmetry, focus, delete, add   voice commands
+  snapshot {path}, restore {path}, fingerprint   version history (a copy of the scene; opening one; has it changed)
 """
 import base64
 import builtins
@@ -29,7 +30,7 @@ import bpy
 import mathutils
 
 PORT = 9876
-BRIDGE_FILE = os.path.join(os.path.expanduser('~'), '.holomodel', 'bridge.json')
+BRIDGE_FILE = os.path.join(os.environ.get('HOLOMODEL_HOME') or os.path.join(os.path.expanduser('~'), '.holomodel'), 'bridge.json')
 
 # ---------------------------------------------------------------- sandbox for AI-written code
 # Not a security boundary against a determined attacker (the only author is the user's own request); it stops
@@ -378,7 +379,95 @@ def cmd_add(req):
     return {'ok': True, 'object': bpy.context.view_layer.objects.active.name}
 
 
-COMMANDS = {'ping': cmd_ping, 'scene': cmd_scene, 'exec': cmd_exec, 'render': cmd_render, 'undo': cmd_undo,
+_SIMPLE_PROPS = {'BOOLEAN', 'INT', 'FLOAT', 'ENUM', 'STRING'}
+_RUNTIME_PROPS = {'rna_type', 'session_uid', 'users', 'tag', 'use_extra_user'}   # differ after a reload
+
+
+def _hash_rna(h, struct):
+    """Feed a datablock's plain settings (numbers, flags, names) into the hash."""
+    for p in struct.bl_rna.properties:
+        if p.type in _SIMPLE_PROPS and p.identifier not in _RUNTIME_PROPS and not p.identifier.startswith('is_'):
+            try:
+                v = getattr(struct, p.identifier)
+            except Exception:
+                continue
+            h.update(repr(tuple(v) if hasattr(v, '__len__') and not isinstance(v, str) else v).encode())
+
+
+def _fingerprint():
+    """A short hash of what's in the scene (geometry, transforms, modifiers, materials, lights), so the app can tell
+    whether anything changed since a version was saved."""
+    import hashlib
+    import numpy as np
+    h = hashlib.sha1()
+    for o in sorted(bpy.context.scene.objects, key=lambda o: o.name):
+        if o.name.startswith('_holo_'):
+            continue
+        if o.mode == 'EDIT':
+            o.update_from_editmode()
+        h.update(f'{o.name}|{o.type}|{o.parent.name if o.parent else ""}|{o.hide_get()}|'.encode())
+        h.update(np.array(o.matrix_world, dtype=np.float32).tobytes())
+        for m in o.modifiers:
+            _hash_rna(h, m)
+        d = o.data
+        if o.type == 'MESH':
+            co = np.empty(len(d.vertices) * 3, dtype=np.float32)
+            d.vertices.foreach_get('co', co)
+            h.update(f'{len(d.vertices)}|{len(d.edges)}|{len(d.polygons)}|'.encode())
+            h.update(co.tobytes())
+        elif o.type == 'CURVE':
+            for s in d.splines:
+                for p in list(s.bezier_points) + list(s.points):
+                    h.update(np.array(p.co, dtype=np.float32).tobytes())
+        if d is not None:
+            _hash_rna(h, d)
+        for slot in o.material_slots:
+            mat = slot.material
+            h.update((mat.name if mat else '-').encode())
+            if mat and mat.node_tree:
+                for node in mat.node_tree.nodes:
+                    h.update(node.name.encode())
+                    for sock in node.inputs:
+                        if hasattr(sock, 'default_value') and not sock.is_linked:
+                            v = sock.default_value
+                            h.update(repr(tuple(v) if hasattr(v, '__len__') and not isinstance(v, str) else v).encode())
+    return h.hexdigest()[:16]
+
+
+def cmd_fingerprint(req):
+    return {'ok': True, 'fingerprint': _fingerprint(),
+            'objects': len([o for o in bpy.context.scene.objects if not o.name.startswith('_holo_')])}
+
+
+def cmd_snapshot(req):
+    """Save a copy of the whole scene for version history. The open file and its name are untouched."""
+    path = str(req.get('path') or '')
+    if not path.endswith('.blend'):
+        return {'ok': False, 'error': 'snapshot needs a .blend path'}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if bpy.context.mode != 'OBJECT':   # edit-mode changes only reach the mesh data in object mode
+        with bpy.context.temp_override(**_view3d_override()):
+            bpy.ops.object.mode_set(mode='OBJECT')
+    with bpy.context.temp_override(**_view3d_override()):
+        bpy.ops.wm.save_as_mainfile(filepath=path, copy=True, compress=True)
+    return {'ok': True, 'path': path, 'bytes': os.path.getsize(path), 'fingerprint': _fingerprint(),
+            'objects': len([o for o in bpy.context.scene.objects if not o.name.startswith('_holo_')])}
+
+
+def cmd_restore(req):
+    """Go back to a saved version: open its snapshot (keeping the current window layout)."""
+    path = str(req.get('path') or '')
+    if not (path.endswith('.blend') and os.path.exists(path)):
+        return {'ok': False, 'error': 'no such snapshot'}
+    with bpy.context.temp_override(**_view3d_override()):
+        if bpy.context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.wm.open_mainfile(filepath=path, load_ui=False)
+    return {'ok': True, 'objects': len(bpy.context.scene.objects), 'fingerprint': _fingerprint()}
+
+
+COMMANDS = {'snapshot': cmd_snapshot, 'restore': cmd_restore, 'fingerprint': cmd_fingerprint,
+            'ping': cmd_ping, 'scene': cmd_scene, 'exec': cmd_exec, 'render': cmd_render, 'undo': cmd_undo,
             'redo': cmd_undo, 'mode': cmd_mode, 'brush': cmd_brush, 'brush_size': cmd_brush_size,
             'symmetry': cmd_symmetry, 'focus': cmd_focus, 'delete': cmd_delete, 'add': cmd_add}
 

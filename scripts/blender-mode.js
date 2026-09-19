@@ -2,9 +2,9 @@
 // Starts the app server (unless it's already running), opens Blender (the Holo Modeler add-on connects by itself),
 // starts the hand mouse, and opens the voice page in Edge. Ctrl+C stops the hand mouse and the server; Blender stays open.
 import { spawn } from 'node:child_process';
-import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { findBlender, addonUpToDate, installAddon } from './install-addon.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 try { process.loadEnvFile(path.join(root, '.env')); } catch {}
@@ -12,14 +12,6 @@ const PORT = Number(process.env.PORT) || 8765;
 const url = `http://localhost:${PORT}`;
 const children = [];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-function findBlender() {
-  if (process.env.BLENDER_PATH && fs.existsSync(process.env.BLENDER_PATH)) return process.env.BLENDER_PATH;
-  const base = 'C:\\Program Files\\Blender Foundation';
-  const versions = fs.existsSync(base) ? fs.readdirSync(base).filter(d => fs.existsSync(path.join(base, d, 'blender.exe'))) : [];
-  versions.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  return versions.length ? path.join(base, versions.at(-1), 'blender.exe') : null;
-}
 
 const get = p => fetch(`${url}${p}`).then(r => (r.ok ? r.json() : null)).catch(() => null);
 
@@ -33,21 +25,30 @@ async function main() {
     }
     console.log(`Server already running at ${url}`);
   } else {
-    children.push(spawn(process.execPath, [path.join(root, 'server.js')], { cwd: root, stdio: 'inherit' }));
+    const instrument = pathToFileURL(path.join(root, 'server', 'instrument.js')).href;   // Sentry, when SENTRY_DSN is set
+    children.push(spawn(process.execPath, ['--import', instrument, path.join(root, 'server.js')], { cwd: root, stdio: 'inherit' }));
     for (let i = 0; i < 40 && !(await get('/api/status')); i++) await sleep(250);
   }
 
-  // 2. Blender
-  if ((await get('/api/blender/status'))?.connected) {
-    console.log('Blender is already open and connected.');
-  } else {
-    const blender = findBlender();
-    if (!blender) {
-      console.log('Blender not found. Install it (winget install BlenderFoundation.Blender) or set BLENDER_PATH in .env.');
-    } else {
-      console.log(`Opening ${blender}`);
-      spawn(blender, [], { detached: true, stdio: 'ignore' }).unref();
+  // 2. Blender, with this repo's version of the add-on
+  const blender = findBlender();
+  const connected = (await get('/api/blender/status'))?.connected;
+  if (blender && !addonUpToDate(blender)) {
+    console.log('Updating the Holo Modeler add-on in Blender...');
+    try {
+      installAddon(blender);
+      if (connected) console.log('Updated. Restart Blender (save your work first) so it loads the new add-on.');
+    } catch (err) {
+      console.log(err.message);
     }
+  }
+  if (connected) {
+    console.log('Blender is already open and connected.');
+  } else if (!blender) {
+    console.log('Blender not found. Install it (winget install BlenderFoundation.Blender) or set BLENDER_PATH in .env.');
+  } else {
+    console.log(`Opening ${blender}`);
+    spawn(blender, [], { detached: true, stdio: 'ignore' }).unref();
   }
 
   // 3. the voice page (Edge has the speech recognition)

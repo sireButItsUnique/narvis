@@ -5,10 +5,12 @@
   "description": "Say what you want and Claude models it in Blender; your hand is the mouse. Also: a head-tracked 3D window.",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --import ./server/instrument.js server.js",
     "blender": "node scripts/blender-mode.js",
     "handmouse": "py handmouse/handmouse.py",
-    "test": "node --test && py -m unittest discover -s handmouse"
+    "test": "node --test && py -m unittest discover -s handmouse",
+    "addon": "node scripts/install-addon.js",
+    "check": "node scripts/check-integrations.js"
   },
   "engines": {
     "node": ">=20.12"

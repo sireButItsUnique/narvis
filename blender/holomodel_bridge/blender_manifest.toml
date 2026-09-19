@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "holomodel_bridge"
-version = "0.1.0"
+version = "0.2.0"
 name = "Holo Modeler Bridge"
 tagline = "Lets the Holo Modeler app build and edit models in this Blender"
 maintainer = "TC-al"
@@ -12,3 +12,6 @@ license = ["SPDX:GPL-3.0-or-later"]
 [permissions]
 network = "Listens on this computer only, for the Holo Modeler app"
 files = "Writes its connection details and temporary preview renders"
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "*.pyc"]

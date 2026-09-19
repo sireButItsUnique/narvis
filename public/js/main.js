@@ -8,7 +8,9 @@ import { updateInteraction, pointedPart, tool, TOOLS, setBrush } from './interac
 import { model, setModel, addPrimitive, deletePart, clearModel, scaleBy, setSpin, turnBy, undo, resetPlacement,
          recolorPart, duplicatePart, sculptedNames, layout, update as updateModel } from './model.js';
 import { parseCommand, parseTyped } from './commands.js';
-import { createVoice } from './voice.js';
+import { createVoice, createCloudVoice } from './voice.js';
+import { createSpeaker } from './speak.js';
+import { startSentry, tag } from './observability.js';
 import { exportGlb, glbBytes } from './export.js';
 import { sanitizeSpec } from './spec.js';
 import { startBlenderMode, runBlenderCommand } from './blendermode.js';
@@ -90,7 +92,8 @@ $('btn-blender').addEventListener('click', () => {
   started = true;
   $('htw-start').hidden = true;
   $('voice-bar').hidden = false;
-  startBlenderMode({ flash });
+  tag('mode', 'blender');
+  startBlenderMode({ flash, say: text => { if (S.talk) speaker.say(text); } });
   if (S.mic) voice.start();
 });
 if (location.hash === '#blender') $('btn-blender').focus();
@@ -110,7 +113,11 @@ const MIC_TEXT = {
   network: 'speech service unreachable (Brave blocks it): open in Edge, or press / to type',
   error: 'voice stopped: press V to retry',
 };
-function showMic(state) { const el = $('mic-state'); el.textContent = MIC_TEXT[state] || state; el.dataset.state = state; }
+function showMic(state) {
+  const el = $('mic-state');
+  el.textContent = (MIC_TEXT[state] || state) + (state === 'listening' && voice?.engine === 'elevenlabs' ? ' (ElevenLabs)' : '');
+  el.dataset.state = state;
+}
 
 let heardTimer = 0;
 function showHeard(text, kind) {
@@ -121,16 +128,43 @@ function showHeard(text, kind) {
   if (kind !== 'interim') heardTimer = setTimeout(() => el.classList.add('stale'), 5000);
 }
 
-const voice = createVoice({
-  onState: showMic,
+const voiceHandlers = {
+  onState: s => showMic(s),
   onInterim: text => { if (text) showHeard(text, 'interim'); },
   onFinal: text => {
     const cmd = parseCommand(text);
     showHeard(text, cmd ? 'command' : 'ignored');
     if (cmd) runCommand(cmd);
   },
-});
+};
+let voice = createVoice(voiceHandlers);   // Edge's recogniser until /api/config says ElevenLabs is set up
 showMic(voice.state);
+
+// the reply voice; the mic ignores what it hears while this talks
+let speaker = createSpeaker({ onTalking: on => voice.mute(on) });
+
+function useVoiceEngine(kind) {
+  if (voice.engine === kind) return;
+  const wasOn = voice.wanted;
+  voice.stop();
+  voice = kind === 'elevenlabs'
+    ? createCloudVoice({ ...voiceHandlers, onFail: err => {
+        flash(`ElevenLabs voice failed (${err.message}), so using the browser's`, 6000);
+        useVoiceEngine('browser');
+      } })
+    : createVoice(voiceHandlers);
+  showMic(voice.state);
+  if (wasOn) voice.start();
+}
+
+// which integrations the server has keys for: ElevenLabs voice, Sentry, where version history is kept
+fetch('/api/config').then(r => r.json()).then(config => {
+  if (config.voice === 'elevenlabs') {
+    useVoiceEngine('elevenlabs');
+    speaker = createSpeaker({ engine: 'elevenlabs', onTalking: on => voice.mute(on) });
+  }
+  startSentry(config).catch(err => console.warn(err.message));
+}).catch(() => {});
 
 // ---------- typed commands (press /) ----------
 const cmdBox = $('cmd');
@@ -209,7 +243,8 @@ function runCommand(cmd) {
       return flash(`Recoloured ${part.name}`);
     }
     case 'mode':   return setTool(cmd.mode === 'edit' ? 'part' : cmd.mode);
-    case 'redo': case 'focus': case 'brush_pick': return flash('That one is for Blender mode');
+    case 'redo': case 'focus': case 'brush_pick': case 'save_version': case 'restore_version': case 'versions':
+      return flash('That one is for Blender mode');
     case 'mirror': tool.mirror = cmd.on; showTool(); return flash(`Mirror ${cmd.on ? 'on: sculpting copies across the middle' : 'off'}`);
     case 'brush':  setBrush(tool.brush * cmd.factor); showTool(); return flash(`Brush ${tool.brush.toFixed(1)} cm`);
     case 'turn':   return flash(turnBy(cmd.deg) ? `Turned ${cmd.deg === 180 ? 'around' : cmd.deg < 0 ? 'left' : 'right'}` : 'Nothing to turn');
@@ -244,6 +279,7 @@ addEventListener('keydown', async e => {
   else if (k === 'e') { S.eye = { center: 'left', left: 'right', right: 'center' }[S.eye]; saveSettings(); eyeFilt.forEach(fl => fl.reset()); flash(`Tracking: ${S.eye === 'center' ? 'between eyes' : S.eye + ' eye'}`); }
   else if (k === 'r') { resetPlacement(); flash('Model back in the middle'); }
   else if (k === 'v') { if (started) { S.mic = voice.toggle(); saveSettings(); } }
+  else if (k === 't') { S.talk = !S.talk; saveSettings(); if (!S.talk) speaker.stop(); flash(`Spoken replies ${S.talk ? 'on' : 'off'}`); }
   else if (k >= '1' && k <= '4') { if (started) setTool(TOOLS[+k - 1]); }
   else if (k === '[' || k === ']') { if (started) runCommand({ type: 'brush', factor: k === ']' ? 1.35 : 1 / 1.35 }); }
   else if (k === 'x') { if (started) runCommand({ type: 'mirror', on: !tool.mirror }); }

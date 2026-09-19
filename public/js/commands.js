@@ -66,6 +66,41 @@ const CHANGE_TAIL = new RegExp(`\\b(?:(?!(?:${ER_NOUNS})$)[a-z]{2,}(?:er|ier)|mo
 const THAT_WORDS = 'it|this|that|this part|that part|this one|that one';
 const THAT = `(?:${THAT_WORDS})`;
 
+// "version three", "version 3", "version to" (a misheard two), "version twenty one"
+const ONES = { one: 1, won: 1, two: 2, to: 2, too: 2, three: 3, four: 4, for: 4, five: 5, six: 6, seven: 7, eight: 8, ate: 8,
+               nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16,
+               seventeen: 17, eighteen: 18, nineteen: 19 };
+const TENS = { twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90 };
+const DIGIT_WORDS = Object.keys(ONES).filter(w => ONES[w] < 10).join('|');
+const NUMBER = `(\\d{1,4}|(?:${Object.keys(TENS).join('|')})(?:[ -](?:${DIGIT_WORDS}))?|${Object.keys(ONES).join('|')})`;
+export function numberFrom(words) {
+  if (/^\d+$/.test(words)) return Number(words);
+  const [a, b] = words.split(/[ -]/);
+  if (TENS[a]) return TENS[a] + (b ? ONES[b] || 0 : 0);
+  return ONES[a] ?? null;
+}
+
+// version history (Blender mode): these come before "go back" (undo) and "save" (export)
+function parseVersion(t) {
+  let m;
+  if ((m = t.match(new RegExp(`^(?:go back|revert|restore|return|roll back|switch|jump|load|open|bring back)(?: to)? (?:the )?version (?:number )?${NUMBER}$`)))) {
+    return { type: 'restore_version', which: String(numberFrom(m[1])) };
+  }
+  if (/^(?:go back (?:a|one) version|(?:(?:go back|revert|return|roll back|switch) to |restore |load |bring back )?(?:the )?(?:previous|last|earlier|old) version|undo (?:the )?(?:last )?build)$/.test(t)) {
+    return { type: 'restore_version', which: 'previous' };
+  }
+  if (/^(?:(?:go|switch|jump|return) (?:back )?to |restore |load )(?:the )?(?:latest|newest|most recent) version$/.test(t)) {
+    return { type: 'restore_version', which: 'latest' };
+  }
+  if ((m = t.match(/^(?:save|keep|make|take|add)(?: a| this| the)?(?: new)? (?:version|checkpoint|snapshot)(?: (?:as|called|named) (.+))?$|^(?:checkpoint|snapshot)(?: (?:it|this|that))?$/))) {
+    return { type: 'save_version', label: m[1] || '' };
+  }
+  if (/^(?:(?:show|list|open)(?: me)?(?: the| all(?: the)?| my)? versions|(?:the )?version history|what versions (?:are there|do i have|have i got))$/.test(t)) {
+    return { type: 'versions' };
+  }
+  return null;
+}
+
 export function normalize(text) {
   return String(text ?? '').toLowerCase()
     .replace(/(?<!\d)\.|\.(?!\d)/g, ' ')        // drop full stops, keep decimals like 1.5
@@ -82,6 +117,7 @@ export function parseCommand(text) {
   let m;
 
   if (/^(?:cancel|never ?mind|forget it|abort)$/.test(t)) return { type: 'cancel' };
+  if ((m = parseVersion(t))) return m;
   if (/^(?:undo|undo that|go back|take that back|oops)$/.test(t)) return { type: 'undo' };
   if (/^(?:redo|redo that)$/.test(t)) return { type: 'redo' };
   if (/^(?:focus|focus on it|frame it|zoom to it|show me|show it|center it|centre it|find it)$/.test(t)) return { type: 'focus' };

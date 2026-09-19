@@ -1,6 +1,6 @@
 // ---------- settings (all lengths in cm unless noted) ----------
 export const DEFAULTS = { diagIn: 14, camAboveCm: 0.8, camXCm: 0, ipdMm: 63, hfovDeg: 60, eyeYNudgeCm: 0,
-                          knownDistCm: 50, eye: 'center', hands: true, popout: false, mic: true };
+                          knownDistCm: 50, eye: 'center', hands: true, popout: false, mic: true, talk: true };
 export const S = loadSettings();
 function loadSettings() {
   try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('htw-settings') || '{}') }; }

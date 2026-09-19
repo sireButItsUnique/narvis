@@ -18,6 +18,7 @@ from mediapipe.tasks.python import BaseOptions, vision
 
 import win32input
 from gestures import Config, HandMouse, palm_center
+from observability import Tracer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.path.join(HERE, 'models', 'hand_landmarker.task')
@@ -86,6 +87,7 @@ def main():
     ap.add_argument('--dry-run', action='store_true', help="print mouse actions instead of doing them")
     args = ap.parse_args()
 
+    tracer = Tracer()   # Sentry, when SENTRY_DSN is set
     ensure_model()
     cfg = Config(main_hand='Left' if args.left else 'Right')
     sw, sh = win32input.screen_size()
@@ -113,56 +115,67 @@ def main():
     print('Hand mouse running. F8 pauses, Esc (in the preview window) quits.')
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                # camera unplugged or blocked: let go of any held button (after the usual grace period),
-                # and keep F8 and the preview window responsive
+            with tracer.frame() as trace:   # every few seconds, one frame is traced stage by stage
+                with trace.span('camera.read'):
+                    ok, frame = cap.read()
+                if not ok:
+                    # camera unplugged or blocked: let go of any held button (after the usual grace period),
+                    # and keep F8 and the preview window responsive
+                    now = time.perf_counter()
+                    if fail_since is None:
+                        tracer.log('camera stopped delivering frames')
+                    fail_since = fail_since or now
+                    if now - fail_since > cfg.lost_release:
+                        for a in hm.release_all():
+                            act(a)
+                        hm.state = 'no camera'
+                    f8 = win32input.key_is_down('f8')
+                    if f8 and not f8_was_down:
+                        enabled = not enabled
+                    f8_was_down = f8
+                    key = cv2.waitKey(10) & 0xFF
+                    if key == 27 or cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+                    continue
+                fail_since = None
+                frame = cv2.flip(frame, 1)   # mirror: move your hand right, the cursor goes right
                 now = time.perf_counter()
-                fail_since = fail_since or now
-                if now - fail_since > cfg.lost_release:
-                    for a in hm.release_all():
-                        act(a)
-                    hm.state = 'no camera'
+                h, w = frame.shape[:2]
+                with trace.span('mediapipe.detect'):
+                    result = landmarker.detect_for_video(
+                        mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), int((now - t0) * 1000))
+                    hands = read_hands(result, w, h)
+
                 f8 = win32input.key_is_down('f8')
                 if f8 and not f8_was_down:
                     enabled = not enabled
                 f8_was_down = f8
-                key = cv2.waitKey(10) & 0xFF
+                with trace.span('gestures.update'):
+                    if enabled:
+                        if not args.dry_run and not hm.aux:   # an orbit/pan starts from wherever the pointer really is
+                            x, y = win32input.cursor_pos()
+                            hm.cursor = (min(sw - 1, max(0, x)), min(sh - 1, max(0, y)))
+                        actions = hm.update(hands, now, w, h)
+                    else:
+                        actions = hm.release_all()
+                        hm.state = 'paused'
+                with trace.span('mouse.send'):
+                    for a in actions:
+                        act(a)
+
+                fps = 0.9 * fps + 0.1 / max(1e-3, now - last)
+                last = now
+                trace.set('fps', round(fps, 1))
+                trace.set('hands', sum(v is not None for v in hands.values()))
+                trace.set('state', hm.state)
+                with trace.span('preview.draw'):
+                    draw(frame, hands, hm, enabled, cfg, fps)
+                    cv2.imshow(WINDOW, frame)
+                    key = cv2.waitKey(1) & 0xFF
                 if key == 27 or cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
                     break
-                continue
-            fail_since = None
-            frame = cv2.flip(frame, 1)   # mirror: move your hand right, the cursor goes right
-            now = time.perf_counter()
-            h, w = frame.shape[:2]
-            result = landmarker.detect_for_video(
-                mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), int((now - t0) * 1000))
-            hands = read_hands(result, w, h)
-
-            f8 = win32input.key_is_down('f8')
-            if f8 and not f8_was_down:
-                enabled = not enabled
-            f8_was_down = f8
-            if enabled:
-                if not args.dry_run and not hm.aux:   # an orbit/pan starts from wherever the pointer really is
-                    x, y = win32input.cursor_pos()
-                    hm.cursor = (min(sw - 1, max(0, x)), min(sh - 1, max(0, y)))
-                actions = hm.update(hands, now, w, h)
-            else:
-                actions = hm.release_all()
-                hm.state = 'paused'
-            for a in actions:
-                act(a)
-
-            fps = 0.9 * fps + 0.1 / max(1e-3, now - last)
-            last = now
-            draw(frame, hands, hm, enabled, cfg, fps)
-            cv2.imshow(WINDOW, frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27 or cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
-                break
-            if key in (ord('p'), ord('P')):
-                enabled = not enabled
+                if key in (ord('p'), ord('P')):
+                    enabled = not enabled
     finally:
         for a in hm.release_all():   # never leave a button stuck down
             act(a)

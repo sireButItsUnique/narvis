@@ -98,3 +98,25 @@ test('typed text that is not a command becomes a make request', () => {
   assert.deepEqual(parseTyped('undo'), { type: 'undo' });
   assert.equal(parseTyped('   '), null);
 });
+
+test('version history commands (Blender mode)', () => {
+  const said = {
+    'save version': { type: 'save_version', label: '' },
+    'save a version called gold frame': { type: 'save_version', label: 'gold frame' },
+    'checkpoint': { type: 'save_version', label: '' },
+    'go back to version 3': { type: 'restore_version', which: '3' },
+    'Go back to version three.': { type: 'restore_version', which: '3' },
+    'restore version to': { type: 'restore_version', which: '2' },   // a misheard "two"
+    'load version number twenty one': { type: 'restore_version', which: '21' },
+    'go back a version': { type: 'restore_version', which: 'previous' },
+    'go back to the previous version': { type: 'restore_version', which: 'previous' },
+    'go to the latest version': { type: 'restore_version', which: 'latest' },
+    'show versions': { type: 'versions' },
+    'version history': { type: 'versions' },
+  };
+  for (const [s, expected] of Object.entries(said)) assert.deepEqual(parseCommand(s), expected, s);
+  // the older meanings of the same words still work
+  assert.deepEqual(parseCommand('go back'), { type: 'undo' });
+  assert.deepEqual(parseCommand('save it'), { type: 'export' });
+  assert.deepEqual(parseCommand('go back to sculpt mode'), { type: 'mode', mode: 'sculpt' });
+});

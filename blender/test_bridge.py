@@ -106,6 +106,30 @@ r = hb.handle({'cmd': 'render', 'views': ['three_quarter', 'side', 'front'], 'si
 print(f'INFO next render (3 views, 640px) took {time.time() - t:.1f}s')
 check('a second render works too', r['ok'] and len(r['images']) == 3, r.get('error'))
 
+# version history: snapshot the scene, change it, restore the snapshot
+import tempfile
+snap = os.path.join(tempfile.gettempdir(), 'holo_test_snapshot.blend')
+r = hb.handle({'cmd': 'snapshot', 'path': snap})
+check('snapshot writes a .blend', r['ok'] and os.path.getsize(snap) > 1000, r)
+names_then = sorted(o.name for o in bpy.data.objects)
+fp_then = r.get('fingerprint')
+check('fingerprint is stable when nothing changes', hb.handle({'cmd': 'fingerprint'})['fingerprint'] == fp_then)
+hb.handle({'cmd': 'exec', 'code': 'bpy.ops.mesh.primitive_monkey_add()'})
+check('scene changed after the snapshot', sorted(o.name for o in bpy.data.objects) != names_then)
+check('fingerprint sees a new object', hb.handle({'cmd': 'fingerprint'})['fingerprint'] != fp_then)
+r = hb.handle({'cmd': 'restore', 'path': snap})
+check('restore brings the snapshot back', r['ok'] and sorted(o.name for o in bpy.data.objects) == names_then,
+      (r, sorted(o.name for o in bpy.data.objects)))
+check('a restored snapshot has the fingerprint it was saved with', r.get('fingerprint') == fp_then, (r.get('fingerprint'), fp_then))
+hb.handle({'cmd': 'exec', 'code': 'bpy.data.objects["mug_body"].data.vertices[0].co.x += 0.001'})
+check('fingerprint sees a sculpt-sized edit', hb.handle({'cmd': 'fingerprint'})['fingerprint'] != fp_then)
+hb.handle({'cmd': 'exec', 'code': 'bpy.data.materials["glaze"].node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (0, 0, 1, 1)'})
+fp_blue = hb.handle({'cmd': 'fingerprint'})['fingerprint']
+hb.handle({'cmd': 'exec', 'code': 'bpy.data.materials["glaze"].node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (1, 0, 0, 1)'})
+check('fingerprint sees a colour change', hb.handle({'cmd': 'fingerprint'})['fingerprint'] != fp_blue)
+check('restore refuses a missing file', not hb.handle({'cmd': 'restore', 'path': 'C:/nope.blend'})['ok'])
+os.remove(snap)
+
 # the socket server + token, pumped by hand (background Blender has no timer loop)
 hb._start_server()
 with open(hb.BRIDGE_FILE) as f:

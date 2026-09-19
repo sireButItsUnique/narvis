@@ -5,8 +5,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { providerInfo, generateModel, NoKeyError } from './server/ai.js';
+import * as Sentry from '@sentry/node';
 import { bridge, buildInBlender, blenderModel, BridgeError } from './server/blender.js';
 import { sanitizeSpec } from './public/js/spec.js';
+import { saveVersion, restoreVersion, listVersions, versionThumb, VersionError } from './server/versions.js';
+import { history, historyInfo, LOCAL_DIR } from './server/history.js';
+import { voiceAvailable, transcribe, speak, warmUp } from './server/voice.js';
+import { textureToolAvailable } from './server/texture-tool.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 try { process.loadEnvFile(path.join(here, '.env')); } catch {}   // .env is optional; without it only local commands work
@@ -57,6 +62,7 @@ async function handleModel(req, res) {
   } catch (err) {
     if (ac.signal.aborted) return;
     if (err instanceof NoKeyError) return sendJson(res, 503, { error: 'no_key', message: err.message });
+    Sentry.captureException(err);
     console.error('[ai] failed:', err);
     sendJson(res, 502, { error: 'ai_failed', message: err.message || String(err) });
   }
@@ -89,13 +95,35 @@ async function blenderBuild(req, res) {
     if (!res.writableEnded) { controller.abort(); if (building?.controller === controller) building = null; }
   });
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
-  const emit = ev => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(ev)}\n\n`); };
+  const send = ev => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(ev)}\n\n`); };
+  const steps = [], sources = new Map();   // kept with the version
+  const emit = ev => {
+    if (ev.type === 'step' && ev.state === 'done') steps.push(ev.label);
+    if (ev.type === 'sources') for (const s of ev.items) if (s.url && sources.size < 12) sources.set(s.url, s.title || s.url);
+    send(ev);
+  };
   const t0 = Date.now();
+  const mode = body.mode === 'change' ? 'change' : 'make';
   try {
-    const { usd = 0 } = await buildInBlender({ prompt, mode: body.mode === 'change' ? 'change' : 'make', emit, signal: controller.signal });
-    console.log(`[blender] "${prompt}" done in ${((Date.now() - t0) / 1000).toFixed(0)}s, about $${usd.toFixed(2)}`);
+    const { usd = 0, summary = '', turns = 0 } = await buildInBlender({ prompt, mode, emit, signal: controller.signal });
+    const durationMs = Date.now() - t0;
+    console.log(`[blender] "${prompt}" done in ${(durationMs / 1000).toFixed(0)}s, about $${usd.toFixed(2)}`);
+    if (!controller.signal.aborted) {
+      send({ type: 'status', text: 'Saving this version…' });
+      try {
+        const v = await saveVersion({ prompt, mode, summary, usd: Number(usd.toFixed(4)), durationMs, turns,
+                                      model: blenderModel(), steps, sources: [...sources].map(([url, title]) => ({ url, title })) });
+        send({ type: 'saved', version: v });
+      } catch (err) {
+        Sentry.captureException(err);
+        console.error('[history] save failed:', err.message);
+        send({ type: 'status', text: '' });
+        send({ type: 'warn', message: `Built, but couldn't save a version: ${err.message}` });
+      }
+    }
   } catch (err) {
     if (!controller.signal.aborted) {
+      Sentry.captureException(err);
       console.error('[blender] failed:', err.message);
       emit({ type: 'error', message: err instanceof BridgeError ? err.message : `Couldn't build it: ${err.message}` });
     } else {
@@ -119,6 +147,95 @@ async function blenderCommand(req, res) {
   } catch (err) {
     sendJson(res, 502, { ok: false, error: err.message });
   }
+}
+
+// ---------- version history (MongoDB Atlas, or local files until MONGODB_URI is set) ----------
+async function historyRoute(req, res, pathname) {
+  const m = pathname.match(/^\/api\/history(?:\/([\w.-]{1,40})(?:\/(thumb|restore))?)?$/);
+  if (!m) return sendJson(res, 404, { error: 'not_found' });
+  const [, id, action] = m;
+  try {
+    if (!id && req.method === 'GET') {
+      return sendJson(res, 200, { ...(await listVersions()), ...historyInfo() });
+    }
+    if (action === 'thumb' && req.method === 'GET') {
+      const png = await versionThumb(id);
+      if (!png) return sendJson(res, 404, { error: 'not_found' });
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'max-age=31536000, immutable' });
+      return res.end(png);
+    }
+    if (req.method !== 'POST' || (action !== 'restore' && id !== 'checkpoint') || (id === 'checkpoint' && action)) {
+      return sendJson(res, 405, { error: 'method_not_allowed' });
+    }
+    const body = await readJson(req).catch(() => ({}));
+    if (building) return sendJson(res, 409, { error: 'busy', message: 'Wait for the build to finish (or say "cancel").' });
+    building = { controller: new AbortController() };
+    try {
+      if (id === 'checkpoint') {
+        const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim().slice(0, 120) : 'saved by voice';
+        return sendJson(res, 200, { ok: true, version: await saveVersion({ kind: 'manual', prompt: label }) });
+      }
+      return sendJson(res, 200, { ok: true, ...(await restoreVersion(id)) });
+    } finally {
+      building = null;
+    }
+  } catch (err) {
+    if (!(err instanceof VersionError || err instanceof BridgeError)) { Sentry.captureException(err); console.error('[history]', err); }
+    sendJson(res, err instanceof VersionError ? 400 : 502, { ok: false, error: err.message });
+  }
+}
+
+// ---------- voice (ElevenLabs when ELEVENLABS_API_KEY is set; otherwise the page uses the browser's) ----------
+function readRaw(req, limit) {
+  return new Promise((resolve, reject) => {
+    let size = 0; const chunks = [];
+    req.on('data', c => {
+      size += c.length;
+      if (size > limit) { reject(new Error('recording too long')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+async function voiceRoute(req, res, pathname) {
+  if (req.method !== 'POST') return sendJson(res, 405, { error: 'method_not_allowed', message: 'POST only' });
+  if (!voiceAvailable()) return sendJson(res, 503, { error: 'no_key', message: 'No ELEVENLABS_API_KEY in .env.' });
+  const ac = new AbortController();
+  res.on('close', () => { if (!res.writableEnded) ac.abort(); });
+  try {
+    if (pathname === '/api/voice/transcribe') {
+      const audio = await readRaw(req, 8 * 1024 * 1024);
+      if (audio.length < 1000) return sendJson(res, 200, { text: '' });
+      return sendJson(res, 200, { text: await transcribe(audio, String(req.headers['content-type'] || 'audio/webm'), ac.signal) });
+    }
+    if (pathname === '/api/voice/speak') {
+      const body = await readJson(req);
+      const text = typeof body.text === 'string' ? body.text.trim().slice(0, 600) : '';
+      if (!text) return sendJson(res, 400, { error: 'bad_request', message: 'nothing to say' });
+      const audio = await speak(text, ac.signal);
+      res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store' });
+      return audio.pipe(res);
+    }
+    sendJson(res, 404, { error: 'not_found' });
+  } catch (err) {
+    if (ac.signal.aborted) return;
+    Sentry.captureException(err);
+    console.error('[voice]', err.message);
+    if (!res.headersSent) sendJson(res, 502, { error: 'voice_failed', message: err.message });
+    else res.destroy();
+  }
+}
+
+// what the page needs to know at startup; the Sentry DSN is public by design (it's only for sending events)
+function config(res) {
+  sendJson(res, 200, {
+    sentryDsn: (process.env.SENTRY_DSN || '').trim() || null,
+    voice: voiceAvailable() ? 'elevenlabs' : 'browser',
+    history: historyInfo().kind,
+    textures: textureToolAvailable(),
+  });
 }
 
 function serveStatic(pathname, res) {
@@ -146,6 +263,9 @@ http.createServer((req, res) => {
     if (req.method !== 'POST') return sendJson(res, 405, { error: 'method_not_allowed', message: 'POST only' });
     return pathname.endsWith('build') ? blenderBuild(req, res) : blenderCommand(req, res);
   }
+  if (pathname === '/api/history' || pathname.startsWith('/api/history/')) return historyRoute(req, res, pathname);
+  if (pathname.startsWith('/api/voice/')) return voiceRoute(req, res, pathname);
+  if (pathname === '/api/config') return config(res);
   if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method_not_allowed' });
   serveStatic(pathname, res);
 }).listen(PORT, '127.0.0.1', () => {
@@ -153,4 +273,9 @@ http.createServer((req, res) => {
   console.log(`serving on http://localhost:${PORT}  (open it in Edge for voice)`);
   console.log(ai.provider ? `AI: ${ai.provider} (${ai.model})` : 'AI: no key in .env yet, so "make a ___" is off; local commands still work');
   console.log(`Blender mode builds with ${blenderModel()}`);
+  console.log(`Voice: ${voiceAvailable() ? 'ElevenLabs (Scribe v2 in, Flash voice out)' : "the browser's (add ELEVENLABS_API_KEY for ElevenLabs)"}`);
+  console.log(`Sentry: ${(process.env.SENTRY_DSN || '').trim() ? 'on' : 'off (add SENTRY_DSN)'}`);
+  warmUp();
+  history().then(s => { if (s.kind === 'local') console.log(`History: local files in ${LOCAL_DIR} (add MONGODB_URI for Atlas)`); })
+    .catch(err => console.error('History:', err.message));
 });

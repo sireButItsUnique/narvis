@@ -93,9 +93,22 @@
   #bp-log li.request { color:var(--cyan); font-weight:600; }
   #bp-log li.thinking { color:var(--dim); font-style:italic; }
   #bp-log li.look { color:#c79bff; }
+  #bp-log li.research { color:var(--amber); }
+  #bp-log li.sources { color:var(--dim); font-size:13px; }
+  #bp-log li.sources a { color:var(--dim); }
   #bp-log li.warn { color:var(--amber); }
   #bp-log li.error { color:var(--red); }
   #bp-log li.done { color:var(--green); }
+  #bp-log li.saved { color:var(--dim); }
+  .bp-versions-head { font-size:12px; color:var(--dim); margin-bottom:6px; }
+  #bp-versions-list { display:flex; gap:8px; overflow-x:auto; padding-bottom:4px; }
+  #bp-versions-list .version { flex:none; display:flex; flex-direction:column; align-items:center; gap:3px; width:84px;
+    padding:4px; background:var(--panel); border:1px solid var(--line); border-radius:8px; color:var(--text);
+    font-family:inherit; font-size:12px; line-height:1.2; cursor:pointer; }
+  #bp-versions-list .version:hover, #bp-versions-list .version:focus-visible { border-color:var(--cyan); }
+  #bp-versions-list .version[data-current="1"] { border-color:var(--green); box-shadow:0 0 0 1px var(--green); }
+  #bp-versions-list .version.checkpoint { opacity:.65; }
+  #bp-versions-list img { width:74px; height:74px; object-fit:cover; border-radius:5px; background:#000; }
   #bp-help { font-size:13px; color:var(--dim); line-height:1.5; }
   #bp-help b { color:var(--text); font-weight:600; }
   body.blender-mode #voice-bar { max-width:calc(100vw - 40px); }
@@ -116,10 +129,15 @@
 <div id="blender-panel" hidden>
   <div class="bp-head"><span id="bp-conn" data-on="0"></span><span id="bp-title">Connecting to Blender…</span><span id="bp-cost"></span></div>
   <div id="bp-status"></div>
+  <div id="bp-versions" hidden>
+    <div class="bp-versions-head">Versions <span id="bp-versions-where"></span> · click one, or say "go back to version 2"</div>
+    <div id="bp-versions-list"></div>
+  </div>
   <ol id="bp-log"></ol>
   <div id="bp-help">
     Say <b>"make the Mona Lisa"</b> and Claude Fable builds it in Blender, checks renders of it, and fixes it. Then <b>"make the frame gold"</b> to change it.
     <b>"sculpt mode"</b>, <b>"clay brush"</b>, <b>"grab brush"</b>, <b>"bigger brush"</b>, <b>"mirror on"</b>, <b>"object mode"</b>, <b>"edit mode"</b>, <b>"frame it"</b>, <b>"undo"</b>, <b>"cancel"</b>.
+    Every build is saved as a version: <b>"go back to version 2"</b>, <b>"go back a version"</b>, <b>"save version"</b>. T turns spoken replies on or off.
     Your hand is the mouse (<b>npm run blender</b> starts it, or <b>npm run handmouse</b> on its own). Pinch to click and drag, pinch-drag with your other hand to orbit, make a fist to pause.
   </div>
 </div>
