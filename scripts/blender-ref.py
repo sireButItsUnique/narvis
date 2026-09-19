@@ -80,3 +80,12 @@ case("draw_half_pressure", "Draw", pressure=0.5)
 case("grab_pull", "Grab", n=6, x0=0.0, dx=12.0)
 case("grab_pull_short", "Grab", n=2, x0=0.0, dx=12.0)
 case("smooth_short", "Smooth", n=2, x0=0.0, dx=12.0)
+# Same reason, brush set B: every one of these pins something to the first ray that lands (Snake
+# Hook's travelling dab centre, Thumb's anchor, Crease's groove that the next dab is raycast
+# against, Mask's saturating paint), so the silhouette start above measures Blender's raycast
+# disagreement rather than the kernel. These are the identical 16-dab strokes started on the face.
+for _n, _b in [("crease_face", "Crease Sharp"), ("blob_face", "Blob"), ("pinch_face", "Pinch/Magnify"),
+               ("nudge_face", "Nudge"), ("thumb_face", "Thumb"), ("snake_hook_face", "Snake Hook"),
+               ("elastic_face", "Elastic Grab"), ("mask_face", "Mask")]:
+    try: case(_n, _b, x0=0.0)
+    except Exception as e: print("FAIL", _n, e)

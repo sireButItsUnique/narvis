@@ -57,6 +57,7 @@
   },
   "Draw Sharp": {
    "sculpt_brush_type": "DRAW_SHARP",
+   "use_negative_direction": true,
    "strength": 0.5,
    "use_pressure_strength": true,
    "use_pressure_size": false,
@@ -435,6 +436,7 @@
   },
   "Crease Polish": {
    "sculpt_brush_type": "CREASE",
+   "use_negative_direction": true,
    "strength": 0.25,
    "use_pressure_strength": true,
    "use_pressure_size": false,
@@ -489,6 +491,7 @@
   },
   "Crease Sharp": {
    "sculpt_brush_type": "CREASE",
+   "use_negative_direction": true,
    "strength": 0.6,
    "use_pressure_strength": true,
    "use_pressure_size": false,

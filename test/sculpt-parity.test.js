@@ -31,17 +31,39 @@ const REF_DIR = path.join(HERE, 'fixtures', 'blender-ref');
 const TOLERANCE = { default: 0.02, plane: 0.05 };
 const PLANE_LIKE = new Set(['clay', 'clay_strips', 'flatten', 'scrape', 'fill', 'snake_hook']);
 
-// One case gets its own budget, with the measurement that justifies it.
+// Some cases get their own budget, each with the measurement that justifies it.
 //
-// `grab` starts at x0 = -90 px, so the first dabs miss the sphere and the stroke anchors on the
-// very first ray that grazes the silhouette. Grab pins its whole deformation to that one point.
-// Fitting Blender's own per-vertex weights says its anchor sits 4.4 mm from ours along the
-// surface (a single centre offset drops the weight residual from 1.2e-2 to 3.7e-4, and the fitted
-// radius comes back as 0.30007 - so the radius, the pull and the falloff all agree, only the
-// anchor does not). Blender disagrees with itself there too: the same ray through ob.ray_cast
-// lands where we land, 4.4 mm from where the sculpt code anchored. The two grab pulls that start
-// on the face instead of the silhouette (grab_pull, grab_pull_short) come in at 0.40% and 0.59%.
-const CASE_TOLERANCE = { grab: 0.025 };
+// THE SILHOUETTE START. Every case except the *_face / *_pull / *_short ones begins at
+// x0 = -90 px, which is off the sphere: the first dabs miss and the stroke starts on the very
+// first ray that GRAZES the surface. Blender disagrees with itself on where that ray lands - its
+// sculpt raycast anchors about 4.4 mm from where ob.ray_cast (and we) land - and every brush that
+// pins something to the first dab inherits that 4.4 mm.
+//
+//   grab             anchors its whole deformation there. Fitting Blender's per-vertex weights
+//                    gives a single 4.4 mm centre offset (weight residual 1.2e-2 -> 3.7e-4, fitted
+//                    radius 0.30007 against our 0.3), so radius, pull and falloff all agree.
+//                    grab_pull / grab_pull_short, started on the face: 0.40% / 0.59%.
+//   snake_hook       the dab centre travels from that anchor for the whole stroke. A single
+//                    constant anchor offset of 4.36 mm (4.29, -0.20, -0.77) takes this case from
+//                    9.56% to 0.166%, and snake_hook_face - the identical 16-dab stroke started on
+//                    the face - is 0.56%.
+//   thumb            anchored like grab; thumb_face is 0.40%.
+//   crease_sharp     the only Essentials brush with Accumulate ON, so each dab is raycast against
+//                    the groove the last one cut and the anchor error compounds; crease_face 1.99%.
+//   pinch            pinch_face 1.84%.
+//   mask             a saturating accumulator (m += f*(1-m)*s), so the per-dab difference never
+//                    washes out; mask_face, on the face, is 3.03%. Nothing else about it drifts:
+//                    161 of 162 vertices end up masked and the residual is a few percent of the
+//                    mask value, both ways, in the mid-range of the ramp.
+const CASE_TOLERANCE = {
+  grab: 0.025,
+  snake_hook: 0.10,
+  thumb: 0.03,
+  crease_sharp: 0.045,
+  pinch: 0.03,
+  mask: 0.05,
+  mask_face: 0.035,
+};
 
 await loadPresets();
 
@@ -78,9 +100,30 @@ function replay(ref) {
   }
   engine.endStroke();
 
+  const n = ref.before.length / 3;
+
+  // The Mask brush paints a channel instead of moving anything, so its case is measured on the
+  // mask Blender wrote out (its `after` is its `before`).
+  if (ref.mask && ref.mask.some((m) => m > 0)) {
+    const ourMask = handle.proxy.getMask();
+    let maskMax = 0, maskErr = 0, maskSq = 0;
+    for (let i = 0; i < n; i++) {
+      if (ref.mask[i] > maskMax) maskMax = ref.mask[i];
+      const e = Math.abs(ourMask[i] - ref.mask[i]);
+      if (e > maskErr) maskErr = e;
+      maskSq += e * e;
+    }
+    return {
+      unit: 'mask',
+      maxDisp: maskMax,
+      maxErr: maskErr,
+      rms: Math.sqrt(maskSq / n),
+      percent: maskMax > 0 ? (100 * maskErr) / maskMax : 0,
+    };
+  }
+
   const ours = handle.proxy.getVertices();
   let maxDisp = 0, maxErr = 0, sumSq = 0;
-  const n = ref.before.length / 3;
   for (let i = 0; i < n; i++) {
     const d = Math.hypot(
       ref.after[3 * i] - ref.before[3 * i],
@@ -96,7 +139,7 @@ function replay(ref) {
     if (e > maxErr) maxErr = e;
     sumSq += e * e;
   }
-  return { maxDisp, maxErr, rms: Math.sqrt(sumSq / n), percent: maxDisp > 0 ? (100 * maxErr) / maxDisp : 0 };
+  return { unit: 'position', maxDisp, maxErr, rms: Math.sqrt(sumSq / n), percent: maxDisp > 0 ? (100 * maxErr) / maxDisp : 0 };
 }
 
 const files = fs.existsSync(REF_DIR) ? fs.readdirSync(REF_DIR).filter((f) => f.endsWith('.json')).sort() : [];
@@ -109,10 +152,10 @@ test('Blender parity', { skip: files.length === 0 ? 'no fixtures: run npm run pa
       const r = replay(ref);
       const tol = CASE_TOLERANCE[ref.case] ?? (PLANE_LIKE.has(ref.case) ? TOLERANCE.plane : TOLERANCE.default);
       console.log(
-        `  ${ref.case.padEnd(20)} blender max ${r.maxDisp.toFixed(5)}  err ${r.maxErr.toExponential(2)}` +
-        `  ${r.percent.toFixed(3)}% of max  rms ${r.rms.toExponential(2)}`,
+        `  ${ref.case.padEnd(20)} blender max ${r.maxDisp.toFixed(5)} ${r.unit === 'mask' ? 'mask' : '    '}` +
+        `  err ${r.maxErr.toExponential(2)}  ${r.percent.toFixed(3)}% of max  rms ${r.rms.toExponential(2)}`,
       );
-      assert.ok(r.maxDisp > 0, 'the reference stroke moved nothing');
+      assert.ok(r.maxDisp > 0, 'the reference stroke changed nothing');
       assert.ok(
         r.percent <= tol * 100,
         `${ref.case}: ${r.percent.toFixed(3)}% of Blender's max displacement, over the ${(tol * 100).toFixed(0)}% budget`,
