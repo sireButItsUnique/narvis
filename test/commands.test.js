@@ -1,13 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCommand, parseTyped } from '../public/js/commands.js';
+import { parseCommand, parseTyped, FINISHES } from '../public/js/commands.js';
 
 const cases = [
   ['Make a coffee mug.', { type: 'make', prompt: 'a coffee mug' }],
   ['hey can you build me a wooden chair', { type: 'make', prompt: 'a wooden chair' }],
   ['Create a 1.5 metre tall lamp', { type: 'make', prompt: 'a 1.5 metre tall lamp' }],
   ['make the handle bigger', { type: 'change', prompt: 'make the handle bigger' }],
-  ['make it red', { type: 'color', color: '#d93a3a', prompt: 'make it red' }],   // recolours the pointed-at part, else goes to the AI
+  ['make it red', { type: 'color', color: '#d93a3a', prompt: 'make it red' }],   // goes to Fable, naming the pointed-at part; "quick red" is the instant one
   ['add wheels', { type: 'change', prompt: 'add wheels' }],
   ['remove the handle', { type: 'change', prompt: 'remove the handle' }],
   ['turn it into a boat', { type: 'change', prompt: 'turn it into a boat' }],
@@ -63,7 +63,7 @@ const cases = [
   ['brush size smaller', { type: 'brush', factor: 1 / 1.35 }],
   ['turn it', { type: 'spin', on: true }],
   ['change the colour to blue', { type: 'change', prompt: 'change the colour to blue' }],
-  // Blender mode
+  // Blender words: modes, brushes, redo, focus
   ['edit mode', { type: 'mode', mode: 'edit' }],
   ['object mode', { type: 'mode', mode: 'move' }],
   ['clay strips brush', { type: 'brush_pick', name: 'Clay Strips' }],
@@ -82,7 +82,7 @@ const cases = [
   ['make the head pointy', { type: 'change', prompt: 'make the head pointy' }],
   ['make the monster', { type: 'make', prompt: 'the monster' }],
   ['make the leaning tower', { type: 'make', prompt: 'the leaning tower' }],
-  ['make the silver surfer', { type: 'change', prompt: 'make the silver surfer' }],   // -er word that isn't listed: goes to change (Blender mode lets Fable decide anyway)
+  ['make the silver surfer', { type: 'change', prompt: 'make the silver surfer' }],   // -er word that isn't listed: goes to change (Fable decides new vs edit anyway)
 ];
 
 for (const [said, expected] of cases) {
@@ -99,7 +99,56 @@ test('typed text that is not a command becomes a make request', () => {
   assert.equal(parseTyped('   '), null);
 });
 
-test('version history commands (Blender mode)', () => {
+test('parts on screen: focus, hide, isolate, show all', () => {
+  const said = {
+    'focus on that': { type: 'focus' },
+    'zoom in on this part': { type: 'focus' },
+    'focus on the lid': { type: 'focus', target: 'lid' },
+    'zoom in on the spout': { type: 'focus', target: 'spout' },
+    'zoom out': { type: 'unfocus' },
+    'show the whole model': { type: 'unfocus' },
+    'hide that': { type: 'hide' },
+    'hide': { type: 'hide' },
+    'hide the lid': { type: 'hide', target: 'lid' },
+    'isolate that': { type: 'isolate' },
+    'show only the spout': { type: 'isolate', target: 'spout' },
+    'solo this one': { type: 'isolate' },
+    'show all': { type: 'show_all' },
+    'show everything': { type: 'show_all' },
+    'unhide all': { type: 'show_all' },
+  };
+  for (const [s, expected] of Object.entries(said)) assert.deepEqual(parseCommand(s), expected, s);
+  // unchanged neighbours
+  assert.deepEqual(parseCommand('frame it'), { type: 'focus' });
+  assert.deepEqual(parseCommand('show versions'), { type: 'versions' });
+});
+
+test('clay view, and "quick <colour>" for an instant local recolour', () => {
+  const said = {
+    'clay view': { type: 'clay', on: true },
+    'turn on clay view': { type: 'clay', on: true },
+    'switch to clay view': { type: 'clay', on: true },
+    'clay view off': { type: 'clay', on: false },
+    'turn off the clay view': { type: 'clay', on: false },
+    'normal view': { type: 'clay', on: false },
+    'show the materials': { type: 'clay', on: false },
+    'quick red': { type: 'quick_color', color: '#d93a3a', name: 'red' },
+    'Quick dark blue.': { type: 'quick_color', color: '#234382', name: 'dark blue' },
+    'quick make that gold': { type: 'quick_color', color: '#d4af37', name: 'gold' },
+    'quick metal': { type: 'quick_finish', finish: FINISHES.metal, name: 'metal' },
+    'quick shiny': { type: 'quick_finish', finish: FINISHES.shiny, name: 'shiny' },
+    'quick make that part matte': { type: 'quick_finish', finish: FINISHES.matte, name: 'matte' },
+    // "quick" means instant and free, so an unknown word must not fall through to a paid Fable build
+    'quick banana': { type: 'quick_unknown', word: 'banana' },
+  };
+  for (const [s, expected] of Object.entries(said)) assert.deepEqual(parseCommand(s), expected, s);
+  // "clay" on its own is still the sculpt tool, "clay brush" still picks the brush, and plain colour talk goes to Fable
+  assert.deepEqual(parseCommand('clay'), { type: 'mode', mode: 'sculpt' });
+  assert.deepEqual(parseCommand('clay brush'), { type: 'brush_pick', name: 'Clay' });
+  assert.deepEqual(parseTyped('quick banana'), { type: 'quick_unknown', word: 'banana' }, 'never a build');
+});
+
+test('version history commands', () => {
   const said = {
     'save version': { type: 'save_version', label: '' },
     'save a version called gold frame': { type: 'save_version', label: 'gold frame' },

@@ -2,7 +2,7 @@
 //
 // Speech that doesn't start like a command returns null and is ignored, so talking near the mic is harmless.
 
-// spoken word -> builder shape
+// spoken word -> primitive shape
 export const PRIMITIVES = {
   cube: 'box', box: 'box', block: 'box',
   sphere: 'sphere', ball: 'sphere',
@@ -12,12 +12,23 @@ export const PRIMITIVES = {
   capsule: 'capsule', pill: 'capsule',
 };
 
-// colour words for "make that red" while pointing at a part
+// colour words for "make that red" and "quick red"
 export const COLORS = {
   red: '#d93a3a', orange: '#f28c28', yellow: '#f2d02e', green: '#3fae4a', blue: '#3a6fd9', purple: '#8a4fd1',
   pink: '#f07ab0', white: '#f2f2f2', black: '#1c1c1c', gray: '#8c8c8c', grey: '#8c8c8c', brown: '#8b5a2b',
   gold: '#d4af37', silver: '#c0c0c0', cyan: '#35d0ff', teal: '#1f9e9a', navy: '#1f2f6b', beige: '#e3d5b8',
   maroon: '#7a1f2b', lime: '#9be34a', magenta: '#d63ad0', tan: '#c9a77c', cream: '#f4eedd', wood: '#a0703c', wooden: '#a0703c',
+};
+
+// finish words for "quick metal": what they set on the part's own material clones (three MeshStandardMaterial)
+export const FINISHES = {
+  metal: { metalness: 1, roughness: 0.25 }, metallic: { metalness: 1, roughness: 0.25 },
+  chrome: { metalness: 1, roughness: 0.03 }, mirror: { metalness: 1, roughness: 0.02 },
+  shiny: { roughness: 0.05 }, glossy: { roughness: 0.05 }, polished: { roughness: 0.05 },
+  matte: { metalness: 0, roughness: 0.9 }, flat: { metalness: 0, roughness: 0.9 },
+  rough: { roughness: 1 }, dull: { metalness: 0, roughness: 0.95 },
+  glass: { metalness: 0, roughness: 0.02, opacity: 0.3, transparent: true },
+  plastic: { metalness: 0, roughness: 0.45 },
 };
 
 // "dark red", "light blue", "bright green"
@@ -80,7 +91,7 @@ export function numberFrom(words) {
   return ONES[a] ?? null;
 }
 
-// version history (Blender mode): these come before "go back" (undo) and "save" (export)
+// version history: these come before "go back" (undo) and "save" (export)
 function parseVersion(t) {
   let m;
   if ((m = t.match(new RegExp(`^(?:go back|revert|restore|return|roll back|switch|jump|load|open|bring back)(?: to)? (?:the )?version (?:number )?${NUMBER}$`)))) {
@@ -121,6 +132,32 @@ export function parseCommand(text) {
   if (/^(?:undo|undo that|go back|take that back|oops)$/.test(t)) return { type: 'undo' };
   if (/^(?:redo|redo that)$/.test(t)) return { type: 'redo' };
   if (/^(?:focus|focus on it|frame it|zoom to it|show me|show it|center it|centre it|find it)$/.test(t)) return { type: 'focus' };
+  if (new RegExp(`^(?:focus|zoom(?: in)?|frame) (?:on |to )?${THAT}$`).test(t)) return { type: 'focus' };
+  if (/^(?:zoom out|unfocus|focus off|(?:show|frame) the whole (?:thing|model)|whole model)$/.test(t)) return { type: 'unfocus' };
+  if ((m = t.match(/^(?:focus|zoom(?: in)?|frame) (?:on |to )?the ([a-z0-9 ]+)$/))) return { type: 'focus', target: m[1] };
+  // parts on screen: hide / isolate / show all ("hide that", "hide the lid", "show only the spout")
+  if ((m = t.match(new RegExp(`^hide(?: ${THAT}| the ([a-z0-9 ]+))?$`)))) return m[1] ? { type: 'hide', target: m[1] } : { type: 'hide' };
+  if ((m = t.match(new RegExp(`^(?:isolate|solo|show only|only show|just show)(?: ${THAT}| the ([a-z0-9 ]+))?$`)))) {
+    return m[1] ? { type: 'isolate', target: m[1] } : { type: 'isolate' };
+  }
+  if (/^(?:show (?:all|everything|all (?:the )?parts|every part|it all)|unhide(?: all| everything| it all)?|bring (?:everything|them all) back)$/.test(t)) {
+    return { type: 'show_all' };
+  }
+  // "clay view": a neutral matte look for reading the form ("clay" alone is the sculpt tool)
+  const LOOK = '(?:view|look|render|shading)';
+  if (new RegExp(`^(?:(?:turn on |switch to |use )?(?:the )?clay ${LOOK}(?: on)?|matte view)$`).test(t)) return { type: 'clay', on: true };
+  if (new RegExp(`^(?:(?:the )?clay ${LOOK} off|turn (?:off (?:the )?clay ${LOOK}|(?:the )?clay ${LOOK} off)|(?:normal|material|materials|colou?r|full|regular) ${LOOK}|show (?:the )?(?:materials|colou?rs))$`).test(t)) {
+    return { type: 'clay', on: false };
+  }
+  // "quick red", "quick metal": change the pointed-at part right here, no Fable (plain "make that red" goes to Fable)
+  if ((m = t.match(new RegExp(`^quick (?:(?:make|colou?r|paint|turn) ${THAT}(?: part)? )?((?:dark |light |bright )?[a-z]+)$`)))) {
+    const color = colorFor(m[1]);
+    if (color) return { type: 'quick_color', color, name: m[1] };
+    if (FINISHES[m[1]]) return { type: 'quick_finish', finish: FINISHES[m[1]], name: m[1] };
+  }
+  // "quick" promises instant and free, so an unknown word says what quick knows instead of falling through to
+  // parseTyped's catch-all, which would start a real Fable build
+  if (/^quick\b/.test(t)) return { type: 'quick_unknown', word: t.slice(5).trim() };
   // "clay brush", "use the grab brush", "switch to smooth brush"
   if ((m = t.match(/^(?:(?:use|switch to|change to|give me|pick) )?(?:the |a )?([a-z ]+?) brush$/)) && BRUSHES[m[1]]) {
     return { type: 'brush_pick', name: BRUSHES[m[1]] };
@@ -161,13 +198,13 @@ export function parseCommand(text) {
   if (/^(?:stop|stop (?:spinning|rotating|it)|hold (?:it )?still|freeze|stay still|don't move|turntable off)$/.test(t)) {
     return { type: 'spin', on: false };
   }
-  // "make that red": recolours the part you point at; with nothing pointed at, the AI handles it
+  // "make that red": a looks-only change, which goes to Fable with the pointed-at part named (main.js)
   if ((m = t.match(new RegExp(`^(?:make|color|colour|paint|turn) ${THAT}(?: part)? ((?:dark |light |bright )?[a-z]+)$`)))) {
     const color = colorFor(m[1]);
     if (color) return { type: 'color', color, prompt: t };
   }
 
-  // "add a cube" adds to the model, "make a cube" starts a new one. Both are instant, no AI.
+  // "add a cube" adds to the model, "make a cube" asks for a new one (Blender-side add_primitive comes later)
   if ((m = t.match(/^(add|place|put|drop|spawn|insert|make|create|build|give me)(?: me)? (?:a |an |another |one )?(?:new )?(\w+)$/))
       && PRIMITIVES[m[2]]) {
     return { type: 'add', shape: PRIMITIVES[m[2]], word: m[2], fresh: !/^(?:add|place|put|drop|spawn|insert)$/.test(m[1]) };

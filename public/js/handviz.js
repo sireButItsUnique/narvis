@@ -10,25 +10,26 @@ const GHOST_SCALE = 0.5;
 const BONES = [0, 1, 1, 2, 2, 3, 3, 4, 0, 5, 5, 6, 6, 7, 7, 8, 5, 9, 9, 10, 10, 11, 11, 12,
                9, 13, 13, 14, 14, 15, 15, 16, 13, 17, 0, 17, 17, 18, 18, 19, 19, 20];
 
+// toneMapped: false everywhere here: these are UI colours, not lit surfaces
 const vis = HAND_COLORS.map(color => {
   const cursor = new THREE.Mesh(new THREE.RingGeometry(0.45, 0.65, 32),
-    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, depthTest: false }));
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, depthTest: false, toneMapped: false }));
   cursor.renderOrder = 10;
   const beam = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
-    new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.5 }));
+    new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.5, toneMapped: false }));
   const ghostGeo = new THREE.BufferGeometry();
   ghostGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(21 * 3), 3));
   ghostGeo.setIndex(BONES);
   // drawn over the model (no depth test) so you can always see where your hand is, even inside the clay
-  const bones = new THREE.LineSegments(ghostGeo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.5, depthTest: false }));
-  const joints = new THREE.Points(ghostGeo, new THREE.PointsMaterial({ color, size: 0.35, transparent: true, opacity: 0.7, depthTest: false }));
+  const bones = new THREE.LineSegments(ghostGeo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.5, depthTest: false, toneMapped: false }));
+  const joints = new THREE.Points(ghostGeo, new THREE.PointsMaterial({ color, size: 0.35, transparent: true, opacity: 0.7, depthTest: false, toneMapped: false }));
   bones.renderOrder = joints.renderOrder = 9;
   for (const o of [cursor, beam, bones, joints]) { o.visible = false; o.frustumCulled = false; scene.add(o); }
   return { color, cursor, beam, bones, joints };
 });
 
 const brushRing = new THREE.Mesh(new THREE.RingGeometry(0.9, 1, 48),
-  new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85, depthTest: false, side: THREE.DoubleSide }));
+  new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85, depthTest: false, side: THREE.DoubleSide, toneMapped: false }));
 brushRing.renderOrder = 11;
 brushRing.visible = false;
 scene.add(brushRing);

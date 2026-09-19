@@ -1,22 +1,25 @@
-// Model -> .glb download. Blender: File > Import > glTF 2.0; each part arrives as its own editable mesh,
-// sculpted parts with their sculpted shape.
-import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
-import { buildModelGroup, disposeGroup } from './builder.js';
+// "export": download the scene exactly as the hidden Blender has it — the GLB it exported (GET /api/scene/<rev>.glb,
+// with Fable's real materials) and the working .blend beside it, which keeps the modifiers, node trees and UVs the
+// GLB flattens away. Blender: File > Open for the .blend, File > Import > glTF 2.0 for the GLB.
+// From M4, hand edits are flushed first.
+const slug = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'model';
 
-const slug = s => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'model';
-
-// glTF is in metres and parts are in cm, so the export copy is built at 1/100 scale (a 10 cm mug stays 10 cm).
-export async function glbBytes(spec, sculpts = null) {
-  const root = buildModelGroup(spec, { unit: 0.01, forExport: true, sculpts });
-  try { return await new GLTFExporter().parseAsync(root, { binary: true, trs: true }); }   // trs: plain location/rotation in Blender
-  finally { disposeGroup(root); }
+async function saveAs(url, filename) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(r.status === 404 ? 'that copy of the scene is gone already, try again' : `server error ${r.status}`);
+  const blob = await r.blob();
+  const href = URL.createObjectURL(blob);
+  const a = Object.assign(document.createElement('a'), { href, download: filename });
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(href), 10000);
+  return filename;
 }
 
-export async function exportGlb(spec, sculpts = null) {
-  const filename = `${slug(spec.name)}.glb`;
-  const url = URL.createObjectURL(new Blob([await glbBytes(spec, sculpts)], { type: 'model/gltf-binary' }));
-  const a = Object.assign(document.createElement('a'), { href: url, download: filename });
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10000);
-  return filename;
+export function downloadScene({ url, name, rev }) {
+  return saveAs(url, `${slug(name)}-${rev}.glb`);
+}
+
+// the same scene as Blender's own file; the browser may ask before this second download
+export function downloadBlend({ name, rev }) {
+  return saveAs('/api/scene/current.blend', `${slug(name)}-${rev}.blend`);
 }

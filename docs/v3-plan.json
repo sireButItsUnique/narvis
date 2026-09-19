@@ -136,6 +136,11 @@
     ],
     "recommendation": "Later. Dense-on-arrival plus instant 'add detail' covers the demo, and more Blender brushes are worth more to the 'feels like Blender' goal than live detail."
    }
+  ],
+  "deviations": [
+   "Tone mapping: public/js/view.js sets THREE.NeutralToneMapping (Khronos PBR Neutral), not the AgXToneMapping named in plan.files (public/js/view.js), plan.web_features and milestone M1. Measured in three r170: AgX desaturates the teapot's teal glaze from HSL saturation about 0.95 to about 0.33 (#048c84 -> #4a948f at 1x radiance, #70b3ae at 2x) and greys the navy box, while Neutral matches Blender's own render of version 4 - which is what Fable judges its colours against. This is a decision, not an oversight: do not switch back for plan fidelity. The same reason is in the comment at public/js/view.js:37-41.",
+   "Export extras: the GLB carries one scene extra the recipe doesn't list, holo_model - the single root Empty's name, or the one collection the exported objects live in. The glTF scene name is always Blender's (\"Scene\" under --factory-startup), so without it a multi-root build (the usual shape when Fable groups a build in a collection) has no name to show or to name the download after. See blender/holomodel_bridge/webio.py _model_name and public/js/scene/load.js.",
+   "Quick local edits: 'quick <colour>' from decision 2 is joined by 'quick <finish>' (metal, shiny, matte, rough, glass, chrome, plastic), which sets metalness/roughness on the part's material clones, matching the set_material op in plan.export_recipe B. Any other 'quick <word>' answers with what quick knows instead of falling through to a Fable build."
   ]
  },
  "judgements": [

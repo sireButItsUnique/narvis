@@ -5,10 +5,20 @@ import { S, makeFilter3 } from '../settings.js';
 import { webcamPos, focalPx } from '../view.js';
 import { input } from './state.js';
 
+// [local copy from "npm run vendor", online original]: local first so tracking works without the internet
 const MP_VERSION = '0.10.35';
-const MP_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
-const FACE_MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
-const HAND_MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const MP_CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
+const MODELS = 'https://storage.googleapis.com/mediapipe-models';
+const MP_BUNDLE = ['/vendor/mediapipe/vision_bundle.mjs', `${MP_CDN}/vision_bundle.mjs`];
+const MP_WASM = ['/vendor/mediapipe/wasm', `${MP_CDN}/wasm`];
+const FACE_MODEL = ['/vendor/models/face_landmarker.task', `${MODELS}/face_landmarker/face_landmarker/float16/1/face_landmarker.task`];
+const HAND_MODEL = ['/vendor/models/hand_landmarker.task', `${MODELS}/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`];
+
+// The local URL if this server has the file (or redirects it, as ours does when it isn't vendored), else the online one.
+async function pick([local, online], probe = '') {
+  try { if ((await fetch(local + probe, { method: 'HEAD' })).ok) return local; } catch {}
+  return online;
+}
 
 export const eyeFilt = makeFilter3(1.0, 0.05);
 const tipFilt = [makeFilter3(1.6, 0.08), makeFilter3(1.6, 0.08)];
@@ -28,14 +38,16 @@ export async function startCamera(status) {
   await video.play();
 
   status('Loading tracking models (about 25 MB the first time)…');
-  const { FilesetResolver, FaceLandmarker, HandLandmarker } = await import(`${MP_BASE}/vision_bundle.mjs`);
-  const fileset = await FilesetResolver.forVisionTasks(`${MP_BASE}/wasm`);
+  const [bundle, wasm, faceModel, handModel] = await Promise.all([
+    pick(MP_BUNDLE), pick(MP_WASM, '/vision_wasm_internal.wasm'), pick(FACE_MODEL), pick(HAND_MODEL)]);
+  const { FilesetResolver, FaceLandmarker, HandLandmarker } = await import(bundle);
+  const fileset = await FilesetResolver.forVisionTasks(wasm);
   const make = async (Cls, opts) => {
     try { return await Cls.createFromOptions(fileset, { ...opts, baseOptions: { ...opts.baseOptions, delegate: 'GPU' } }); }
     catch (e) { console.warn('GPU delegate failed, using CPU', e); return Cls.createFromOptions(fileset, { ...opts, baseOptions: { ...opts.baseOptions, delegate: 'CPU' } }); }
   };
-  cam.faceLm = await make(FaceLandmarker, { baseOptions: { modelAssetPath: FACE_MODEL }, runningMode: 'VIDEO', numFaces: 1 });
-  cam.handLm = await make(HandLandmarker, { baseOptions: { modelAssetPath: HAND_MODEL }, runningMode: 'VIDEO', numHands: 2 });
+  cam.faceLm = await make(FaceLandmarker, { baseOptions: { modelAssetPath: faceModel }, runningMode: 'VIDEO', numFaces: 1 });
+  cam.handLm = await make(HandLandmarker, { baseOptions: { modelAssetPath: handModel }, runningMode: 'VIDEO', numHands: 2 });
   input.mode = 'camera';
 }
 

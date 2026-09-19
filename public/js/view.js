@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { S } from './settings.js';
 
 // ---------- physical geometry ----------
@@ -33,15 +34,49 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setClearColor(0x04060b);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+// Lit like Blender's own renders of Fable's models (AgX, a near-black world, a 3.5 key sun and a 1.2 fill).
+// Blender uses AgX, but three r170's AgX turned the teapot's teal glaze pale mint and the navy box grey;
+// Khronos PBR Neutral matched Blender's render of the same teapot, so that's the tone mapper here.
+// The HUD-like room parts opt out with toneMapped: false so their colours stay exact.
+renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.toneMappingExposure = 1;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
 
 export const scene = new THREE.Scene();
 export const camera = new THREE.PerspectiveCamera();   // projection is set manually every frame (off-axis)
-scene.add(new THREE.HemisphereLight(0x9fd8ff, 0x0a0f18, 0.7));
-const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+// image-based light, so metal, gold and clearcoat reflect something (black otherwise); dim, like Blender's world
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.2;
+pmrem.dispose();
+const sun = new THREE.DirectionalLight(0xffffff, 3);
 sun.castShadow = true;
 sun.shadow.mapSize.set(1024, 1024);
 sun.shadow.bias = -0.0005;
-scene.add(sun, sun.target);
+sun.shadow.normalBias = 0.08;   // cm; without it a strong sun draws acne stripes across smooth glazes
+const fill = new THREE.DirectionalLight(0xffffff, 1);
+scene.add(sun, sun.target, fill, fill.target);
+
+// Every picture drawn per frame. One full-window view now; the Pepper's-ghost stage adds more (M7).
+export const views = [{ camera, viewport: null }];   // viewport: [x, y, w, h] in CSS px from bottom left
+export function renderViews() {
+  for (const v of views) {
+    if (v.viewport) {
+      renderer.setViewport(...v.viewport);
+      renderer.setScissor(...v.viewport);
+      renderer.setScissorTest(true);
+    }
+    renderer.render(scene, v.camera);
+    if (v.viewport) {
+      renderer.setScissorTest(false);
+      renderer.setViewport(0, 0, canvas.clientWidth, canvas.clientHeight);
+    }
+  }
+}
+
+// 'clay view': one neutral matte material on every part, for reading the form without colour or gloss
+export const clayMaterial = new THREE.MeshStandardMaterial({ color: 0xb9b3aa, roughness: 0.82, metalness: 0,
+                                                              side: THREE.DoubleSide, name: 'clay' });
 
 let room = new THREE.Group(); scene.add(room);
 export let rect = canvasRect();
@@ -79,11 +114,11 @@ export function buildRoom() {
   gridLines(new THREE.Vector3(x1, y0, 0), Y, Zm, h, D, step, pts);   // right
   gridLines(new THREE.Vector3(x0, y0, -D), X, Y, w, h, step, pts);   // back
   const grid = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts),
-    new THREE.LineBasicMaterial({ color: 0x1f6f99, transparent: true, opacity: 0.75 }));
+    new THREE.LineBasicMaterial({ color: 0x1f6f99, transparent: true, opacity: 0.75, toneMapped: false }));
   room.add(grid);
 
-  // solid floor + back wall to catch shadows
-  const surf = new THREE.MeshStandardMaterial({ color: 0x0a1826, roughness: 1, metalness: 0 });
+  // solid floor + back wall to catch shadows; barely lit by the environment so the box stays dark
+  const surf = new THREE.MeshStandardMaterial({ color: 0x0a1826, roughness: 1, metalness: 0, envMapIntensity: 0.15 });
   const floor = new THREE.Mesh(new THREE.PlaneGeometry(w, D), surf);
   floor.rotation.x = -Math.PI / 2; floor.position.set(cx, y0 - 0.02, -D / 2); floor.receiveShadow = true;
   const back = new THREE.Mesh(new THREE.PlaneGeometry(w, h), surf.clone());
@@ -94,7 +129,7 @@ export function buildRoom() {
   const frame = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([
     new THREE.Vector3(x0 + 0.15, y0 + 0.15, 0), new THREE.Vector3(x1 - 0.15, y0 + 0.15, 0),
     new THREE.Vector3(x1 - 0.15, y1 - 0.15, 0), new THREE.Vector3(x0 + 0.15, y1 - 0.15, 0)]),
-    new THREE.LineBasicMaterial({ color: 0x35d0ff }));
+    new THREE.LineBasicMaterial({ color: 0x35d0ff, toneMapped: false }));
   room.add(frame);
 
   // light from above and slightly in front, shadows fall on floor/back wall
@@ -103,6 +138,9 @@ export function buildRoom() {
   const sc = sun.shadow.camera, ext = Math.max(w, h, D) * 1.2;
   sc.left = -ext; sc.right = ext; sc.top = ext; sc.bottom = -ext; sc.near = 1; sc.far = 400;
   sc.updateProjectionMatrix();
+  // fill from the front right, low, so the shadow side isn't black
+  fill.position.set(cx + w, cy, 40);
+  fill.target.position.set(cx, y0, -D / 2);
 }
 
 // ---------- off-axis ("window") projection ----------

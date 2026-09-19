@@ -1,12 +1,15 @@
-"""Holo Modeler bridge: lets the Holo Modeler app on this computer build and edit models in the open Blender.
+"""Holo Modeler bridge: the Holo Modeler app's way into Blender.
 
-The app connects to 127.0.0.1 (port in ~/.holomodel/bridge.json, with a per-session token) and sends one JSON
-request per line. Requests run on Blender's main thread, one at a time:
+The app's server runs its own hidden Blender (blender -b, started by server/blender-process.js through
+blender/headless.py) and talks to it over 127.0.0.1 with a token it passes in the environment. Installed as an
+add-on in a normal Blender, the same bridge still starts (port in ~/.holomodel/bridge.json), but the app no
+longer uses that. One JSON request per line; requests run on Blender's main thread, one at a time:
   ping, scene            what's open and what's in it
   exec {code, label}     run AI-written modelling code (bpy/bmesh/mathutils/numpy only), as one undo step
   render {views, objects, size}   PNG previews so the AI can look at what it built
-  undo, redo, mode, brush, brush_size, symmetry, focus, delete, add   voice commands
+  undo, redo, delete, add         small scene edits
   snapshot {path}, restore {path}, fingerprint   version history (a copy of the scene; opening one; has it changed)
+  export_glb, clear_scene, save_working, warm_up   what the web gets (webio.py)
 """
 import base64
 import builtins
@@ -24,6 +27,7 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 
 import bmesh
 import bpy
@@ -33,12 +37,20 @@ PORT = 9876
 BRIDGE_FILE = os.path.join(os.environ.get('HOLOMODEL_HOME') or os.path.join(os.path.expanduser('~'), '.holomodel'), 'bridge.json')
 
 # ---------------------------------------------------------------- sandbox for AI-written code
-# Not a security boundary against a determined attacker (the only author is the user's own request); it stops
-# modelling code from touching files, the network, the OS or Blender's settings by mistake.
+# Not a security boundary against a determined attacker (the only author is the user's own request, but web pages
+# Fable reads can try to steer it); it stops modelling code from touching files, the network, the OS or Blender's
+# settings by mistake.
 ALLOWED_IMPORTS = {'bpy', 'bmesh', 'mathutils', 'math', 'random', 'numpy', 'colorsys', 'itertools', 'functools',
                    'collections', 'dataclasses', 'typing', 're', 'string', 'bpy_extras', 'statistics', 'copy', 'enum'}
 BLOCKED = [
-    (r'\bbpy\.ops\.(wm|preferences|extensions|script|screen\.userpref_show)\b', 'window-manager, preferences and script operators'),
+    (r'\bbpy\.ops\.(wm|preferences|extensions|script|file|text|sound|sequencer|ptcache|fluid|cachefile'
+     r'|screen\.userpref_show)\b', 'window-manager, preferences, file and script operators'),
+    (r'\bbpy\.ops\.(export_\w+|import_\w+)', 'import and export operators'),
+    (r'\bbpy\.ops\.image\.(save\w*|external_edit)\b', 'saving images'),
+    (r'\bbpy\.ops\.render\.(render|opengl|play_rendered_anim|view_show)\b', 'rendering'),
+    (r'\.(save|save_render)\s*\(|\bfilepath_raw\b|\bsave_mode\b', 'writing image files'),
+    (r'\b(np|numpy)\s*\.\s*(save\w*|load\w*|genfromtxt|fromfile|fromregex|memmap|DataSource|recfromtxt|recfromcsv)\b'
+     r'|\.tofile\s*\(', 'reading and writing files with numpy'),
     (r'\bbpy\.app\.(handlers|timers)\b', 'handlers and timers'),
     (r'\bbpy\.(utils|data\.libraries)\b', 'bpy.utils and library loading'),
     (r'__(subclasses|globals|builtins|code|import|loader|spec|bases|mro|dict)__', 'Python internals'),
@@ -47,11 +59,98 @@ BLOCKED = [
 _NO_BUILTINS = {'open', 'exec', 'eval', 'compile', 'input', 'breakpoint', '__import__', 'exit', 'quit', 'help',
                 'globals', 'locals', 'vars', 'memoryview', '__loader__', '__spec__'}
 
+# the same operator rules at run time, so `ops = bpy.ops` or getattr() can't walk around the text check
+_BLOCKED_OP_MODULES = {'wm', 'preferences', 'extensions', 'script', 'file', 'text', 'sound', 'sequencer', 'ptcache',
+                       'fluid', 'cachefile'}
+_BLOCKED_OPS = {'image': re.compile(r'^(save\w*|external_edit)$'), 'render': re.compile(r'^(render|opengl|play_rendered_anim|view_show)$'),
+                'screen': re.compile(r'^userpref_show$')}
+
+
+def _no_op(name):
+    raise PermissionError(f"bpy.ops.{name} isn't available here: build with bpy/bmesh/mathutils/numpy only; "
+                          'no files, network, OS or Blender settings.')
+
+
+class _OpsModule:
+    def __init__(self, name, real):
+        self._name, self._real = name, real
+
+    def __getattr__(self, op):
+        if _BLOCKED_OPS[self._name].match(op):
+            _no_op(f'{self._name}.{op}')
+        return getattr(self._real, op)
+
+    def __dir__(self):
+        return dir(self._real)
+
+
+class _Ops:
+    def __getattr__(self, name):
+        if name in _BLOCKED_OP_MODULES or name.startswith(('export_', 'import_')):
+            _no_op(name)
+        real = getattr(bpy.ops, name)
+        return _OpsModule(name, real) if name in _BLOCKED_OPS else real
+
+    def __dir__(self):
+        return dir(bpy.ops)
+
+
+class _Bpy(types.ModuleType):
+    """bpy as AI code sees it: everything is the real thing except bpy.ops, which goes through _Ops."""
+    def __getattr__(self, name):
+        return _OPS if name == 'ops' else getattr(bpy, name)
+
+    def __dir__(self):
+        return dir(bpy)
+
+
+_OPS = _Ops()
+_BPY = _Bpy('bpy')
+
+# The same idea for the other modules. numpy's file helpers (savetxt, loadtxt, genfromtxt) are pure Python and look
+# `open` up in numpy's own globals, not the caller's, so stripping builtins doesn't stop them; and a module's
+# __builtins__ hands back the real `open` whatever the text rules say. getattr(np, 'save' + 'txt') walks around a
+# name pattern, so the module object AI code gets has to be the one that refuses.
+_NUMPY_FILE_IO = frozenset({'save', 'savez', 'savez_compressed', 'savetxt', 'load', 'loadtxt', 'genfromtxt',
+                            'fromfile', 'fromregex', 'memmap', 'DataSource', 'recfromtxt', 'recfromcsv',
+                            'ctypeslib', 'f2py', 'distutils'})
+_DENIED_ATTRS = frozenset({'__builtins__', '__globals__'})
+_MODULE_DENY = {'numpy': _NUMPY_FILE_IO}
+_REAL = {}        # guarded module name -> the real module, kept off the wrapper so AI code can't read it back
+_GUARDED = {}
+
+
+class _Guarded(types.ModuleType):
+    """A module as AI code sees it: names that reach the filesystem raise, and submodules come back guarded too."""
+
+    def __getattr__(self, name):
+        if name in _DENIED_ATTRS or name in _MODULE_DENY.get(self.__name__.split('.')[0], ()):
+            raise PermissionError(f"{self.__name__}.{name} isn't available here: build in memory with "
+                                  'bpy/bmesh/mathutils/numpy; no files, network or OS.')
+        value = getattr(_REAL[self.__name__], name)
+        return _guard(value) if isinstance(value, types.ModuleType) else value
+
+    def __dir__(self):
+        deny = _DENIED_ATTRS | _MODULE_DENY.get(self.__name__.split('.')[0], frozenset())
+        return [n for n in dir(_REAL[self.__name__]) if n not in deny]
+
+
+def _guard(module):
+    name = module.__name__
+    if _REAL.get(name) is not module:   # a reload would leave the old one behind
+        _REAL[name] = module
+        _GUARDED[name] = _Guarded(name)
+    return _GUARDED[name]
+
 
 def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     if level or name.split('.')[0] not in ALLOWED_IMPORTS:
         raise ImportError(f"'{name}' isn't available here. Allowed: {', '.join(sorted(ALLOWED_IMPORTS))}")
-    return builtins.__import__(name, globals, locals, fromlist, level)
+    if name == 'bpy' or (name.startswith('bpy.') and not fromlist):
+        return _BPY
+    if name == 'bpy.ops' or name.startswith('bpy.ops.'):   # from bpy.ops import ...
+        return _OPS if name == 'bpy.ops' else getattr(_OPS, name.split('.')[2])
+    return _guard(builtins.__import__(name, globals, locals, fromlist, level))
 
 
 SAFE_BUILTINS = {k: getattr(builtins, k) for k in dir(builtins) if k not in _NO_BUILTINS}
@@ -127,17 +226,29 @@ def _undo_push(label):
         pass
 
 
-def _target_mesh():
-    """The mesh voice commands act on: the active one, else the selected one, else the newest."""
-    vl = bpy.context.view_layer
-    ob = vl.objects.active
-    if ob and ob.type == 'MESH':
-        return ob
-    sel = [o for o in bpy.context.selected_objects if o.type == 'MESH']
-    if sel:
-        return sel[0]
-    meshes = [o for o in bpy.context.scene.objects if o.type == 'MESH' and not o.name.startswith('_holo_')]
-    return meshes[-1] if meshes else None
+def _object_mode():
+    if bpy.context.mode != 'OBJECT':   # edit-mode changes only reach the mesh data in object mode
+        with bpy.context.temp_override(**_view3d_override()):
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def pack_images():
+    """Pack every image into the .blend, so snapshots and GLBs carry their textures: generate_texture writes files
+    outside the scene, and numpy-painted or baked images only live in memory until packed."""
+    packed = 0
+    for img in bpy.data.images:
+        if img.type in {'RENDER_RESULT', 'COMPOSITING'} or img.packed_file:   # (painted ones say UV_TEST)
+            continue
+        if img.source == 'FILE' and not os.path.exists(bpy.path.abspath(img.filepath)):
+            continue
+        if img.source not in {'FILE', 'GENERATED'}:
+            continue
+        try:
+            img.pack()
+            packed += 1
+        except RuntimeError:
+            pass   # e.g. a generated image that never got pixels
+    return packed
 
 
 # ---------------------------------------------------------------- commands
@@ -164,7 +275,7 @@ def cmd_exec(req):
                 pass
     before = set(bpy.data.objects.keys())
     out = io.StringIO()
-    ns = {'__builtins__': SAFE_BUILTINS, '__name__': '__main__', 'bpy': bpy, 'bmesh': bmesh,
+    ns = {'__builtins__': SAFE_BUILTINS, '__name__': '__main__', 'bpy': _BPY, 'bmesh': bmesh,
           'mathutils': mathutils, 'math': math, 'random': random, 'Vector': mathutils.Vector,
           'Matrix': mathutils.Matrix, 'Euler': mathutils.Euler, 'Color': mathutils.Color}
     ok, err = True, None
@@ -193,8 +304,9 @@ def cmd_render(req):
     size = int(min(1024, max(256, int(req.get('size') or 640))))
     names = set(req.get('objects') or [])
     scene = bpy.context.scene
-    objs = [o for o in scene.objects if o.type in RENDERABLE and o.visible_get() and not o.name.startswith('_holo_')
-            and (not names or o.name in names)]
+    # the same objects the web gets (webio.export_set): a hide_render helper mustn't set the framing
+    objs = [o for o in scene.objects if o.type in RENDERABLE and o.visible_get() and not o.hide_render
+            and not o.name.startswith('_holo_') and (not names or o.name in names)]
     if not objs:
         return {'ok': False, 'error': 'nothing visible to render' + (f' named {sorted(names)}' if names else '')}
     corners = [o.matrix_world @ mathutils.Vector(c) for o in objs for c in o.bound_box]
@@ -278,63 +390,6 @@ def cmd_render(req):
 def cmd_undo(req):
     with bpy.context.temp_override(**_view3d_override()):
         bpy.ops.ed.undo() if req.get('cmd') == 'undo' else bpy.ops.ed.redo()
-    return {'ok': True}
-
-
-def cmd_mode(req):
-    mode = {'object': 'OBJECT', 'edit': 'EDIT', 'sculpt': 'SCULPT'}.get(str(req.get('mode')).lower())
-    ob = _target_mesh()
-    if not mode or not ob:
-        return {'ok': False, 'error': 'nothing to switch' if not ob else f"unknown mode {req.get('mode')}"}
-    with bpy.context.temp_override(**_view3d_override()):
-        if bpy.context.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-        for o in bpy.context.selected_objects:
-            o.select_set(False)
-        ob.select_set(True)
-        bpy.context.view_layer.objects.active = ob
-        bpy.ops.object.mode_set(mode=mode)
-    return {'ok': True, 'object': ob.name, 'mode': mode.lower()}
-
-
-def cmd_brush(req):
-    name = str(req.get('name'))
-    if bpy.context.mode != 'SCULPT':
-        res = cmd_mode({'mode': 'sculpt'})
-        if not res['ok']:
-            return res
-    with bpy.context.temp_override(**_view3d_override()):
-        bpy.ops.brush.asset_activate(asset_library_type='ESSENTIALS',
-                                     relative_asset_identifier=f'brushes/essentials_brushes-mesh_sculpt.blend/Brush/{name}')
-    b = bpy.context.tool_settings.sculpt.brush
-    return {'ok': True, 'brush': b.name if b else name}
-
-
-def cmd_brush_size(req):
-    sculpt = bpy.context.tool_settings.sculpt
-    b = sculpt.brush
-    if not b:
-        return {'ok': False, 'error': 'no sculpt brush active (say "sculpt mode" first)'}
-    ups = getattr(sculpt, 'unified_paint_settings', None)
-    owner = ups if ups is not None and ups.use_unified_size else b   # whichever size is actually in effect
-    owner.size = int(min(500, max(5, round(owner.size * float(req.get('factor', 1))))))
-    return {'ok': True, 'size': owner.size}
-
-
-def cmd_symmetry(req):
-    ob = _target_mesh()
-    if not ob:
-        return {'ok': False, 'error': 'no mesh to mirror'}
-    ob.data.use_mirror_x = bool(req.get('on'))   # what mesh sculpting (and edit mode) actually uses
-    return {'ok': True, 'on': ob.data.use_mirror_x, 'object': ob.name}
-
-
-def cmd_focus(req):
-    with bpy.context.temp_override(**_view3d_override()):
-        if bpy.context.selected_objects or bpy.context.mode != 'OBJECT':
-            bpy.ops.view3d.view_selected()
-        else:
-            bpy.ops.view3d.view_all()
     return {'ok': True}
 
 
@@ -445,9 +500,8 @@ def cmd_snapshot(req):
     if not path.endswith('.blend'):
         return {'ok': False, 'error': 'snapshot needs a .blend path'}
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    if bpy.context.mode != 'OBJECT':   # edit-mode changes only reach the mesh data in object mode
-        with bpy.context.temp_override(**_view3d_override()):
-            bpy.ops.object.mode_set(mode='OBJECT')
+    _object_mode()
+    pack_images()   # a version must still have its textures after the files they came from are gone
     with bpy.context.temp_override(**_view3d_override()):
         bpy.ops.wm.save_as_mainfile(filepath=path, copy=True, compress=True)
     return {'ok': True, 'path': path, 'bytes': os.path.getsize(path), 'fingerprint': _fingerprint(),
@@ -468,8 +522,7 @@ def cmd_restore(req):
 
 COMMANDS = {'snapshot': cmd_snapshot, 'restore': cmd_restore, 'fingerprint': cmd_fingerprint,
             'ping': cmd_ping, 'scene': cmd_scene, 'exec': cmd_exec, 'render': cmd_render, 'undo': cmd_undo,
-            'redo': cmd_undo, 'mode': cmd_mode, 'brush': cmd_brush, 'brush_size': cmd_brush_size,
-            'symmetry': cmd_symmetry, 'focus': cmd_focus, 'delete': cmd_delete, 'add': cmd_add}
+            'redo': cmd_undo, 'delete': cmd_delete, 'add': cmd_add}
 
 
 def handle(req):
@@ -483,34 +536,59 @@ def handle(req):
         return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
 
 
-# ---------------------------------------------------------------- server: socket thread -> main-thread timer
+# ---------------------------------------------------------------- server: socket threads -> main thread
 _jobs = queue.Queue()
 _state = {'sock': None, 'token': None, 'running': False}
 
 
-def _pump():
-    """Runs on Blender's main thread: bpy is only safe to use here."""
+def _refresh_ping():
     try:
         _state['ping'] = cmd_ping({})   # answered straight from the socket thread, even while a job runs
     except Exception:
         pass
-    wm = bpy.context.window_manager
-    if any(w.modal_operators for w in wm.windows):   # a sculpt stroke, drag or orbit is in progress: wait for it
-        return 0.05
+
+
+def _run_job(req, reply):
+    deadline = req.get('deadline') if isinstance(req, dict) else None
+    if isinstance(deadline, (int, float)) and time.time() * 1000 > deadline:
+        reply.put({'ok': False, 'error': 'expired: the app stopped waiting'})
+        return
+    try:
+        reply.put(handle(req))
+    except Exception as e:   # handle() catches command errors; this is the last line of defence
+        reply.put({'ok': False, 'error': f'{type(e).__name__}: {e}'})
+
+
+def _pump():
+    """Runs on Blender's main thread (a timer in a normal Blender): bpy is only safe to use here."""
+    _refresh_ping()
     while True:
         try:
-            req, reply = _jobs.get_nowait()
+            job = _jobs.get_nowait()
         except queue.Empty:
             break
-        deadline = req.get('deadline') if isinstance(req, dict) else None
-        if isinstance(deadline, (int, float)) and time.time() * 1000 > deadline:
-            reply.put({'ok': False, 'error': 'expired: the app stopped waiting'})
-            continue
-        try:
-            reply.put(handle(req))
-        except Exception as e:   # handle() catches command errors; this is the last line of defence
-            reply.put({'ok': False, 'error': f'{type(e).__name__}: {e}'})
+        if job is not None:
+            _run_job(*job)
     return 0.05
+
+
+def wake():
+    """Makes serve_headless look at its stop flag now instead of at the next tick."""
+    _jobs.put(None)
+
+
+def serve_headless(stop):
+    """The headless Blender's main loop: sleep until a job arrives (no polling), run it, repeat until stop is set."""
+    _refresh_ping()
+    while not stop.is_set():
+        try:
+            job = _jobs.get(timeout=0.25)
+        except queue.Empty:
+            continue
+        if job is None:
+            continue
+        _run_job(*job)
+        _refresh_ping()
 
 
 def _serve_client(conn):
@@ -523,7 +601,8 @@ def _serve_client(conn):
             except ValueError:
                 resp = {'ok': False, 'error': 'bad JSON'}
             else:
-                if not isinstance(req, dict) or req.get('token') != _state['token']:
+                token = req.get('token') if isinstance(req, dict) else None
+                if not isinstance(token, str) or not secrets.compare_digest(token.encode(), (_state['token'] or '').encode()):
                     resp = {'ok': False, 'error': 'bad token'}
                 elif req.get('cmd') == 'ping' and _state.get('ping'):
                     resp = dict(_state['ping'])   # don't queue behind a long build just to say hello
@@ -562,45 +641,53 @@ def _other_bridge_alive(own_port):
         return False
 
 
-def _start_server():
+def start_server(port=0, token=None, advertise=False):
+    """Listen on 127.0.0.1 and return the port. port=0 lets the OS pick a free one (the headless Blender, which
+    tells the server its port on stdout). advertise=True writes bridge.json for whoever looks for a GUI Blender;
+    the headless one never does, so it can't be mistaken for (or clobber) a Blender the user opened."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    port = PORT
-    for port in range(PORT, PORT + 10):   # another Blender may already have the first port
+    for p in (range(port, port + 10) if port else (0,)):   # another Blender may already have the first port
         try:
-            sock.bind(('127.0.0.1', port))
+            sock.bind(('127.0.0.1', p))
             break
         except OSError:
             continue
-    sock.listen(4)
-    _state.update(sock=sock, token=secrets.token_hex(16), running=True)
-    os.makedirs(os.path.dirname(BRIDGE_FILE), exist_ok=True)
-    if _other_bridge_alive(port):
-        print('Holo Modeler bridge: another Blender already has the connection; this one stays unlisted')
     else:
-        with open(BRIDGE_FILE, 'w') as f:
-            json.dump({'port': port, 'token': _state['token'], 'pid': os.getpid(), 'blender': bpy.app.version_string}, f)
+        sock.close()
+        raise OSError(f'no free port in {port}-{port + 9}')
+    port = sock.getsockname()[1]
+    sock.listen(8)
+    _state.update(sock=sock, token=token or secrets.token_hex(16), running=True, port=port)
+    if advertise:
+        os.makedirs(os.path.dirname(BRIDGE_FILE), exist_ok=True)
+        if _other_bridge_alive(port):
+            print('Holo Modeler bridge: another Blender already has the connection; this one stays unlisted')
+        else:
+            with open(BRIDGE_FILE, 'w') as f:
+                json.dump({'port': port, 'token': _state['token'], 'pid': os.getpid(),
+                           'blender': bpy.app.version_string}, f)
     threading.Thread(target=_accept_loop, args=(sock,), daemon=True).start()
-    print(f'Holo Modeler bridge listening on 127.0.0.1:{port}')
+    return port
+
+
+def stop_server():
+    _state['running'] = False
+    if _state['sock']:
+        _state['sock'].close()
+        _state['sock'] = None
 
 
 def register():
-    if bpy.app.background:   # command-line Blender (installs, batch renders) can't serve requests
+    if bpy.app.background:   # command-line Blender: headless.py starts the server itself
         return
-    # the hand mouse moves the real cursor: stop Blender warping it back to the other side of the screen mid-drag
-    _state['prev_continuous'] = bpy.context.preferences.inputs.use_mouse_continuous
-    bpy.context.preferences.inputs.use_mouse_continuous = False
-    _start_server()
+    port = start_server(PORT, advertise=True)
+    print(f'Holo Modeler bridge listening on 127.0.0.1:{port}')
     if not bpy.app.timers.is_registered(_pump):
         bpy.app.timers.register(_pump, persistent=True)
 
 
 def unregister():
-    prev = _state.pop('prev_continuous', None)
-    if prev is not None:
-        bpy.context.preferences.inputs.use_mouse_continuous = prev
-    _state['running'] = False
-    if _state['sock']:
-        _state['sock'].close()
+    stop_server()
     if bpy.app.timers.is_registered(_pump):
         bpy.app.timers.unregister(_pump)
     try:
@@ -610,3 +697,8 @@ def unregister():
             os.remove(BRIDGE_FILE)
     except (OSError, ValueError):
         pass
+
+
+from . import webio   # noqa: E402  (last: it uses the helpers above)
+
+COMMANDS.update(webio.COMMANDS)

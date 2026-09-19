@@ -1,13 +1,9 @@
-// Voice -> Blender. Claude Fable 5.1 writes Blender Python, runs it in the open Blender through the bridge add-on,
-// looks at renders of the result, and fixes what's off, until the model is done.
-import fs from 'node:fs';
-import net from 'node:net';
-import os from 'node:os';
-import path from 'node:path';
+// Voice -> Blender. Claude Fable 5.1 writes Blender Python, runs it in the server's hidden Blender through the
+// bridge, looks at renders of the result, and fixes what's off, until the model is done.
 import * as Sentry from '@sentry/node';   // spans and logs are no-ops until SENTRY_DSN is set
+import { blender, callBlender } from './blender-process.js';
 import { TEXTURE_TOOL, textureToolAvailable, runTextureTool } from './texture-tool.js';
 
-const BRIDGE_FILE = path.join(process.env.HOLOMODEL_HOME || path.join(os.homedir(), '.holomodel'), 'bridge.json');
 const env = name => (process.env[name] || '').trim();
 export const blenderModel = () => env('BLENDER_MODEL') || 'claude-fable-5-1';
 const effort = () => env('BLENDER_EFFORT') || 'high';
@@ -19,36 +15,53 @@ const PRICES = { 'claude-fable-5-1': [10, 50, 0.25], 'claude-opus-5': [5, 25, 0.
 
 export class BridgeError extends Error {}
 
-// ---------- the bridge: one JSON request per connection to the add-on inside Blender ----------
+// ---------- the bridge: one JSON request per connection to the server's headless Blender ----------
+// Safe to send again to a restarted Blender. Never exec: its code may have half-run before Blender died.
+const IDEMPOTENT = new Set(['ping', 'scene', 'fingerprint', 'render', 'export_glb', 'save_working', 'snapshot',
+                            'restore', 'clear_scene', 'warm_up']);
+
 export function bridge(cmd, args = {}, { timeout = 180000 } = {}) {
   return Sentry.startSpan({ op: 'blender.bridge', name: `blender ${cmd}` }, () => bridgeCall(cmd, args, timeout));
 }
 
-function bridgeCall(cmd, args, timeout) {
-  return new Promise((resolve, reject) => {
-    let info;
-    try { info = JSON.parse(fs.readFileSync(BRIDGE_FILE, 'utf8')); }
-    catch { return reject(new BridgeError("Blender isn't connected. Open Blender (the Holo Modeler add-on starts with it).")); }
-    const sock = net.connect(info.port, '127.0.0.1');
-    let buf = '';
-    const timer = setTimeout(() => { sock.destroy(); reject(new BridgeError("Blender didn't answer in time.")); }, timeout);
-    sock.setEncoding('utf8');
-    // the deadline lets Blender drop the job if it's still queued after we've stopped waiting (same clock)
-    sock.on('connect', () => sock.write(JSON.stringify({ id: 1, token: info.token, cmd, ...args, deadline: Date.now() + timeout - 250 }) + '\n'));
-    sock.on('data', d => {
-      buf += d;
-      const nl = buf.indexOf('\n');
-      if (nl < 0) return;
-      clearTimeout(timer);
-      sock.end();
-      try { resolve(JSON.parse(buf.slice(0, nl))); } catch (e) { reject(e); }
-    });
-    sock.on('error', e => {
-      clearTimeout(timer);
-      reject(new BridgeError(e.code === 'ECONNREFUSED'
-        ? "Blender isn't running, or the Holo Modeler add-on is off. Open Blender." : e.message));
-    });
-  });
+async function ready(cmd, after, timeout) {
+  try { return await blender.ready({ after, timeout, revive: cmd !== 'ping' }); }
+  catch (err) { throw new BridgeError(err.message); }
+}
+
+async function attempt(info, cmd, args, timeout) {
+  try {
+    return await callBlender(info, cmd, args, timeout);
+  } catch (err) {
+    if (err.code !== 'HOLO_TIMEOUT') throw err;
+    // Python on Blender's main thread can't be interrupted (think `while True`): only a restart frees it, and the
+    // restarted Blender reopens the working autosave
+    blender.restart(`${cmd} ran past ${Math.round(timeout / 1000)} s`);
+    throw new BridgeError(`Blender didn't finish ${cmd === 'exec' ? 'that step' : cmd} in time, so it's being restarted.`);
+  }
+}
+
+// The timeout is how long the command itself may take, measured from the moment Blender is there to run it.
+// Waiting for a cold start (about 8 s) or for a restart never counts against it: a retry handed what was left of
+// the original budget would time out at once, and attempt() would read that as a stuck Blender and kill the
+// healthy one that had just come back.
+async function bridgeCall(cmd, args, timeout) {
+  let info = await ready(cmd, 0, Math.min(timeout, 90000));
+  try {
+    return await attempt(info, cmd, args, timeout);
+  } catch (err) {
+    if (!err.lost) throw err;
+    // the connection broke: give the manager a moment to see whether Blender itself died (its exit event lands
+    // ~26 ms after the reset); if it didn't, this wasn't a crash and a retry wouldn't help
+    for (let i = 0; i < 20 && blender.generation === info.gen && blender.state().state === 'ready'; i++) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+    if (blender.generation === info.gen && blender.state().state === 'ready') throw new BridgeError(err.message);
+    if (!IDEMPOTENT.has(cmd)) throw new BridgeError("Blender stopped in the middle of that; it's restarting with the last saved scene.");
+    info = await ready(cmd, info.gen, 60000);
+    try { return await attempt(info, cmd, args, timeout); }
+    catch (e) { throw e.lost ? new BridgeError("Blender stopped again; it's restarting.") : e; }
+  }
 }
 
 // ---------- the model's instructions and tools ----------
@@ -66,11 +79,13 @@ Research first when it's a specific real thing
 
 What the result should be like
 - Named objects grouped under one new collection named after the thing (or parented to an Empty), clean topology the user can sculpt or edit, and live, named modifiers where they help (Subdivision Surface, Bevel, Solidify, Mirror, Array). Principled BSDF materials; procedural shader textures, or images you generate with numpy into bpy.data.images, are fine. Web research gives you text, not image files; if a generate_texture tool is available, use it for pictures that would be impractical to paint (a painting's canvas, a poster, a label), otherwise paint or model the detail yourself.
+- The finished model is shown in a web viewer as glTF: Principled BSDF values and image textures on a UV map come through, but a procedural texture wired into a BSDF input does not (the web shows plain white there), so give every material its real colour as a plain value or an image.
+- No metaballs: glTF has no mesh for them, so they are missing from what the user sees even though your renders show them. Model with meshes, or convert a metaball to a mesh before you finish.
 - Metres, Z up, resting on the ground at z = 0, front facing -Y (Blender's front view).
-- Leave the user's existing objects alone unless the request is about them. For a change request, edit the relevant objects in place and keep their names rather than rebuilding everything.
+- A new model starts in an empty scene. For a change request, edit the relevant objects in place and keep their names rather than rebuilding everything, and leave objects the request isn't about alone.
 - Don't change render settings, cameras, lights or the world unless asked; the preview tool brings its own.
 
-Code limits: it runs in object mode; imports only from bpy, bmesh, mathutils, math, random, numpy, colorsys and the standard maths and collections modules; no open(), eval or exec, no os, sys, subprocess or network, no bpy.ops.wm, preferences or script operators, no handlers or timers. Each run is one undo step for the user.`;
+Code limits: it runs in object mode; imports only from bpy, bmesh, mathutils, math, random, numpy, colorsys and the standard maths and collections modules; no file access at all (no open(), and numpy's save/load/savetxt/loadtxt helpers are blocked too), no eval or exec, no os, sys, subprocess or network, no bpy.ops.wm, preferences or script operators, no handlers or timers. Each run is one undo step for the user.`;
 
 const VIEWS = ['front', 'three_quarter', 'side', 'left', 'back', 'top'];
 const TOOLS = [
@@ -110,13 +125,14 @@ const toolsForThisBuild = () => [...TOOLS, ...(research() ? RESEARCH_TOOLS : [])
 
 const sceneBrief = s => (s?.objects || []).map(o => `${o.name} (${o.type}${o.verts ? `, ${o.verts} verts` : ''}${o.collection ? `, in ${o.collection}` : ''})`).join('; ') || 'empty';
 
-// The request comes from speech recognition, so it may have misheard words, and "make the ___ ___" can mean a new
-// thing or an edit. Give Fable the words, our best guess, and the scene, and let it decide.
+// The request comes from speech recognition, so it may have misheard words. A 'make' arrives in a scene the server
+// has just emptied, so there's nothing to read it against; a 'change' may still turn out to be a new thing.
 function userMessage(prompt, mode, scene) {
-  const guess = mode === 'change' ? 'it sounds like a change to something already in the scene'
-    : 'it sounds like a request for something new';
-  return `The user said: "${prompt}"\n(This came from speech recognition, so a word may be misheard; ${guess}, `
-    + `but if the scene makes the other reading clearly right, do that.)\n\nThe scene right now: ${sceneBrief(scene)}.`;
+  const note = mode === 'change'
+    ? 'it sounds like a change to something already in the scene, but if the scene makes the other reading clearly right, do that'
+    : 'they asked for something new, and the scene has been emptied for it';
+  return `The user said: "${prompt}"\n(This came from speech recognition, so a word may be misheard; ${note}.)`
+    + `\n\nThe scene right now: ${sceneBrief(scene)}.`;
 }
 
 function costOf(usage, model) {

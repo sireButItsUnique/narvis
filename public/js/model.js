@@ -1,69 +1,128 @@
-// The current model: its part list, sculpted shapes, the meshes in the scene, where it stands, and undo.
+// The model on screen: the GLB from the hidden Blender (as parts, see scene/parts.js), where it stands in the
+// box, spin, and a small undo for placement and local part edits. Blender holds the real model; the unified
+// undo (strokes, part ops, Fable builds) arrives with undo.js in M2.
 import * as THREE from 'three';
 import { S } from './settings.js';
 import { scene, rect, boxDepth } from './view.js';
-import { buildModelGroup, disposeGroup } from './builder.js';
+import { createParts } from './scene/parts.js';
 
 const HOME = { fx: 0, fy: 0, fz: 0.5 };   // centre of the floor, halfway back
 const SPIN_SPEED = 0.4;                    // rad/s
 const MAX_UNDO = 50;
 const DEG = Math.PI / 180;
+const CM_PER_M = 100;                      // glTF is metres, the box is centimetres
+
+export const parts = createParts();
+
+// display (where it stands, its turn, metres -> cm x fit) -> pivot (puts the model's footprint centre on the
+// floor at the display origin) -> parts.root (the glTF frame, untouched) -> one mesh per part
+const display = new THREE.Group();
+const pivot = new THREE.Group();
+display.name = 'display';
+pivot.name = 'pivot';
+display.add(pivot);
+pivot.add(parts.root);
 
 export const model = {
-  spec: null,       // { name, parts } in cm, see spec.js
-  sculpts: new Map(),   // part name -> Float32Array of sculpted vertex positions (cm, part-local); never mutated, only replaced
-  group: null,      // root THREE.Group in the scene, null when empty
-  meshes: [],       // one per part, for raycasting
+  group: null,          // the display parent while a model is loaded, null when empty
+  get meshes() { return parts.meshes(); },   // visible parts, for pointing
+  name: '',             // the model's top object in Blender, e.g. "Utah Teapot"
+  rev: null,            // the /api/scene rev on screen
+  sym: { x: false, y: false, z: false },   // symmetry Blender detected, in three's axes
+  focusId: null,        // "focus on that": fit this part in the box instead of the whole model
   place: { ...HOME },   // where it stands, as fractions of the box, so it survives window resizes
-  userScale: 1,     // "bigger" / "smaller" / two-hand resize on top of the automatic fit
+  userScale: 1,         // "bigger" / "smaller" / two-hand resize on top of the automatic fit
   rotY: 0,
   spinning: true,
 };
 let editing = false;   // a hand is mid-gesture: don't spin
 let editSnap = null;   // the undo step the current gesture pushed
 let fit = 1;           // automatic scale that makes the model fit the box
-const history = [];
+const history = [];    // steps: { undo(), drop?() }, newest last
 
-// interaction.js registers this: commit whatever gesture is in progress before the model gets rebuilt
+// interaction.js registers this: commit whatever gesture is in progress before the parts change under it
 let flushGesture = () => {};
 export const setGestureFlush = fn => { flushGesture = fn; };
 
 // drop line to the floor and a ring under the model: depth cues
 const stick = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
-  new THREE.LineBasicMaterial({ color: 0x3a8fb8, transparent: true, opacity: 0.8 }));
+  new THREE.LineBasicMaterial({ color: 0x3a8fb8, transparent: true, opacity: 0.8, toneMapped: false }));
 stick.frustumCulled = false;   // geometry is rewritten every frame
 const ring = new THREE.Mesh(new THREE.RingGeometry(0.85, 1, 48),
-  new THREE.MeshBasicMaterial({ color: 0x35d0ff, transparent: true, opacity: 0.45, side: THREE.DoubleSide }));
+  new THREE.MeshBasicMaterial({ color: 0x35d0ff, transparent: true, opacity: 0.45, side: THREE.DoubleSide, toneMapped: false }));
 ring.rotation.x = -Math.PI / 2;
 stick.visible = ring.visible = false;
 scene.add(stick, ring);
 
 // ---------- undo ----------
-function snapshot() {
-  const { spec, place, userScale, rotY, spinning } = model;
-  return { state: JSON.stringify({ spec, place, userScale, rotY, spinning }), sculpts: new Map(model.sculpts) };
+function push(step) {
+  history.push(step);
+  while (history.length > MAX_UNDO) history.shift().drop?.();
 }
-function restore(s) { Object.assign(model, JSON.parse(s.state)); model.sculpts = s.sculpts; }
-export function remember() { history.push(snapshot()); if (history.length > MAX_UNDO) history.shift(); }
+function clearHistory() {
+  while (history.length) history.pop().drop?.();
+  editSnap = null;
+}
+
+// placement, plus one part's transform when a gesture is about to move it
+function placementStep(mesh = null) {
+  const snap = { place: { ...model.place }, userScale: model.userScale, rotY: model.rotY,
+                 spinning: model.spinning, focusId: model.focusId };
+  const partSnap = mesh && { position: mesh.position.clone(), quaternion: mesh.quaternion.clone() };
+  return {
+    undo() {
+      const refit = snap.focusId !== model.focusId;
+      Object.assign(model, snap, { place: { ...snap.place } });
+      if (partSnap) { mesh.position.copy(partSnap.position); mesh.quaternion.copy(partSnap.quaternion); }
+      if (refit) measure();
+      layout();
+    },
+  };
+}
+export function remember(mesh = null) { push(placementStep(mesh)); }
 
 export function undo() {
-  const s = history.pop();
-  if (!s) return false;
-  restore(s);
+  flushGesture();
+  const step = history.pop();
+  if (!step) return false;
+  step.undo();
   editing = false;
   editSnap = null;
-  rebuild();
   return true;
 }
 
-function rebuild() {
-  if (model.group) { scene.remove(model.group); disposeGroup(model.group); }
-  model.group = null; model.meshes = [];
-  if (model.spec) {
-    model.group = buildModelGroup(model.spec, { sculpts: model.sculpts });
-    model.meshes = [...model.group.children];
-    scene.add(model.group);
+// ---------- the model from Blender ----------
+// A new rev: swaps in only the parts that changed (parts.swap) and keeps the placement.
+export function showScene(loaded) {
+  flushGesture();
+  const wasEmpty = !parts.size;
+  const report = parts.swap(loaded.parts);
+  Object.assign(model, { name: loaded.name || '', sym: loaded.sym || model.sym, rev: loaded.rev ?? model.rev });
+  clearHistory();   // local steps don't carry over a Blender change; "go back a version" does that
+  if (model.focusId && !parts.get(model.focusId)) model.focusId = null;
+  if (wasEmpty) Object.assign(model, { place: { ...HOME }, userScale: 1, rotY: 0, spinning: true, focusId: null });
+  attach();
+  return report;
+}
+
+export function clearScene() {
+  flushGesture();
+  parts.clear();
+  clearHistory();
+  model.focusId = null;
+  attach();
+}
+
+// in the scene while there's something to show
+function attach() {
+  if (!parts.size) {
+    scene.remove(display);
+    model.group = null;
+    stick.visible = ring.visible = false;
+    return;
   }
+  if (!model.group) { scene.add(display); model.group = display; }
+  measure();
   layout();
 }
 
@@ -75,9 +134,21 @@ export function clampPosition(v) {
   return v;
 }
 
+// Size and footprint of the model (or the focused part). Only when the set of parts changes: re-measuring after
+// a part move would make the whole model jump.
+function measure() {
+  const focus = model.focusId && parts.get(model.focusId);
+  const box = parts.bounds(focus ? [focus] : null);
+  if (box.isEmpty()) return;
+  const size = box.getSize(new THREE.Vector3());
+  pivot.position.set(-(box.min.x + box.max.x) / 2, -box.min.y, -(box.min.z + box.max.z) / 2);
+  display.userData.height = Math.max(size.y * CM_PER_M, 1e-3);   // cm
+  display.userData.radius = Math.max(Math.hypot(size.x, size.z) / 2 * CM_PER_M, 1e-3);   // footprint around the spin axis, cm
+}
+
 function applyTransform() {
   const g = model.group;
-  g.scale.setScalar(fit * model.userScale);
+  g.scale.setScalar(CM_PER_M * fit * model.userScale);
   g.rotation.y = model.rotY;
   ring.scale.setScalar(Math.max(0.5, g.userData.radius * fit * model.userScale));
 }
@@ -98,102 +169,8 @@ function syncPlace() {
   model.place = { fx: (p.x - rect.cx) / rect.w, fy: (p.y - rect.y0) / rect.h, fz: -p.z / boxDepth };
 }
 
-// The parts' bounds in the spec's own coordinates (cm), including any sculpting.
-function specBounds() {
-  const box = new THREE.Box3(), shift = model.group.userData.shift;
-  for (const m of model.meshes) {
-    m.updateMatrix();
-    if (!m.geometry.boundingBox) m.geometry.computeBoundingBox();
-    box.union(m.geometry.boundingBox.clone().applyMatrix4(m.matrix));
-  }
-  box.min.sub(shift); box.max.sub(shift);
-  return box;
-}
-
-const updatePart = (name, fn) => ({ ...model.spec, parts: model.spec.parts.map(p => (p.name === name ? fn(p) : p)) });
-const round = v => Math.round(v * 1000) / 1000;
-
-// ---------- whole-model edits (each one is undoable) ----------
-// A "change" request comes back as a whole new part list; keep a sculpt when its part kept the same shape.
-function carrySculpts(oldSpec, newSpec) {
-  const same = (a, b) => a && b && a.shape === b.shape && JSON.stringify(a.dims) === JSON.stringify(b.dims)
-                                && JSON.stringify(a.points) === JSON.stringify(b.points);
-  const kept = new Map();
-  for (const [name, arr] of model.sculpts) {
-    if (same(oldSpec.parts.find(p => p.name === name), newSpec.parts.find(p => p.name === name))) kept.set(name, arr);
-  }
-  return kept;
-}
-export const sculptedNames = () => [...model.sculpts.keys()];
-
-export function setModel(spec, { keepPlacement = false, keepSculptsFrom = null } = {}) {
-  flushGesture();
-  remember();
-  model.sculpts = keepSculptsFrom ? carrySculpts(keepSculptsFrom, spec) : new Map();
-  model.spec = spec;
-  if (!keepPlacement) Object.assign(model, { place: { ...HOME }, userScale: 1, rotY: 0, spinning: true });
-  rebuild();
-}
-
-const PALETTE = ['#ffb23e', '#35d0ff', '#ff5d8f', '#7cff9b', '#c79bff', '#ffe08a'];
-// shape -> [dims for size s, half-width, centre height] so the new part stands on the floor
-const PRIMITIVE = {
-  box:      s => [[s, s, s], s / 2, s / 2],
-  sphere:   s => [[s / 2], s / 2, s / 2],
-  cylinder: s => [[s / 2, s / 2, s], s / 2, s / 2],
-  cone:     s => [[s / 2, s], s / 2, s / 2],
-  torus:    s => [[s * 0.4, s * 0.12, 360], s * 0.52, s * 0.52],
-  capsule:  s => [[s * 0.3, s * 0.6], s * 0.3, s * 0.6],
-};
-const uniqueName = base => { let n = base, k = 2; while (model.spec?.parts.some(p => p.name === n)) n = `${base}_${k++}`; return n; };
-
-// "add a cube": puts it to the right of the current model; `fresh` starts a new model instead
-export function addPrimitive(shape, { word = shape, fresh = false } = {}) {
-  flushGesture();
-  const base = fresh ? null : model.spec;
-  const b = base && specBounds();
-  const s = b ? Math.max(1, 0.35 * Math.max(b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z)) : 10;
-  const [dims, half, cy] = PRIMITIVE[shape](s);
-  const n = (base?.parts.length ?? 0) + 1;
-  const part = {
-    name: base ? uniqueName(`${word}_${n}`) : `${word}_1`, shape, dims, points: [],
-    position: b ? [b.max.x + half + s * 0.1, b.min.y + cy, (b.min.z + b.max.z) / 2] : [0, cy, 0],
-    rotation: [0, 0, 0], color: PALETTE[(n - 1) % PALETTE.length],
-  };
-  if (base) {
-    remember();
-    model.spec = { ...base, parts: [...base.parts, part] };
-    rebuild();
-  } else {
-    setModel({ name: word, parts: [part] });
-  }
-  return part.name;
-}
-
-// removes one part, or the whole model when no part is given
-export function deletePart(mesh) {
-  if (!model.spec) return false;
-  flushGesture();
-  remember();
-  const parts = mesh ? model.spec.parts.filter(p => p.name !== mesh.name) : [];
-  model.spec = parts.length ? { ...model.spec, parts } : null;
-  model.sculpts = new Map([...model.sculpts].filter(([name]) => parts.some(p => p.name === name)));
-  rebuild();
-  return true;
-}
-
-export function clearModel() {
-  if (!model.spec) return false;
-  flushGesture();
-  remember();
-  model.spec = null;
-  model.sculpts = new Map();
-  rebuild();
-  return true;
-}
-
 export function scaleBy(f) {
-  if (!model.spec) return false;
+  if (!model.group) return false;
   remember();
   model.userScale = THREE.MathUtils.clamp(model.userScale * f, 0.1, 5);
   applyTransform();
@@ -212,53 +189,88 @@ export function turnBy(deg) {
 export function setSpin(on) { model.spinning = on; }
 
 export function resetPlacement() {
-  if (!model.spec) return;
+  if (!model.group) return;
   remember();
-  Object.assign(model, { place: { ...HOME }, userScale: 1, rotY: 0 });
+  Object.assign(model, { place: { ...HOME }, userScale: 1, rotY: 0, focusId: null });
+  measure();
   layout();
 }
 
-// ---------- single-part edits: pointed at by hand, applied in place (no rebuild, so nothing jumps) ----------
-export function recolorPart(mesh, hex) {
+// "focus on that": the part fills the box (null: back to the whole model)
+export function focusPart(part) {
+  if (!model.group) return false;
   remember();
-  model.spec = updatePart(mesh.name, p => ({ ...p, color: hex }));
-  mesh.material.color.set(hex);
-  mesh.material.emissive.set(hex);
+  Object.assign(model, { focusId: part ? part.id : null, place: { ...HOME }, userScale: 1 });
+  measure();
+  layout();
+  return true;
 }
 
-export function duplicatePart(mesh) {
-  const part = model.spec.parts.find(p => p.name === mesh.name);
-  if (!part) return null;
+// ---------- local part edits: this view only until sync.js sends them to Blender (M4) ----------
+export function deletePart(part) {
   flushGesture();
-  remember();
-  mesh.updateMatrix();
-  if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
-  const width = mesh.geometry.boundingBox.clone().applyMatrix4(mesh.matrix).getSize(new THREE.Vector3()).x;
-  const name = uniqueName(`${part.name}_copy`);
-  const copy = { ...part, name, position: [round(part.position[0] + width * 1.1), part.position[1], part.position[2]] };
-  model.spec = { ...model.spec, parts: [...model.spec.parts, copy] };
-  if (model.sculpts.has(part.name)) model.sculpts = new Map(model.sculpts).set(name, model.sculpts.get(part.name));
-  rebuild();
-  return name;
+  parts.remove(part);
+  if (model.focusId === part.id) model.focusId = null;
+  push({ undo: () => { parts.restore(part); attach(); }, drop: () => parts.dispose([part]) });
+  attach();
+  return true;
 }
 
-// ---------- hand gestures (interaction.js moves meshes directly, then commits here) ----------
-// Start of any gesture: one undo step, and the model holds still while you work on it.
-export function beginEdit() { remember(); editSnap = history.at(-1); editing = true; model.spinning = false; }
+export function duplicatePart(part) {
+  flushGesture();
+  const copy = parts.duplicate(part);
+  push({ undo: () => { parts.remove(copy); parts.dispose([copy]); attach(); } });
+  attach();
+  return copy;
+}
+
+// returns false when clay view is hiding the result
+export function quickColor(part, hex) {
+  const before = part.materials.map(m => m.color?.getHex());
+  const wasDirty = part.dirty.material;
+  const onScreen = parts.recolor(part, hex);
+  push({ undo: () => {
+    part.materials.forEach((m, i) => { if (m.color && before[i] !== undefined) m.color.setHex(before[i]); });
+    part.dirty.material = wasDirty;
+  } });
+  return onScreen;
+}
+
+// "quick metal", "quick matte": the same instant local edit for how the surface behaves, not its colour
+export function quickFinish(part, finish) {
+  const keys = Object.keys(finish);
+  const before = part.materials.map(m => Object.fromEntries(keys.filter(k => k in m).map(k => [k, m[k]])));
+  const wasDirty = part.dirty.material;
+  const onScreen = parts.setFinish(part, finish);
+  push({ undo: () => {
+    part.materials.forEach((m, i) => {
+      for (const [k, v] of Object.entries(before[i])) m[k] = v;
+      m.needsUpdate = true;
+    });
+    part.dirty.material = wasDirty;
+  } });
+  return onScreen;
+}
+
+// ---------- hand gestures (interaction.js moves things directly, then commits here) ----------
+// Start of any gesture: one undo step. The turntable holds still by itself while `editing` (see update), and it's
+// only really stopped when the gesture commits, so a tap that moves nothing leaves the spin as it found it.
+export function beginEdit(mesh = null) { remember(mesh); editSnap = history.at(-1); editing = true; }
 
 // A gesture being abandoned: drop the step that beginEdit pushed and put things back as they were.
-// The caller has already undone its own changes to the geometry. A voice command that landed mid-gesture
-// (turn, recolour, resize) pushed its own step on top; that one is kept.
+// A voice command that landed mid-gesture (turn, resize) pushed its own step on top; that one is kept.
 export function cancelEdit() {
   const i = history.lastIndexOf(editSnap);
-  if (i >= 0 && i === history.length - 1) restore(history.pop());
-  else if (i >= 0) { model.spinning = JSON.parse(editSnap.state).spinning; history.splice(i, 1); }
+  if (i >= 0 && i === history.length - 1) history.pop().undo();
+  else if (i >= 0) history.splice(i, 1);
   editSnap = null;
   editing = false;
   if (model.group) layout();
 }
 
-export function endGrab() { editing = false; editSnap = null; if (model.group) syncPlace(); }
+// A gesture that moved the model: it stays where you put it, so the turntable stops. That's part of the step
+// beginEdit pushed, so undo brings the spin back with the placement.
+export function endGrab() { editing = false; editSnap = null; model.spinning = false; if (model.group) syncPlace(); }
 
 // A gesture that changed nothing (a touch, a pinch without moving): leave no empty step in undo.
 export function discardEdit() {
@@ -268,16 +280,11 @@ export function discardEdit() {
 }
 
 export function commitPartPosition(mesh) {
-  const p = mesh.position.clone().sub(model.group.userData.shift);
-  model.spec = updatePart(mesh.name, part => ({ ...part, position: [round(p.x), round(p.y), round(p.z)] }));
+  const part = parts.ofMesh(mesh);
+  if (part) part.dirty.xform = true;
   editing = false;
   editSnap = null;
-}
-
-export function commitSculpt(mesh) {
-  model.sculpts = new Map(model.sculpts).set(mesh.name, mesh.geometry.attributes.position.array.slice());
-  editing = false;
-  editSnap = null;
+  model.spinning = false;
 }
 
 // two-hand turn / resize / move, applied live
@@ -296,11 +303,4 @@ export function update(dt) {
   const p = g.position, floorY = rect.y0;
   stick.geometry.setFromPoints([p, new THREE.Vector3(p.x, floorY, p.z)]);
   ring.position.set(p.x, floorY + 0.05, p.z);
-}
-
-// brightest on the part being worked on, bright on the pointed-at part, a little on the rest
-export function highlight({ hovered = null, active = null, all = false } = {}) {
-  for (const m of model.meshes) {
-    m.material.emissiveIntensity = all ? 0.5 : m === active ? 0.4 : m === hovered ? 0.45 : (hovered || active) ? 0.2 : 0.12;
-  }
 }

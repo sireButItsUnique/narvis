@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Holo Modeler</title>
+<link rel="icon" href="data:,">   <!-- no icon file, and no 404 for one either -->
 <style>
   :root { --bg:#04060b; --panel:#07111c; --line:#1d3b55; --text:#cfe8ff; --dim:#7fa3bf; --cyan:#35d0ff; --amber:#ffb23e; --green:#7cff9b; --red:#ff6b7a; }
   html, body { margin:0; height:100%; background:var(--bg); color:var(--text); overflow:hidden;
@@ -76,19 +77,21 @@
     animation:spin .8s linear infinite; }
   @keyframes spin { to { transform:rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { #ai-busy .spin, #mic-state::before { animation:none !important; } }
-  /* Blender mode: this page is the voice console; Blender and the hand mouse do the rest */
-  body.blender-mode canvas#htw-view { display:none; }
-  #blender-panel { position:fixed; inset:0; display:flex; flex-direction:column; gap:10px; box-sizing:border-box;
-    padding:16px 16px 70px; max-width:760px; margin:0 auto; }
-  .bp-head { display:flex; gap:10px; align-items:center; font-size:14px; color:var(--text); }
-  #bp-conn { width:10px; height:10px; border-radius:50%; background:var(--red); flex:none; }
-  #bp-conn[data-on="1"] { background:var(--green); }
-  #bp-cost { margin-left:auto; color:var(--dim); font-size:13px; white-space:nowrap; }
-  #bp-status { min-height:22px; font-size:15px; color:var(--cyan); }
-  body.building #bp-status::before { content:""; display:inline-block; width:11px; height:11px; margin-right:8px;
+  /* what the hidden Blender is up to when it isn't simply ready, top centre under the busy pill */
+  #scene-state { position:fixed; left:50%; top:52px; transform:translateX(-50%); z-index:5; pointer-events:none;
+    max-width:60vw; background:rgba(7,17,28,.92); border:1px solid var(--amber); border-radius:8px; padding:6px 12px;
+    font-size:13px; color:var(--amber); }
+
+  /* Fable's build log, right side; L shows or hides it */
+  #build-panel { position:fixed; right:10px; top:10px; width:330px; max-height:44vh; z-index:4; display:flex;
+    flex-direction:column; gap:6px; box-sizing:border-box; padding:10px 12px; background:rgba(7,17,28,.9);
+    border:1px solid var(--line); border-radius:10px; }
+  .bp-head { display:flex; gap:10px; align-items:baseline; font-size:13px; color:var(--text); }
+  #bp-status { color:var(--cyan); min-height:18px; }
+  #bp-cost { margin-left:auto; color:var(--dim); font-size:12px; white-space:nowrap; }
+  body.building #bp-status::before { content:""; display:inline-block; width:10px; height:10px; margin-right:7px;
     vertical-align:-1px; border:2px solid var(--line); border-top-color:var(--cyan); border-radius:50%; animation:spin .8s linear infinite; }
-  #bp-log { flex:1; overflow-y:auto; margin:0; padding:10px 12px 10px 30px; list-style:decimal; background:var(--panel);
-    border:1px solid var(--line); border-radius:10px; font-size:14px; line-height:1.5; }
+  #bp-log { flex:1; overflow-y:auto; margin:0; padding:0 4px 0 22px; list-style:decimal; font-size:13px; line-height:1.45; }
   #bp-log li { margin:3px 0; color:var(--text); }
   #bp-log li.request { color:var(--cyan); font-weight:600; }
   #bp-log li.thinking { color:var(--dim); font-style:italic; }
@@ -100,18 +103,20 @@
   #bp-log li.error { color:var(--red); }
   #bp-log li.done { color:var(--green); }
   #bp-log li.saved { color:var(--dim); }
-  .bp-versions-head { font-size:12px; color:var(--dim); margin-bottom:6px; }
-  #bp-versions-list { display:flex; gap:8px; overflow-x:auto; padding-bottom:4px; }
-  #bp-versions-list .version { flex:none; display:flex; flex-direction:column; align-items:center; gap:3px; width:84px;
-    padding:4px; background:var(--panel); border:1px solid var(--line); border-radius:8px; color:var(--text);
-    font-family:inherit; font-size:12px; line-height:1.2; cursor:pointer; }
-  #bp-versions-list .version:hover, #bp-versions-list .version:focus-visible { border-color:var(--cyan); }
-  #bp-versions-list .version[data-current="1"] { border-color:var(--green); box-shadow:0 0 0 1px var(--green); }
-  #bp-versions-list .version.checkpoint { opacity:.65; }
-  #bp-versions-list img { width:74px; height:74px; object-fit:cover; border-radius:5px; background:#000; }
-  #bp-help { font-size:13px; color:var(--dim); line-height:1.5; }
-  #bp-help b { color:var(--text); font-weight:600; }
-  body.blender-mode #voice-bar { max-width:calc(100vw - 40px); }
+
+  /* versions strip, bottom right: every build is a version; click one or say "go back to version 2" */
+  #versions { position:fixed; right:10px; bottom:10px; z-index:5; max-width:min(46vw, 560px); box-sizing:border-box;
+    background:rgba(7,17,28,.85); border:1px solid var(--line); border-radius:8px; padding:6px 8px; }
+  .versions-head { font-size:11px; color:var(--dim); margin-bottom:4px; }
+  #versions-list { display:flex; gap:6px; overflow-x:auto; }
+  #versions-list .version { flex:none; display:flex; flex-direction:column; align-items:center; gap:2px; width:58px;
+    padding:3px; background:var(--panel); border:1px solid var(--line); border-radius:7px; color:var(--text);
+    font-family:inherit; font-size:11px; line-height:1.2; cursor:pointer; }
+  #versions-list .version:hover, #versions-list .version:focus-visible { border-color:var(--cyan); }
+  #versions-list .version[data-current="1"] { border-color:var(--green); box-shadow:0 0 0 1px var(--green); }
+  #versions-list .version.checkpoint { opacity:.65; }
+  #versions-list img { width:50px; height:50px; object-fit:cover; border-radius:4px; background:#000; }
+  #htw-cam { bottom:96px; }
   [hidden] { display:none !important; }
 </style>
 </head>
@@ -122,24 +127,18 @@
 <div id="htw-banner" hidden></div>
 <div id="tool-badge" hidden><span id="tool-name"></span><span id="tool-hint"></span></div>
 <div id="ai-busy" hidden><span class="spin"></span><span id="ai-busy-text"></span></div>
+<div id="scene-state" hidden></div>
 <div id="voice-bar" hidden><span id="mic-state"></span><span id="heard"></span></div>
 <input id="cmd" type="text" hidden autocomplete="off" spellcheck="false"
-       placeholder='Type a command: "make a red chair", "add cube", "undo"…' aria-label="Command">
+       placeholder='Type a command: "make a victorian teapot", "make the lid gold", "go back a version"…' aria-label="Command">
 
-<div id="blender-panel" hidden>
-  <div class="bp-head"><span id="bp-conn" data-on="0"></span><span id="bp-title">Connecting to Blender…</span><span id="bp-cost"></span></div>
-  <div id="bp-status"></div>
-  <div id="bp-versions" hidden>
-    <div class="bp-versions-head">Versions <span id="bp-versions-where"></span> · click one, or say "go back to version 2"</div>
-    <div id="bp-versions-list"></div>
-  </div>
+<div id="build-panel" hidden>
+  <div class="bp-head"><span id="bp-status"></span><span id="bp-cost"></span></div>
   <ol id="bp-log"></ol>
-  <div id="bp-help">
-    Say <b>"make the Mona Lisa"</b> and Claude Fable builds it in Blender, checks renders of it, and fixes it. Then <b>"make the frame gold"</b> to change it.
-    <b>"sculpt mode"</b>, <b>"clay brush"</b>, <b>"grab brush"</b>, <b>"bigger brush"</b>, <b>"mirror on"</b>, <b>"object mode"</b>, <b>"edit mode"</b>, <b>"frame it"</b>, <b>"undo"</b>, <b>"cancel"</b>.
-    Every build is saved as a version: <b>"go back to version 2"</b>, <b>"go back a version"</b>, <b>"save version"</b>. T turns spoken replies on or off.
-    Your hand is the mouse (<b>npm run blender</b> starts it, or <b>npm run handmouse</b> on its own). Pinch to click and drag, pinch-drag with your other hand to orbit, make a fist to pause.
-  </div>
+</div>
+<div id="versions" hidden>
+  <div class="versions-head">Versions <span id="versions-where"></span> · click one, or say "go back to version 2"</div>
+  <div id="versions-list"></div>
 </div>
 
 <div id="htw-panel" hidden>
@@ -160,16 +159,13 @@
 <div id="htw-start" class="overlay">
   <div class="card">
     <h1>Holo Modeler</h1>
-    <p><b>Blender mode</b>: say what you want and Claude Fable models it in Blender; your hand (via the hand mouse) is the cursor for sculpting and editing it.</p>
-    <div class="row"><button id="btn-blender" class="primary">Blender mode</button></div>
-    <p style="margin-top:14px"><b>Head-tracked box</b>: the model floats in a 3D window behind your screen.</p>
-    <p>Say what you want and it appears in a 3D box behind your screen. The webcam tracks your eyes so the box looks deep, and your hand can reach in and grab what you made.</p>
+    <p>Say what you want and Claude Fable models it in a Blender that runs hidden in the background. The model appears in a 3D box behind your screen: the webcam tracks your eyes so the box looks deep, and your hands reach in and hold it.</p>
     <ol>
       <li>Use <b>Microsoft Edge</b>: its speech recognition is what hears you. Enter your screen size, press <b>Start with webcam</b>, then allow the camera and microphone.</li>
       <li>Press <b>F</b> for fullscreen (the 3D is only correct full screen). Sit about 50 cm away.</li>
-      <li>Say <b>"make a coffee mug"</b>, or press <b>/</b> and type it. Then try "make the handle bigger", "add a cube", "undo", "export".</li>
-      <li>Point at the model and pinch to grab it; push toward the screen to move it deeper. Pinch with <b>both hands</b> to turn and resize it.</li>
-      <li>Say <b>"sculpt"</b>, then pinch the surface and pull it like clay. "Smooth" evens it out, "part mode" moves single parts, and pointing at a part while saying "make that red" or "duplicate that" edits just that part.</li>
+      <li>Say <b>"make a victorian teapot"</b>, or press <b>/</b> and type it. Then point at a part and say <b>"make that gold"</b>. Every build is saved: <b>"go back a version"</b>, <b>"go back to version 2"</b>, <b>"save version"</b>, <b>"export"</b>.</li>
+      <li>Point at the model to highlight a part; pinch to grab the model and push toward the screen to move it deeper. Pinch with <b>both hands</b> to turn and resize it.</li>
+      <li>Pointing at a part: <b>"focus on that"</b>, <b>"hide that"</b>, <b>"show only that"</b>, <b>"show all"</b>, <b>"quick red"</b> / <b>"quick metal"</b> (instant, no Fable). <b>"Clay view"</b> shows the bare form. Sculpting comes in the next build.</li>
     </ol>
     <div class="row"><label for="s-diag">Screen diagonal (inches)</label><input id="s-diag" type="number" step="0.1"></div>
     <div class="row">
@@ -178,14 +174,15 @@
     </div>
     <div id="ai-line"></div>
     <div id="htw-status"></div>
-    <div class="keys">F fullscreen · C calibration · D debug view · H hands on/off · V mic on/off · / type a command<br>1 move · 2 sculpt · 3 smooth · 4 part · [ ] brush size · X mirror · ← → turn<br>P pop-out · E cycle eye · R reset model position · M mouse/webcam · Ctrl+Z undo<br>Mouse mode: drag = pinch, scroll while dragging = pull toward you</div>
+    <div class="keys">F fullscreen · C calibration · D debug view · H hands on/off · V mic on/off · / type a command<br>1 move · 2 sculpt · 3 smooth · 4 part · [ ] brush size · X mirror · ← → turn · K clay view<br>P pop-out · E cycle eye · R reset model position · M mouse/webcam · L build log · T spoken replies · Ctrl+Z undo<br>Mouse mode: drag = pinch, scroll while dragging = pull toward you</div>
   </div>
 </div>
 
+<!-- /vendor is filled by "npm run vendor"; until then the server redirects these to three@0.170.0 on jsDelivr -->
 <script type="importmap">
 { "imports": {
-    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
-    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    "three": "/vendor/three/build/three.module.js",
+    "three/addons/": "/vendor/three/examples/jsm/"
 } }
 </script>
 <script type="module" src="js/main.js"></script>
