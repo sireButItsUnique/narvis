@@ -1,0 +1,125 @@
+// The adapter between grab.js (plain numbers) and three.js (Object3D). grab.js never imports three, so this is
+// the only file that has to change if the scene graph around it is rearranged.
+//
+// Poses are in the WORLD frame, because that is the frame the hand tracker delivers hands in. If the parts hang
+// off a transformed root (the M1 part registry puts them under `holo_root`), pass that root as `frame` and the
+// binding converts both ways.
+
+import * as THREE from 'three';
+
+const _v = new THREE.Vector3();
+const _q = new THREE.Quaternion();
+const _s = new THREE.Vector3();
+const _m = new THREE.Matrix4();
+const _n = new THREE.Matrix4();
+
+const toV = v => ({ x: v.x, y: v.y, z: v.z });
+const toQ = q => ({ x: q.x, y: q.y, z: q.z, w: q.w });
+
+/**
+ * @param {THREE.Object3D} object
+ * @param {object} opts
+ * @param {string} opts.id            stable id (the part's holo_id in the real app)
+ * @param {THREE.Object3D} [opts.frame]  the space grab works in; default the world
+ * @param {number} [opts.radiusScale] pick sphere as a multiple of the geometry's bounding sphere
+ */
+export function bindBody(object, { id = object.uuid, frame = null, radiusScale = 1.0, locked = false } = {}) {
+  const baseScale = object.scale.clone();
+  const body = {
+    id, object3d: object, frame,
+    pose: { position: { x: 0, y: 0, z: 0 }, quaternion: { x: 0, y: 0, z: 0, w: 1 }, scale: 1 },
+    center: { x: 0, y: 0, z: 0 }, radius: 0.05, restOffset: 0, locked,
+    localCenter: new THREE.Vector3(), localRadius: 0.05, localBottom: 0,
+  };
+
+  // the pick sphere and the "how far is the bottom below the origin" figure, from the geometry itself
+  function measure() {
+    const box = new THREE.Box3();
+    object.traverse(o => {
+      if (!o.isMesh || !o.geometry || o.userData.grabShell) return;   // the feedback shell is not part of the part
+      if (!o.geometry.boundingBox) o.geometry.computeBoundingBox();
+      const b = o.geometry.boundingBox.clone();
+      if (o !== object) { o.updateMatrix(); b.applyMatrix4(o.matrix); }
+      box.union(b);
+    });
+    if (box.isEmpty()) return;
+    box.getCenter(body.localCenter);
+    body.localRadius = box.getSize(_v).length() / 2;
+    body.localBottom = box.min.y;
+  }
+  measure();
+
+  // three -> plain: read the object's transform into body.pose (call when anything else moved it)
+  function sync() {
+    object.updateWorldMatrix(true, false);
+    if (frame) {
+      frame.updateWorldMatrix(true, false);
+      _m.copy(frame.matrixWorld).invert().multiply(object.matrixWorld);
+    } else {
+      _m.copy(object.matrixWorld);
+    }
+    _m.decompose(_v, _q, _s);
+    body.pose.position = toV(_v);
+    body.pose.quaternion = toQ(_q);
+    body.pose.scale = _s.x / (baseScale.x || 1);
+    setBounds(body.pose.position, _q, _s.x);
+    return body;
+  }
+
+  // plain -> three: write body.pose back onto the object
+  function apply() {
+    const p = body.pose;
+    _v.set(p.position.x, p.position.y, p.position.z);
+    _q.set(p.quaternion.x, p.quaternion.y, p.quaternion.z, p.quaternion.w);
+    _s.copy(baseScale).multiplyScalar(p.scale);
+    _m.compose(_v, _q, _s);
+    if (frame) { frame.updateWorldMatrix(true, false); _m.premultiply(frame.matrixWorld); }
+    if (object.parent) {
+      object.parent.updateWorldMatrix(true, false);
+      _m.premultiply(_n.copy(object.parent.matrixWorld).invert());
+    }
+    _m.decompose(object.position, object.quaternion, object.scale);
+    object.updateMatrixWorld(true);
+    // the pick sphere travels with it, or the next grab would aim at where it used to be
+    setBounds(p.position, _q, _s.x);
+    return object;
+  }
+
+  const _c = new THREE.Vector3();
+  function setBounds(pos, quat, k) {
+    _c.copy(body.localCenter).applyQuaternion(quat).multiplyScalar(k);
+    body.center = { x: pos.x + _c.x, y: pos.y + _c.y, z: pos.z + _c.z };
+    body.radius = body.localRadius * k * radiusScale;
+    body.restOffset = -body.localBottom * k;
+  }
+
+  sync();
+  return { body, sync, apply, measure, get baseScale() { return baseScale.clone(); } };
+}
+
+// Bind several objects at once; returns { bodies, sync(), apply() } for the whole set.
+export function bindBodies(entries, shared = {}) {
+  const bound = entries.map(e => (e.isObject3D ? bindBody(e, shared) : bindBody(e.object, { ...shared, ...e })));
+  return {
+    bound,
+    bodies: bound.map(b => b.body),
+    sync: () => bound.forEach(b => b.sync()),
+    apply: () => bound.forEach(b => b.apply()),
+  };
+}
+
+// Hands from the shared input object (public/js/input/state.js) in whatever units it uses.
+// state.js is in centimetres today and metres later; `unitsPerMetre` says which, and grab's config must match.
+export function handsFromInput(input, now, { unitsPerMetre = 1 } = {}) {
+  const out = [];
+  input.hands.forEach((h, id) => {
+    if (!h.active) return;
+    const joints = h.jointsWorld;
+    const at = i => ({ x: joints[i * 3] / unitsPerMetre, y: joints[i * 3 + 1] / unitsPerMetre, z: joints[i * 3 + 2] / unitsPerMetre });
+    // landmark 4 is the thumb tip and 8 the index tip: the pinch pair MediaPipe gives and the ZED body
+    // formats do not (see docs/v3-plan.json research notes)
+    if (joints && joints.length >= 27) out.push({ id, active: true, seenAt: h.seenAt, thumb: at(4), index: at(8) });
+    else out.push({ id, active: true, seenAt: h.seenAt, grip: { x: h.gripRaw.x / unitsPerMetre, y: h.gripRaw.y / unitsPerMetre, z: h.gripRaw.z / unitsPerMetre }, pinch: h.pinch });
+  });
+  return out;
+}

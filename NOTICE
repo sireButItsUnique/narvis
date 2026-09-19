@@ -24,3 +24,19 @@ Third-party code in this repository or served by the app:
 - MediaPipe Tasks Vision (@mediapipe/tasks-vision 0.10.35) and its face and hand landmarker models,
   Apache License 2.0, Copyright Google LLC. They are not in this repository: "npm run vendor" copies them
   to public/vendor, and otherwise the page loads them from jsDelivr and Google.
+
+- Ultraleap Unity Plugin (https://github.com/ultraleap/UnityPlugin), Apache License 2.0, Copyright Ultraleap
+  Ltd. No code is copied. The grab thresholds in public/js/interact/config.js are its shipped defaults, read
+  from PinchDetector.cs (activateDistance 25 mm, deactivateDistance 30 mm) and GrabHelperObject.cs
+  (THOWN_GRAB_COOLDOWNTIME 0.5 s, VELOCITY_HISTORY_LENGTH 45 ms, MAX_VELOCITY_SQUARED 100, and the 0.85
+  stickiness factor on a finger that is already pinching). Apache-2.0 is GPL-3.0 compatible.
+
+- The 1 Euro filter in public/js/interact/math.js implements Casiez, Roussel and Vogel, "1 Euro Filter: A
+  Simple Speed-based Low-pass Filter for Noisy Input in Interactive Systems", CHI 2012, from the paper. The
+  speedFloor term is ours, not theirs.
+
+- The anchor in public/js/interact/grab.js follows the idea in Hilliges, Kim, Izadi, Weiss and Wilson,
+  "HoloDesk: Direct 3D Interactions with a Situated See-Through Display", CHI 2012 — a kinematic proxy the
+  tracker drives and a dynamic body springed to it — reduced to fingertip proxies, which that paper's
+  Limitations section explicitly sanctions where only sparse tracking is available. No code was available to
+  copy; there is no open implementation.
