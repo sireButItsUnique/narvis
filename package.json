@@ -15,5 +15,8 @@
     "@anthropic-ai/bedrock-sdk": "^0.33.7",
     "@anthropic-ai/sdk": "^0.127.0",
     "openai": "^7.19.0"
+  },
+  "devDependencies": {
+    "three": "^0.170.0"
   }
 }

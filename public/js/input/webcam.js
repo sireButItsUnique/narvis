@@ -1,4 +1,6 @@
-// Webcam input: MediaPipe face (-> eye position) and hand (-> fingertip + pinch), written into the shared input.
+// Webcam input: MediaPipe face (-> eye position) and up to two hands (-> fingertip, pinch point, pinch, skeleton),
+// written into the shared input.
+import * as THREE from 'three';
 import { S, makeFilter3 } from '../settings.js';
 import { webcamPos, focalPx } from '../view.js';
 import { input } from './state.js';
@@ -9,10 +11,11 @@ const FACE_MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmar
 const HAND_MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
 
 export const eyeFilt = makeFilter3(1.0, 0.05);
-const fingerFilt = makeFilter3(1.6, 0.08);
+const tipFilt = [makeFilter3(1.6, 0.08), makeFilter3(1.6, 0.08)];
+const gripFilt = [makeFilter3(1.6, 0.08), makeFilter3(1.6, 0.08)];
 
 // tracker state, also read by calibration and the debug view
-export const cam = { video: null, faceLm: null, handLm: null, lastVideoTime: -1, lastFace: null, lastHand: null, ipdHistory: [] };
+export const cam = { video: null, faceLm: null, handLm: null, lastVideoTime: -1, lastFace: null, lastHands: [], ipdHistory: [] };
 
 export async function startCamera(status) {
   status('Opening webcam…');
@@ -32,15 +35,71 @@ export async function startCamera(status) {
     catch (e) { console.warn('GPU delegate failed, using CPU', e); return Cls.createFromOptions(fileset, { ...opts, baseOptions: { ...opts.baseOptions, delegate: 'CPU' } }); }
   };
   cam.faceLm = await make(FaceLandmarker, { baseOptions: { modelAssetPath: FACE_MODEL }, runningMode: 'VIDEO', numFaces: 1 });
-  cam.handLm = await make(HandLandmarker, { baseOptions: { modelAssetPath: HAND_MODEL }, runningMode: 'VIDEO', numHands: 1 });
+  cam.handLm = await make(HandLandmarker, { baseOptions: { modelAssetPath: HAND_MODEL }, runningMode: 'VIDEO', numHands: 2 });
   input.mode = 'camera';
 }
 
 const d3 = (p, q) => Math.hypot(p.x - q.x, p.y - q.y, p.z - q.z);
+const joint = (j, i) => new THREE.Vector3(j[i * 3], j[i * 3 + 1], j[i * 3 + 2]);
+
+// Landmarks -> world cm. Depth comes from palm size (average adult: wrist->middle knuckle ~8.5 cm,
+// index->pinky knuckle ~7 cm; max() resists foreshortening), then each joint steps forward or back from
+// that palm segment by its MediaPipe z (smaller = closer to the camera, same scale as x).
+function handToWorld(K, vw, vh, f, wc) {
+  const P = i => ({ x: K[i].x * vw, y: K[i].y * vh, z: K[i].z * vw });
+  const s09 = d3(P(0), P(9)) / 8.5, s517 = d3(P(5), P(17)) / 7.0;
+  const pxPerCm = Math.max(s09, s517);   // scale at the depth of the winning palm segment
+  const zRef = s09 > s517 ? (K[0].z + K[9].z) / 2 : (K[5].z + K[17].z) / 2;
+  const joints = new Float32Array(21 * 3);
+  for (let i = 0; i < 21; i++) {
+    const depth = Math.max(3, (f + (K[i].z - zRef) * vw) / pxPerCm);
+    joints[i * 3] = wc.x - (K[i].x * vw - vw / 2) * depth / f;
+    joints[i * 3 + 1] = wc.y - (K[i].y * vh - vh / 2) * depth / f;
+    joints[i * 3 + 2] = depth;
+  }
+  return { joints, tip: joint(joints, 8), pinchRatio: d3(P(4), P(8)) / d3(P(0), P(9)) };
+}
+
+// Which slot each detected hand goes in, so a hand keeps its slot (and its filters and pinch) frame to frame.
+// Returns the slot for each detection.
+function assignSlots(dets, now) {
+  const hands = input.hands, recent = hands.map(h => now - h.seenAt < 500);
+  if (dets.length === 1) {
+    let best = -1, bestDist = 15;   // cm: close enough to be the same hand
+    hands.forEach((h, s) => { if (recent[s] && h.tip.distanceTo(dets[0].tip) < bestDist) { best = s; bestDist = h.tip.distanceTo(dets[0].tip); } });
+    // Far from every slot: most likely the same hand after a fast, blurred move that tracking briefly lost,
+    // so keep it in the slot that was just tracking (opening the other slot would look like two pinched hands).
+    return [best >= 0 ? best : (recent[1] && !recent[0] ? 1 : 0)];
+  }
+  const [a, b] = dets;
+  if (recent[0] && recent[1]) {
+    const keep = hands[0].tip.distanceTo(a.tip) + hands[1].tip.distanceTo(b.tip);
+    const swap = hands[0].tip.distanceTo(b.tip) + hands[1].tip.distanceTo(a.tip);
+    return keep <= swap ? [0, 1] : [1, 0];
+  }
+  if (recent[0] || recent[1]) {
+    const s = recent[0] ? 0 : 1, aIsIt = hands[s].tip.distanceTo(a.tip) <= hands[s].tip.distanceTo(b.tip);
+    return aIsIt ? [s, 1 - s] : [1 - s, s];
+  }
+  return a.tip.x <= b.tip.x ? [0, 1] : [1, 0];   // both new: the hand further left is slot 0
+}
+
+function updateHand(s, det, now, tSec) {
+  const h = input.hands[s], j = det.joints;
+  const grip = joint(j, 4).add(joint(j, 8)).multiplyScalar(0.5);
+  h.tip.set(tipFilt[s][0].filter(det.tip.x, tSec), tipFilt[s][1].filter(det.tip.y, tSec), tipFilt[s][2].filter(det.tip.z, tSec));
+  h.grip.set(gripFilt[s][0].filter(grip.x, tSec), gripFilt[s][1].filter(grip.y, tSec), gripFilt[s][2].filter(grip.z, tSec));
+  h.gripRaw.copy(grip);
+  h.jointsWorld = j;
+  h.pinchRatio = det.pinchRatio;
+  if (!h.pinch && h.pinchRatio < 0.28) h.pinch = true;
+  else if (h.pinch && h.pinchRatio > 0.45) h.pinch = false;
+  h.seenAt = now;
+  h.active = true;
+}
 
 export function track(now) {
-  const hand = input.hands[0];
-  hand.active = S.hands && now - hand.seenAt < 300;
+  for (const h of input.hands) h.active = S.hands && now - h.seenAt < 300;
   const { video, faceLm, handLm } = cam;
   if (!video || !faceLm || video.readyState < 2 || video.currentTime === cam.lastVideoTime) return;
   cam.lastVideoTime = video.currentTime;
@@ -69,45 +128,34 @@ export function track(now) {
     eyeFilt.forEach(fl => fl.reset());
   }
 
-  // --- hand: index fingertip in 3D (depth from palm size) + pinch ---
-  if (S.hands && handLm) {
-    const hr = handLm.detectForVideo(video, now);
-    if (hr.landmarks && hr.landmarks.length) {
-      const K = hr.landmarks[0];
-      const P = i => ({ x: K[i].x * vw, y: K[i].y * vh, z: K[i].z * vw });
-      // average adult: wrist->middle knuckle ~8.5 cm, index->pinky knuckle ~7 cm; max() resists foreshortening
-      const s09 = d3(P(0), P(9)) / 8.5, s517 = d3(P(5), P(17)) / 7.0;
-      const pxPerCm = Math.max(s09, s517);   // scale at the depth of the winning palm segment
-      const zRef = s09 > s517 ? (K[0].z + K[9].z) / 2 : (K[5].z + K[17].z) / 2;
-      // step from that palm segment forward to the fingertip (MediaPipe z: smaller = closer to the camera, same scale as x)
-      const depth = Math.max(3, (f + (K[8].z - zRef) * vw) / pxPerCm);
-      const tip = P(8);
-      hand.tip.set(fingerFilt[0].filter(wc.x - (tip.x - vw / 2) * depth / f, tSec),
-                   fingerFilt[1].filter(wc.y - (tip.y - vh / 2) * depth / f, tSec),
-                   fingerFilt[2].filter(depth, tSec));
-      hand.pinchRatio = d3(P(4), P(8)) / d3(P(0), P(9));
-      if (!hand.pinch && hand.pinchRatio < 0.28) hand.pinch = true;
-      else if (hand.pinch && hand.pinchRatio > 0.45) hand.pinch = false;
-      hand.seenAt = now; hand.joints = K; cam.lastHand = { K, vw, vh };
-      hand.active = true;
-    } else if (now - hand.seenAt > 500) {
-      fingerFilt.forEach(fl => fl.reset()); hand.pinch = false;
+  // --- hands: fingertip + pinch point in 3D (depth from palm size), pinch, skeleton ---
+  if (!S.hands || !handLm) return;
+  const hr = handLm.detectForVideo(video, now);
+  const dets = (hr.landmarks || []).slice(0, 2).map(K => handToWorld(K, vw, vh, f, wc));
+  cam.lastHands = (hr.landmarks || []).slice(0, 2);
+  const slots = dets.length ? assignSlots(dets, now) : [];
+  dets.forEach((det, k) => updateHand(slots[k], det, now, tSec));
+  input.hands.forEach((h, s) => {
+    if (!slots.includes(s) && now - h.seenAt > 500) {
+      tipFilt[s].forEach(fl => fl.reset()); gripFilt[s].forEach(fl => fl.reset());
+      h.pinch = false; h.jointsWorld = null;
     }
-  }
+  });
 }
 
 // ---------- debug view: the camera image with the tracked points ----------
 export function drawDebug(dbg) {
   if (dbg.hidden || !cam.video || cam.video.readyState < 2) return;
-  const dctx = dbg.getContext('2d'), hand = input.hands[0], now = performance.now();
+  const dctx = dbg.getContext('2d'), now = performance.now();
   dctx.drawImage(cam.video, 0, 0, dbg.width, dbg.height);
   const sx = dbg.width, sy = dbg.height;
   if (cam.lastFace && now - input.faceSeenAt < 300) {
     dctx.fillStyle = '#35d0ff';
     for (const p of [cam.lastFace.a, cam.lastFace.b]) { dctx.beginPath(); dctx.arc(p.x * sx, p.y * sy, 3, 0, 7); dctx.fill(); }
   }
-  if (cam.lastHand && now - hand.seenAt < 300) {
-    dctx.fillStyle = hand.pinch ? '#ffb23e' : '#7cff9b';
-    for (const p of cam.lastHand.K) { dctx.beginPath(); dctx.arc(p.x * sx, p.y * sy, 2, 0, 7); dctx.fill(); }
+  if (input.hands.some(h => now - h.seenAt < 300)) {
+    const pinching = input.hands.some(h => h.pinch);
+    dctx.fillStyle = pinching ? '#ffb23e' : '#7cff9b';
+    for (const K of cam.lastHands) for (const p of K) { dctx.beginPath(); dctx.arc(p.x * sx, p.y * sy, 2, 0, 7); dctx.fill(); }
   }
 }

@@ -32,9 +32,12 @@ Good models
 Changes
 When you are given a current model and a change request, return the complete updated model. Keep every part the request doesn't affect exactly as it was (same names and values); change, add or remove only what the request is about.`;
 
-function userMessage(prompt, current) {
+function userMessage(prompt, current, sculpted = []) {
   if (!current) return `Make: ${prompt}`;
-  return `Current model:\n${JSON.stringify(current)}\n\nChange request: ${prompt}\n\nReturn the complete updated model.`;
+  const note = sculpted.length
+    ? `\n\nThe user has sculpted these parts by hand: ${sculpted.join(', ')}. Keep each of them exactly as it is (same name, shape, dims and points) unless the change request is specifically about that part; you may still move or recolour them if asked.`
+    : '';
+  return `Current model:\n${JSON.stringify(current)}${note}\n\nChange request: ${prompt}\n\nReturn the complete updated model.`;
 }
 
 const env = name => (process.env[name] || '').trim();
@@ -156,12 +159,12 @@ function explain(err, provider) {
 }
 
 // Asks the AI, validates the answer, and retries once if it came back unusable.
-export async function generateModel({ prompt, current = null, signal }) {
+export async function generateModel({ prompt, current = null, sculpted = [], signal }) {
   const name = pickProvider();
   if (!name) {
     throw new NoKeyError('No AI key set. Add OPENAI_API_KEY, ANTHROPIC_API_KEY or AWS credentials to .env (see .env.example) and restart the server.');
   }
-  const user = userMessage(prompt, current);
+  const user = userMessage(prompt, current, sculpted);
   let lastError;
   for (let attempt = 0; attempt < 2; attempt++) {
     let text;

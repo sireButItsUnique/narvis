@@ -27,7 +27,7 @@
   #htw-status { min-height:20px; font-size:13px; color:var(--amber); margin-top:10px; }
   #ai-line { font-size:13px; color:var(--text); margin:10px 0 0; min-height:18px; }
   .keys { font:12px/1.6 ui-monospace, Consolas, monospace; color:var(--dim); margin-top:12px; }
-  #htw-hud { position:fixed; left:10px; top:10px; z-index:5; pointer-events:none; white-space:pre;
+  #htw-hud { position:fixed; left:10px; top:62px; z-index:5; pointer-events:none; white-space:pre;
     font:12px/1.45 ui-monospace, Consolas, monospace; color:#8fd3ff; text-shadow:0 0 4px #000; }
   #htw-cam { position:fixed; right:10px; bottom:10px; width:260px; border:1px solid var(--line); z-index:5;
     transform:scaleX(-1); background:#000; }
@@ -39,6 +39,12 @@
   #htw-banner { position:fixed; left:50%; bottom:14px; transform:translateX(-50%); z-index:5; pointer-events:none;
     max-width:44vw; background:rgba(7,17,28,.9); border:1px solid var(--line); border-radius:8px; padding:7px 12px;
     font-size:13px; color:var(--amber); }
+
+  /* tool badge: what a pinch does right now, top left */
+  #tool-badge { position:fixed; left:10px; top:10px; z-index:5; pointer-events:none; background:rgba(7,17,28,.85);
+    border:1px solid var(--line); border-radius:8px; padding:6px 11px; }
+  #tool-name { display:block; font:600 12px/1.4 ui-monospace, Consolas, monospace; color:var(--cyan); letter-spacing:.5px; }
+  #tool-hint { display:block; font-size:12px; color:var(--dim); }
 
   /* voice: mic state + what was heard, bottom left */
   #voice-bar { position:fixed; left:10px; bottom:10px; z-index:5; max-width:32vw; pointer-events:none;
@@ -78,6 +84,7 @@
 <div id="htw-hud" hidden></div>
 <canvas id="htw-cam" width="320" height="240" hidden></canvas>
 <div id="htw-banner" hidden></div>
+<div id="tool-badge" hidden><span id="tool-name"></span><span id="tool-hint"></span></div>
 <div id="ai-busy" hidden><span class="spin"></span><span id="ai-busy-text"></span></div>
 <div id="voice-bar" hidden><span id="mic-state"></span><span id="heard"></span></div>
 <input id="cmd" type="text" hidden autocomplete="off" spellcheck="false"
@@ -106,7 +113,8 @@
       <li>Use <b>Microsoft Edge</b>: its speech recognition is what hears you. Enter your screen size, press <b>Start with webcam</b>, then allow the camera and microphone.</li>
       <li>Press <b>F</b> for fullscreen (the 3D is only correct full screen). Sit about 50 cm away.</li>
       <li>Say <b>"make a coffee mug"</b>, or press <b>/</b> and type it. Then try "make the handle bigger", "add a cube", "undo", "export".</li>
-      <li>Point at the model and pinch to grab it; push toward the screen to move it deeper.</li>
+      <li>Point at the model and pinch to grab it; push toward the screen to move it deeper. Pinch with <b>both hands</b> to turn and resize it.</li>
+      <li>Say <b>"sculpt"</b>, then pinch the surface and pull it like clay. "Smooth" evens it out, "part mode" moves single parts, and pointing at a part while saying "make that red" or "duplicate that" edits just that part.</li>
     </ol>
     <div class="row"><label for="s-diag">Screen diagonal (inches)</label><input id="s-diag" type="number" step="0.1"></div>
     <div class="row">
@@ -115,7 +123,7 @@
     </div>
     <div id="ai-line"></div>
     <div id="htw-status"></div>
-    <div class="keys">F fullscreen · C calibration · D debug view · H hands on/off · V mic on/off · / type a command<br>P pop-out · E cycle eye · R reset model position · M mouse/webcam · Ctrl+Z undo</div>
+    <div class="keys">F fullscreen · C calibration · D debug view · H hands on/off · V mic on/off · / type a command<br>1 move · 2 sculpt · 3 smooth · 4 part · [ ] brush size · X mirror · ← → turn<br>P pop-out · E cycle eye · R reset model position · M mouse/webcam · Ctrl+Z undo<br>Mouse mode: drag = pinch, scroll while dragging = pull toward you</div>
   </div>
 </div>
 

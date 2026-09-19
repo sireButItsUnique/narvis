@@ -41,12 +41,14 @@ async function handleModel(req, res) {
   const prompt = typeof body.prompt === 'string' ? body.prompt.trim().slice(0, 600) : '';
   if (!prompt) return sendJson(res, 400, { error: 'bad_request', message: 'say what to make' });
   const current = body.current ? sanitizeSpec(body.current).spec : null;
+  const sculpted = current && Array.isArray(body.sculpted)
+    ? body.sculpted.filter(n => typeof n === 'string' && current.parts.some(p => p.name === n)).slice(0, 80) : [];
 
   const ac = new AbortController();
   res.on('close', () => { if (!res.writableEnded) ac.abort(); });   // the page cancelled or went away
   const t0 = Date.now();
   try {
-    const { spec, warnings, provider } = await generateModel({ prompt, current, signal: ac.signal });
+    const { spec, warnings, provider } = await generateModel({ prompt, current, sculpted, signal: ac.signal });
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     console.log(`[ai] ${provider}: "${prompt}" -> ${spec.name}, ${spec.parts.length} parts, ${secs}s` +
                 (warnings.length ? ` (fixed: ${warnings.join('; ')})` : ''));
