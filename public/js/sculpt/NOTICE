@@ -42,8 +42,25 @@ Pinned at commit 235621eec717437a8dfe0a9dfbf78a3f7eb4c32f (blender/blender).
   source/blender/editors/sculpt_paint/mesh/brushes/grab.cc      -> brushes/grab.js
   source/blender/editors/sculpt_paint/mesh/sculpt_undo.cc       -> undo.js (the first-touch model)
 
-Brush kernels added later (brushes/set-a.js, brushes/set-b.js) name their own sources in their
-file headers; the list above is what exists today.
+Brush set A (brushes/set-a.js):
+  source/blender/editors/sculpt_paint/mesh/brushes/clay_strips.cc
+      -> brushes/clay-strips.js   the depth parabola, plane trim, the brush-local matrix
+  source/blender/editors/sculpt_paint/mesh/brushes/plane.cc
+      -> brushes/plane.js         Flatten/Contrast, Scrape/Fill, Fill/Deepen, Plateau and Trim as
+                                  presets of one height/depth kernel
+  source/blender/editors/sculpt_paint/mesh/brushes/clay.cc      -> brushes/clay.js
+  source/blender/editors/sculpt_paint/mesh/brushes/layer.cc     -> brushes/layer.js
+  source/blender/editors/sculpt_paint/mesh/brushes/draw_sharp.cc -> brushes/draw-sharp.js
+  source/blender/editors/sculpt_paint/mesh/sculpt.cc
+      -> brushes/brush-frame.js   calc_local_positions, calc_brush_cube_distances (the square tip)
+
+Brush kernels added later (brushes/set-b.js) name their own sources in their file headers; the
+list above is what exists today.
+
+Where Blender main @235621e and the shipped Blender 5.2.1 disagree, the behaviour here follows
+5.2.1, because that is the build the parity fixtures are recorded from. The two places this
+matters are named in the code: the accumulate rule for Draw Sharp (cache.js) and the
+"inverse smooth pressure" auto-smooth rule (index.js).
 
 presets.json is a measurement of Blender 5.2.1's Essentials brush library
 (datafiles/assets/brushes/essentials_brushes-mesh_sculpt.blend), dumped headless.

@@ -66,15 +66,22 @@ export const SUPPORTS_ACCUMULATE = new Set([
   'CLAY_THUMB', 'ROTATE', 'PLANE', 'SCENE_PROJECT',
 ]);
 
-/** Blender's stroke_cache_init accumulate rule, including the Draw Sharp inversion. */
+/**
+ * Blender's stroke_cache_init accumulate rule. "Accumulate off" is what makes a dab read the shape
+ * the stroke STARTED with, so this one boolean decides what the dab raycast and the area normal
+ * see; a brush with no Accumulate option stays in accumulate mode and reads the live surface.
+ *
+ * Draw Sharp deserves a note. Blender main @235621e inverts the flag for it ("draw sharp does not
+ * need the original coordinates to produce the accumulate effect"), but the build we take as
+ * ground truth, 5.2.1, does NOT: there Draw Sharp reads the stroke-start surface like every other
+ * accumulate-off brush. Measured on the golden strokes - with main's inversion the two-dab case
+ * sits at 5.23% of Blender's max displacement and the long one at 6.40%; without it, 1.17% and
+ * 3.78%. So this follows 5.2.1 and leaves the inversion out.
+ */
 export function accumulateFor(type, settings = {}) {
   let accum = true;
   if (settings.stroke_method === 'ANCHORED') accum = false;
-  if (type === 'DRAW_SHARP') accum = false;
-  if (SUPPORTS_ACCUMULATE.has(type) && !settings.use_accumulate) {
-    accum = false;
-    if (type === 'DRAW_SHARP') accum = true;
-  }
+  if (SUPPORTS_ACCUMULATE.has(type) && !settings.use_accumulate) accum = false;
   return accum;
 }
 

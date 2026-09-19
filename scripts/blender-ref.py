@@ -12,15 +12,15 @@ FIELDS = ["sculpt_brush_type","strength","curve_distance_falloff_preset","hardne
           "plane_inversion_mode","stabilize_normal","stabilize_plane","tip_roundness","tip_scale_x","crease_pinch_factor",
           "rake_factor","normal_weight","height","use_persistent","elastic_deform_type","elastic_deform_volume_preservation",
           "deform_target","use_grab_active_vertex","use_grab_silhouette","snake_hook_deform_type","smooth_deform_type"]
-def mesh_setup():
+def mesh_setup(subdiv=5):
     for o in list(bpy.data.objects): bpy.data.objects.remove(o)
-    bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=5, radius=1.0)
+    bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=subdiv, radius=1.0)
     ob = bpy.context.active_object
     for v in ob.data.vertices:  # deterministic bumps so smooth/flatten/crease have work to do
         v.co *= 1.0 + 0.03 * noise.noise(v.co * 4.0)
     return ob
-def case(name, brush, dx=12.0, n=16, x0=-90.0, y0=0.0, usize=0.6, mirror_x=False, pressure=1.0):
-    ob = mesh_setup()
+def case(name, brush, dx=12.0, n=16, x0=-90.0, y0=0.0, usize=0.6, mirror_x=False, pressure=1.0, subdiv=5):
+    ob = mesh_setup(subdiv)
     ob.data.use_mirror_x = mirror_x
     before = [c for v in ob.data.vertices for c in v.co]
     tris = [i for p in ob.data.polygons for i in p.vertices]
@@ -80,3 +80,28 @@ case("draw_half_pressure", "Draw", pressure=0.5)
 case("grab_pull", "Grab", n=6, x0=0.0, dx=12.0)
 case("grab_pull_short", "Grab", n=2, x0=0.0, dx=12.0)
 case("smooth_short", "Smooth", n=2, x0=0.0, dx=12.0)
+# Set A. Short strokes that start on the FACE, so one dab's shape can be compared on its own
+# instead of through nine overlapping ones. Clay Strips and the Plane family skip their first
+# brush step (no stroke direction yet), so n=2 gives them exactly one deposit.
+case("clay_strips_short", "Clay Strips", n=2, x0=0.0, dx=12.0)
+case("clay_strips_face", "Clay Strips", n=6, x0=0.0, dx=12.0)
+case("draw_sharp_short", "Draw Sharp", n=2, x0=0.0, dx=12.0)
+case("layer_short", "Layer", n=2, x0=0.0, dx=12.0)
+case("clay_short", "Clay", n=2, x0=0.0, dx=12.0)
+case("flatten_short", "Flatten/Contrast", n=2, x0=0.0, dx=12.0)
+# Single dabs. Draw Sharp and Layer both read the LIVE surface each step, so a one-dab case
+# separates "is the kernel right" from "does the error feed back through the deformed surface".
+case("draw_sharp_one", "Draw Sharp", n=1, x0=0.0, dx=12.0)
+case("layer_one", "Layer", n=1, x0=0.0, dx=12.0)
+# Long strokes that stay on the face, to tell "error grows with the number of dabs" apart from
+# "the stroke anchored on a ray that grazed the silhouette".
+case("draw_sharp_face", "Draw Sharp", n=8, x0=-40.0, dx=12.0)
+case("layer_face", "Layer", n=8, x0=-40.0, dx=12.0)
+# Clay Strips' square tip falls from full strength to nothing over tip_roundness (0.15) of a
+# radius = 4.5 mm, which on the 2,562-vertex sphere is HALF an edge length: whether one vertex
+# lands inside or outside that band swings its weight, and max-vertex-error sees that as a large
+# number even when the surface agrees. The same stroke on a 10,242-vertex sphere resolves the band
+# and is the honest test of the kernel.
+case("clay_strips_dense", "Clay Strips", n=6, x0=0.0, dx=12.0, subdiv=6)
+case("draw_sharp_dense", "Draw Sharp", n=8, x0=-40.0, dx=12.0, subdiv=6)
+case("layer_dense", "Layer", n=8, x0=-40.0, dx=12.0, subdiv=6)

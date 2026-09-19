@@ -85,12 +85,17 @@ test('brush strength table', () => {
   assert.ok(close(brushStrength('NUDGE', { ...o, overlap: 0.5 }), a * 0.75));
 });
 
-test('accumulate rule: only some brushes have the option, and Draw Sharp inverts it', () => {
+test('accumulate rule: only some brushes have the option at all', () => {
   assert.equal(accumulateFor('DRAW', { use_accumulate: false }), false);
   assert.equal(accumulateFor('DRAW', { use_accumulate: true }), true);
   assert.equal(accumulateFor('SMOOTH', { use_accumulate: false }), true, 'Smooth has no accumulate option');
   assert.equal(accumulateFor('GRAB', { use_accumulate: false }), true);
-  assert.equal(accumulateFor('DRAW_SHARP', { use_accumulate: false }), true);
+  // Draw Sharp follows the same rule as every other accumulate-off brush in Blender 5.2.1, which
+  // is the build the golden fixtures come from: it reads the stroke-start surface. (Blender main
+  // @235621e inverts the flag for it; taking main's version costs 5.23% against the golden
+  // two-dab stroke where 5.2.1's rule gives 1.17%. See cache.js.)
+  assert.equal(accumulateFor('DRAW_SHARP', { use_accumulate: false }), false);
+  assert.equal(accumulateFor('DRAW_SHARP', { use_accumulate: true }), true);
   assert.equal(accumulateFor('DRAW', { use_accumulate: false, stroke_method: 'ANCHORED' }), false);
   assert.ok(SUPPORTS_ACCUMULATE.has('CLAY_STRIPS') && !SUPPORTS_ACCUMULATE.has('SMOOTH'));
 });

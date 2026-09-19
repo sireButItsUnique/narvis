@@ -494,12 +494,20 @@ export function createSculptEngine(engineOptions = {}) {
       // except Smooth and Mask.
       const autoSmooth = settings.auto_smooth_factor ?? 0;
       if (!brush.noAutoSmooth && autoSmooth > 0) {
-        const strength = settings.use_smooth_pressure ? autoSmooth * cache.pressure : autoSmooth;
-        smoothDab(proxy, verts, {
-          strength,
-          computeFactors: (out) => calcFactors(proxy, verts, factorParams(cache, settings, false), out, ctx.distances),
-          onTouch: (v) => { proxy.stampOriginal(v); ctx.dirty.add(v); },
-        });
+        // "Inverse smooth pressure" (Blender 5.2.1's use_inverse_smooth_pressure, renamed
+        // use_smooth_pressure in main): pressing HARDER smooths LESS, so a brush carrying the flag
+        // does not auto-smooth at all at full pressure. Clay is the one Essentials brush that has
+        // both a non-zero auto-smooth and this flag, and getting the direction backwards is not
+        // subtle - it took the golden clay stroke from 2.1% to 161% of Blender's max displacement.
+        const inversePressure = settings.use_inverse_smooth_pressure ?? settings.use_smooth_pressure;
+        const strength = inversePressure ? autoSmooth * (1 - cache.pressure) : autoSmooth;
+        if (strength > 0) {
+          smoothDab(proxy, verts, {
+            strength,
+            computeFactors: (out) => calcFactors(proxy, verts, factorParams(cache, settings, false), out, ctx.distances),
+            onTouch: (v) => { proxy.stampOriginal(v); ctx.dirty.add(v); },
+          });
+        }
       }
       for (const v of ctx.dirty) dirty.add(v);
     }
@@ -509,6 +517,14 @@ export function createSculptEngine(engineOptions = {}) {
     if (dirty.size === 0) return false;
     refresh(handle, Uint32Array.from(dirty));
     return true;
+  }
+
+  /** Blender's area_normal_and_center_get_position_radius, as a factor of the brush radius. */
+  function areaRadiusFactor(settings, brush, cache, nrf) {
+    const type = settings.sculpt_brush_type || brush.type;
+    const arf = settings.area_radius_factor ?? 0;
+    if (type !== 'PLANE' || !(arf > 0)) return nrf;
+    return settings.use_pressure_area_radius ? arf * cache.pressure : arf;
   }
 
   function updateAreaData(handle, settings, brush, verts) {
@@ -525,7 +541,11 @@ export function createSculptEngine(engineOptions = {}) {
       if (!brush.needsAreaCenter) return;
     }
     const nrf = settings.normal_radius_factor ?? 0.5;
-    const arf = settings.area_radius_factor ?? nrf;
+    // area_radius_factor sizes the AREA CENTRE, but Blender applies it only to the Plane brush
+    // ("the Layer brush produces artifacts with normal and area radius"); every other brush sizes
+    // the centre with normal_radius_factor as well. Clay Strips is where this shows: its factors
+    // are 1.2 and 0.5, so using the wrong one moves the brush plane and reshapes the whole strip.
+    const arf = areaRadiusFactor(settings, brush, cache, nrf);
     const { normal, center } = calcAreaNormalAndCenter(proxy, {
       verts,
       positions: useOriginal ? proxy.getOrigPositions() : undefined,
@@ -573,8 +593,12 @@ export function createSculptEngine(engineOptions = {}) {
     const settings = input?.settings ? { ...input.settings } : settingsFor();
     const brush = input?.brush || state.brush;
     handle.proxy.beginStrokeSnapshot();
+    const radiusLocal = radiusLocalFromWorld(state.radiusWorld, handle.scale);
     handle._cache = createCache({
-      radius: radiusLocalFromWorld(state.radiusWorld, handle.scale),
+      radius: radiusLocal,
+      // Blender's cache->initial_radius: the radius the STROKE started with, which Clay measures
+      // its plane offset against so a brush resized mid-stroke keeps depositing the same thickness.
+      initialRadius: radiusLocal,
       hardness: settings.hardness || 0,
       firstTime: true,
       invert: state.invert,
