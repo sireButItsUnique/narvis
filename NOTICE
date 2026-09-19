@@ -24,3 +24,13 @@ Third-party code in this repository or served by the app:
 - MediaPipe Tasks Vision (@mediapipe/tasks-vision 0.10.35) and its face and hand landmarker models,
   Apache License 2.0, Copyright Google LLC. They are not in this repository: "npm run vendor" copies them
   to public/vendor, and otherwise the page loads them from jsDelivr and Google.
+
+- The pinch thresholds in public/js/input/cameras.js (grab at 25 mm, release above that, with hysteresis)
+  are taken from Ultraleap's Unity plugin (https://github.com/ultraleap/UnityPlugin), Apache License 2.0,
+  Copyright Ultraleap. Only the numbers are reused; no Ultraleap code is included.
+
+- tools/zed-bridge/ is a standalone helper program, not part of the app. When it is run against a real
+  camera it imports the Stereolabs ZED SDK Python bindings (pyzed) and, in its default mode, MediaPipe's
+  Python package (Apache License 2.0). The ZED SDK is proprietary and is NOT distributed here; the bridge
+  runs as a separate process and talks to the app only over a WebSocket, so no GPL-3.0 code in this
+  repository links against it. Its "--fake" mode uses nothing but the Python standard library.
