@@ -3,7 +3,8 @@
 // into 3D world points, survive the camera being unplugged and survive the bridge dying.
 //
 // The browser driving is the same Edge/CDP trick as .research/tools/cdp.mjs, with the extra media flags
-// this test needs. Run it with:  node test/cameras-e2e.mjs [--keep]
+// this test needs. It drives a real browser and needs the ports below free, so it is NOT under test/ (where
+// `node --test` would run every .mjs). Run it by hand with:  node tools/cameras-e2e.mjs [--keep]
 //
 // Ports: 8801 (page) and 8814 (bridge), both inside the range this workflow owns.
 
