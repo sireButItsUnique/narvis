@@ -24,3 +24,18 @@ Third-party code in this repository or served by the app:
 - MediaPipe Tasks Vision (@mediapipe/tasks-vision 0.10.35) and its face and hand landmarker models,
   Apache License 2.0, Copyright Google LLC. They are not in this repository: "npm run vendor" copies them
   to public/vendor, and otherwise the page loads them from jsDelivr and Google.
+
+- The tracking maths in public/js/track/ and the rig simulator in public/js/sim/ are original code, written
+  from published algorithms rather than copied from any implementation: the normalised 8-point essential
+  matrix and its four-fold decomposition (Hartley & Zisserman, Multiple View Geometry), Umeyama's
+  least-squares similarity fit (IEEE PAMI 1991), the 1 euro filter (Casiez, Roussel & Vogel, CHI 2012) and
+  Kooima's generalised perspective projection for the off-axis frustum. No third-party source is included.
+
+- The pinch thresholds in public/js/track/landmarks.js (25 mm to close, 30 mm to open) are the published
+  defaults of Ultraleap's PinchDetector, from the Ultraleap Unity Plugin, Apache License 2.0, Copyright
+  Ultraleap Ltd. They are cited parameters, not code; no Ultraleap source is used.
+
+- The ZED calibration file format read by parseZedConf() in public/js/track/calibrate.js is documented by
+  Stereolabs (https://support.stereolabs.com), and the file itself is data Stereolabs supplies per camera
+  serial. No part of the proprietary ZED SDK is used or linked: the optional bridge is a separate process
+  that sends plain numbers over a socket, so this GPL-3.0 code never links against it.
