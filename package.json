@@ -1,0 +1,19 @@
+{
+  "name": "holomodel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Say \"make a ___\" and shape the 3D model with your hands in a head-tracked window.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "dependencies": {
+    "@anthropic-ai/bedrock-sdk": "^0.33.7",
+    "@anthropic-ai/sdk": "^0.127.0",
+    "openai": "^7.19.0"
+  }
+}

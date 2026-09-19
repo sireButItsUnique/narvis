@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Holo Modeler</title>
+<style>
+  :root { --bg:#04060b; --panel:#07111c; --line:#1d3b55; --text:#cfe8ff; --dim:#7fa3bf; --cyan:#35d0ff; --amber:#ffb23e; --green:#7cff9b; --red:#ff6b7a; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); overflow:hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  canvas#htw-view { display:block; width:100vw; height:100vh; }
+  .overlay { position:fixed; inset:0; display:flex; align-items:flex-start; justify-content:center; overflow-y:auto;
+    background:rgba(4,6,11,.94); z-index:20; padding:16px; box-sizing:border-box; }
+  .card { margin:auto; max-width:560px; width:100%; box-sizing:border-box; padding:24px 26px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+  .card h1 { margin:0 0 6px; font-size:22px; color:var(--cyan); letter-spacing:.3px; }
+  .card p, .card li { color:var(--dim); font-size:14px; line-height:1.5; }
+  .card li b, .card p b { color:var(--text); font-weight:600; }
+  .card ol { padding-left:20px; margin:10px 0; }
+  .row { display:flex; gap:10px; align-items:center; margin:8px 0; flex-wrap:wrap; }
+  label { font-size:13px; color:var(--dim); }
+  input[type=number], select { width:84px; background:#0b1a29; color:var(--text); border:1px solid var(--line);
+    border-radius:6px; padding:5px 6px; font-size:13px; }
+  button { background:#0e2a40; color:var(--text); border:1px solid #2b5a80; border-radius:8px; padding:9px 14px;
+    font-size:14px; cursor:pointer; }
+  button:hover { background:#123551; }
+  button.primary { background:#0f4a6e; border-color:var(--cyan); }
+  #htw-status { min-height:20px; font-size:13px; color:var(--amber); margin-top:10px; }
+  #ai-line { font-size:13px; color:var(--text); margin:10px 0 0; min-height:18px; }
+  .keys { font:12px/1.6 ui-monospace, Consolas, monospace; color:var(--dim); margin-top:12px; }
+  #htw-hud { position:fixed; left:10px; top:10px; z-index:5; pointer-events:none; white-space:pre;
+    font:12px/1.45 ui-monospace, Consolas, monospace; color:#8fd3ff; text-shadow:0 0 4px #000; }
+  #htw-cam { position:fixed; right:10px; bottom:10px; width:260px; border:1px solid var(--line); z-index:5;
+    transform:scaleX(-1); background:#000; }
+  #htw-panel { position:fixed; right:10px; top:10px; width:310px; z-index:6; background:rgba(7,17,28,.96);
+    border:1px solid var(--line); border-radius:10px; padding:12px 14px; font-size:13px; }
+  #htw-panel h2 { margin:0 0 8px; font-size:14px; color:var(--cyan); }
+  #htw-panel .row { justify-content:space-between; margin:6px 0; }
+  #htw-panel small { color:var(--dim); display:block; margin-top:6px; line-height:1.4; }
+  #htw-banner { position:fixed; left:50%; bottom:14px; transform:translateX(-50%); z-index:5; pointer-events:none;
+    max-width:44vw; background:rgba(7,17,28,.9); border:1px solid var(--line); border-radius:8px; padding:7px 12px;
+    font-size:13px; color:var(--amber); }
+
+  /* voice: mic state + what was heard, bottom left */
+  #voice-bar { position:fixed; left:10px; bottom:10px; z-index:5; max-width:32vw; pointer-events:none;
+    background:rgba(7,17,28,.85); border:1px solid var(--line); border-radius:8px; padding:7px 11px; font-size:13px; }
+  #mic-state { display:block; color:var(--dim); font-size:12px; }
+  #mic-state::before { content:"●"; margin-right:6px; color:var(--dim); }
+  #mic-state[data-state="listening"] { color:var(--green); }
+  #mic-state[data-state="listening"]::before { color:var(--green); animation:pulse 1.6s ease-in-out infinite; }
+  #mic-state[data-state="blocked"], #mic-state[data-state="network"], #mic-state[data-state="unsupported"],
+  #mic-state[data-state="error"] { color:var(--amber); }
+  #heard { display:block; margin-top:3px; color:var(--text); transition:opacity .6s; }
+  #heard:empty { display:none; }
+  #heard.interim { color:var(--dim); font-style:italic; }
+  #heard.command { color:var(--cyan); }
+  #heard.ignored { color:var(--dim); }
+  #heard.stale { opacity:.35; }
+  @keyframes pulse { 50% { opacity:.3; } }
+
+  /* typed commands, press / */
+  #cmd { position:fixed; left:50%; bottom:58px; transform:translateX(-50%); z-index:8; width:min(520px, 80vw);
+    box-sizing:border-box; background:#0b1a29; color:var(--text); border:1px solid var(--cyan); border-radius:8px;
+    padding:10px 12px; font-size:15px; outline:none; box-shadow:0 0 0 4px rgba(53,208,255,.12); }
+
+  /* AI working indicator, top centre */
+  #ai-busy { position:fixed; left:50%; top:12px; transform:translateX(-50%); z-index:5; pointer-events:none;
+    display:flex; gap:9px; align-items:center; background:rgba(7,17,28,.92); border:1px solid var(--cyan);
+    border-radius:8px; padding:7px 12px; font-size:13px; color:var(--text); }
+  #ai-busy .spin { width:12px; height:12px; border:2px solid var(--line); border-top-color:var(--cyan); border-radius:50%;
+    animation:spin .8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { #ai-busy .spin, #mic-state::before { animation:none !important; } }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<canvas id="htw-view"></canvas>
+<div id="htw-hud" hidden></div>
+<canvas id="htw-cam" width="320" height="240" hidden></canvas>
+<div id="htw-banner" hidden></div>
+<div id="ai-busy" hidden><span class="spin"></span><span id="ai-busy-text"></span></div>
+<div id="voice-bar" hidden><span id="mic-state"></span><span id="heard"></span></div>
+<input id="cmd" type="text" hidden autocomplete="off" spellcheck="false"
+       placeholder='Type a command: "make a red chair", "add cube", "undo"…' aria-label="Command">
+
+<div id="htw-panel" hidden>
+  <h2>Calibration</h2>
+  <div class="row"><label for="p-diag">Screen diagonal (in)</label><input id="p-diag" type="number" step="0.1"></div>
+  <div class="row"><label for="p-camab">Webcam above picture (cm)</label><input id="p-camab" type="number" step="0.1"></div>
+  <div class="row"><label for="p-camx">Webcam right of center (cm)</label><input id="p-camx" type="number" step="0.1"></div>
+  <div class="row"><label for="p-ipd">Eye spacing (mm)</label><input id="p-ipd" type="number" step="1"></div>
+  <div class="row"><label for="p-fov">Webcam horizontal FOV (°)</label><input id="p-fov" type="number" step="0.5"></div>
+  <div class="row"><label for="p-ynudge">Eye height nudge (cm)</label><input id="p-ynudge" type="number" step="0.5"></div>
+  <div class="row"><label for="p-eye">Track which eye</label>
+    <select id="p-eye"><option value="center">between eyes</option><option value="left">left eye</option><option value="right">right eye</option></select></div>
+  <div class="row"><label for="p-known">I'm sitting this far away (cm)</label><input id="p-known" type="number" step="1"></div>
+  <div class="row"><button id="p-cal">Calibrate distance</button><button id="p-close">Close</button></div>
+  <small>Measure from your eyes to the screen with a ruler, sit still, press <b>Calibrate distance</b>. That fixes the webcam FOV. Then use "Eye height nudge" until the box's floor looks level.</small>
+</div>
+
+<div id="htw-start" class="overlay">
+  <div class="card">
+    <h1>Holo Modeler</h1>
+    <p>Say what you want and it appears in a 3D box behind your screen. The webcam tracks your eyes so the box looks deep, and your hand can reach in and grab what you made.</p>
+    <ol>
+      <li>Use <b>Microsoft Edge</b>: its speech recognition is what hears you. Enter your screen size, press <b>Start with webcam</b>, then allow the camera and microphone.</li>
+      <li>Press <b>F</b> for fullscreen (the 3D is only correct full screen). Sit about 50 cm away.</li>
+      <li>Say <b>"make a coffee mug"</b>, or press <b>/</b> and type it. Then try "make the handle bigger", "add a cube", "undo", "export".</li>
+      <li>Point at the model and pinch to grab it; push toward the screen to move it deeper.</li>
+    </ol>
+    <div class="row"><label for="s-diag">Screen diagonal (inches)</label><input id="s-diag" type="number" step="0.1"></div>
+    <div class="row">
+      <button id="btn-cam" class="primary">Start with webcam</button>
+      <button id="btn-mouse">Mouse mode (no camera)</button>
+    </div>
+    <div id="ai-line"></div>
+    <div id="htw-status"></div>
+    <div class="keys">F fullscreen · C calibration · D debug view · H hands on/off · V mic on/off · / type a command<br>P pop-out · E cycle eye · R reset model position · M mouse/webcam · Ctrl+Z undo</div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
