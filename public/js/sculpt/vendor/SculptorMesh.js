@@ -2,6 +2,17 @@
  * Portions adapted from SculptGL by Stéphane Ginier.
  * Copyright (c) 2019 Stéphane GINIER
  * Licensed under the MIT License; see ./LICENSE-SculptGL.txt.
+ *
+ * HOLOMODEL FORK (still MIT). Upstream: three.js r186 examples/jsm/misc/SculptorMesh.js.
+ * Every change is tagged with "HOLOMODEL:" so a diff against upstream stays readable:
+ *  1. initFromWelded(positions, triangles, triRenderMap, faceMaterials): take an already welded
+ *     proxy (binding.js welds by Blender _vid), so proxy vertex i keeps Blender's vertex id.
+ *  2. Float32Array mask per vertex (Blender's .sculpt_mask lives on the proxy).
+ *  3. Lazy per-stroke original positions/normals (origP/origN) keyed by a stroke stamp; this is
+ *     both the brushes' "original data" and the undo record (Blender does the same, sculpt_undo.cc).
+ *  4. Per-face material id, so a merged multi-material part can still be split on export.
+ *  5. Angle-weighted vertex normals, which is what Blender's mesh normals are; the upstream
+ *     area-weighted average moved parity by more than the whole brush tolerance.
  */
 
 import {
@@ -683,6 +694,16 @@ class SculptorMesh {
 		this._tagFlag = 1;
 		this._sculptFlag = 1;
 
+		// HOLOMODEL additions.
+		this._mask = null;            // Float32Array, 0 = fully sculptable (Blender's .sculpt_mask)
+		this._origP = null;           // stroke-start positions, filled lazily on first touch
+		this._origN = null;           // stroke-start normals, same
+		this._origStamp = null;       // Int32Array: which stroke stamped this vertex
+		this._strokeStamp = 0;
+		this._touched = [];           // vertices stamped during the current stroke (undo record)
+		this._faceMaterial = null;    // Uint16Array per face
+		this._triRenderMap = null;    // proxy face -> render triangle index
+
 	}
 
 	getNbVertices() {
@@ -892,6 +913,16 @@ class SculptorMesh {
 		this._facePosInLeaf = new Uint32Array( triangleCount );
 		this._faceLeaf = new Array( triangleCount ).fill( null );
 
+		// HOLOMODEL: same per-vertex sculpt data as initFromWelded, so either entry point works.
+		this._mask = new Float32Array( vertexCount );
+		this._origP = new Float32Array( vertexDataLength );
+		this._origN = new Float32Array( vertexDataLength );
+		this._origStamp = new Int32Array( vertexCount );
+		this._strokeStamp = 0;
+		this._touched = [];
+		this._faceMaterial = new Uint16Array( triangleCount );
+		this._triRenderMap = null;
+
 		this._initTopology();
 		this._updateGeometry();
 
@@ -1019,11 +1050,16 @@ class SculptorMesh {
 
 	}
 
+	// HOLOMODEL: angle-weighted instead of the upstream plain average of face normals, because
+	// Blender's mesh vertex normals weigh each face by its corner angle and the brush maths reads
+	// these normals (area normal, Inflate direction, front-face test).
 	_updateVerticesNormal( iVerts ) {
 
 		const nAr = this._normalsXYZ;
 		const renderNAr = this._renderNormalsXYZ;
 		const faceNormals = this._faceNormals;
+		const fAr = this._facesABCD;
+		const vAr = this._verticesXYZ;
 		const ringFaces = this._vertRingFace;
 		const full = iVerts === undefined;
 		const nbVerts = full ? this._nbVertices : iVerts.length;
@@ -1032,21 +1068,41 @@ class SculptorMesh {
 
 			const ind = full ? i : iVerts[ i ];
 			const vrf = ringFaces[ ind ];
+			const ind3 = ind * 3;
+			const px = vAr[ ind3 ], py = vAr[ ind3 + 1 ], pz = vAr[ ind3 + 2 ];
 			let nx = 0, ny = 0, nz = 0;
+
 			for ( let j = 0, l = vrf.length; j < l; ++ j ) {
 
-				const id = vrf[ j ] * 3;
-				nx += faceNormals[ id ];
-				ny += faceNormals[ id + 1 ];
-				nz += faceNormals[ id + 2 ];
+				const iFace = vrf[ j ];
+				const idf = iFace * 4;
+				const a = fAr[ idf ], b = fAr[ idf + 1 ], c = fAr[ idf + 2 ];
+				// The two other corners of this triangle.
+				const o1 = a === ind ? b : ( b === ind ? c : a );
+				const o2 = a === ind ? c : ( b === ind ? a : b );
+				const o13 = o1 * 3, o23 = o2 * 3;
+				let e1x = vAr[ o13 ] - px, e1y = vAr[ o13 + 1 ] - py, e1z = vAr[ o13 + 2 ] - pz;
+				let e2x = vAr[ o23 ] - px, e2y = vAr[ o23 + 1 ] - py, e2z = vAr[ o23 + 2 ] - pz;
+				const l1 = Math.sqrt( e1x * e1x + e1y * e1y + e1z * e1z );
+				const l2 = Math.sqrt( e2x * e2x + e2y * e2y + e2z * e2z );
+				if ( l1 === 0 || l2 === 0 ) continue;
+				e1x /= l1; e1y /= l1; e1z /= l1;
+				e2x /= l2; e2y /= l2; e2z /= l2;
+				let cosAngle = e1x * e2x + e1y * e2y + e1z * e2z;
+				if ( cosAngle > 1 ) cosAngle = 1; else if ( cosAngle < - 1 ) cosAngle = - 1;
+				const weight = Math.acos( cosAngle );
+
+				const idn = iFace * 3;
+				const fx = faceNormals[ idn ], fy = faceNormals[ idn + 1 ], fz = faceNormals[ idn + 2 ];
+				const fl = Math.sqrt( fx * fx + fy * fy + fz * fz );
+				if ( fl === 0 ) continue;
+				const w = weight / fl;
+				nx += fx * w;
+				ny += fy * w;
+				nz += fz * w;
 
 			}
 
-			const inverseCount = vrf.length > 0 ? 1.0 / vrf.length : 0;
-			const ind3 = ind * 3;
-			nx *= inverseCount;
-			ny *= inverseCount;
-			nz *= inverseCount;
 			nAr[ ind3 ] = nx;
 			nAr[ ind3 + 1 ] = ny;
 			nAr[ ind3 + 2 ] = nz;
@@ -1471,6 +1527,147 @@ class SculptorMesh {
 			this._vertSculptFlags = this._resizeArray( this._vertSculptFlags, requiredCount );
 
 		}
+
+	}
+
+	// HOLOMODEL: build from data that binding.js has already welded, so vertex i stays Blender's
+	// _vid i. positions: Float32Array(3n); triangles: Uint32Array(3t) into those vertices;
+	// triRenderMap/faceMaterials are optional per-face side tables.
+	initFromWelded( positions, triangles, triRenderMap, faceMaterials ) {
+
+		this._tagFlag = 1;
+		this._sculptFlag = 1;
+
+		const vertexCount = positions.length / 3;
+		const triangleCount = triangles.length / 3;
+
+		if ( vertexCount === 0 || triangleCount === 0 ) {
+
+			throw new Error( 'SculptorMesh: initFromWelded needs at least one triangle.' );
+
+		}
+
+		const faces = new Uint32Array( triangleCount * 4 );
+		for ( let i = 0; i < triangleCount; ++ i ) {
+
+			const it = i * 3;
+			const idf = i * 4;
+			faces[ idf ] = triangles[ it ];
+			faces[ idf + 1 ] = triangles[ it + 1 ];
+			faces[ idf + 2 ] = triangles[ it + 2 ];
+			faces[ idf + 3 ] = TRI_INDEX;
+
+		}
+
+		this._nbVertices = vertexCount;
+		this._nbFaces = triangleCount;
+		this._topologyVersion = 0;
+		this._leavesToUpdate.length = 0;
+
+		this._verticesXYZ = positions instanceof Float32Array ? positions : new Float32Array( positions );
+		this._normalsXYZ = new Float32Array( vertexCount * 3 );
+		this._renderNormalsXYZ = new Float32Array( vertexCount * 3 );
+
+		this._facesABCD = faces;
+		this._trianglesABC = triangles instanceof Uint32Array ? triangles : new Uint32Array( triangles );
+		this._vertOnEdge = new Uint8Array( vertexCount );
+		this._vertTagFlags = new Int32Array( vertexCount );
+		this._vertSculptFlags = new Int32Array( vertexCount );
+		this._facesTagFlags = new Int32Array( triangleCount );
+		this._faceBoxes = new Float32Array( triangleCount * 6 );
+		this._faceNormals = new Float32Array( triangleCount * 3 );
+		this._faceCenters = new Float32Array( triangleCount * 3 );
+		this._facePosInLeaf = new Uint32Array( triangleCount );
+		this._faceLeaf = new Array( triangleCount ).fill( null );
+
+		this._mask = new Float32Array( vertexCount );
+		this._origP = new Float32Array( vertexCount * 3 );
+		this._origN = new Float32Array( vertexCount * 3 );
+		this._origStamp = new Int32Array( vertexCount );
+		this._strokeStamp = 0;
+		this._touched = [];
+		this._triRenderMap = triRenderMap ?? null;
+		this._faceMaterial = faceMaterials ?? new Uint16Array( triangleCount );
+
+		this._initTopology();
+		this._updateGeometry();
+
+	}
+
+	getMask() {
+
+		return this._mask;
+
+	}
+	getOrigPositions() {
+
+		return this._origP;
+
+	}
+	getOrigNormals() {
+
+		return this._origN;
+
+	}
+	getTouched() {
+
+		return this._touched;
+
+	}
+	getFaceMaterials() {
+
+		return this._faceMaterial;
+
+	}
+	getTriRenderMap() {
+
+		return this._triRenderMap;
+
+	}
+
+	// HOLOMODEL: start a stroke; nothing is copied yet, the snapshot is taken per vertex on first
+	// touch (Blender saves an undo node the first time a BVH node is touched).
+	beginStrokeSnapshot() {
+
+		this._strokeStamp ++;
+		this._touched = [];
+		return this._strokeStamp;
+
+	}
+
+	// HOLOMODEL: make sure iVert's stroke-start position and normal are stored. Returns true the
+	// first time it is called for that vertex in this stroke.
+	stampOriginal( iVert ) {
+
+		if ( this._origStamp[ iVert ] === this._strokeStamp ) return false;
+
+		this._origStamp[ iVert ] = this._strokeStamp;
+		const i3 = iVert * 3;
+		const v = this._verticesXYZ;
+		const n = this._renderNormalsXYZ;
+		this._origP[ i3 ] = v[ i3 ];
+		this._origP[ i3 + 1 ] = v[ i3 + 1 ];
+		this._origP[ i3 + 2 ] = v[ i3 + 2 ];
+		this._origN[ i3 ] = n[ i3 ];
+		this._origN[ i3 + 1 ] = n[ i3 + 1 ];
+		this._origN[ i3 + 2 ] = n[ i3 + 2 ];
+		this._touched.push( iVert );
+		return true;
+
+	}
+
+	// HOLOMODEL: true when iVert already carries this stroke's original data.
+	hasOriginal( iVert ) {
+
+		return this._origStamp[ iVert ] === this._strokeStamp;
+
+	}
+
+	// HOLOMODEL: public name for the partial rebuild after an edit (face normals and boxes, vertex
+	// normals, octree), so callers outside this file do not have to reach for a private method.
+	refreshGeometry( iFaces, iVerts ) {
+
+		this._updateGeometry( iFaces, iVerts );
 
 	}
 

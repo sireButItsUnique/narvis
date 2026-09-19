@@ -10,7 +10,8 @@
     "handmouse": "py handmouse/handmouse.py",
     "test": "node --test && py -m unittest discover -s handmouse",
     "addon": "node scripts/install-addon.js",
-    "check": "node scripts/check-integrations.js"
+    "check": "node scripts/check-integrations.js",
+    "parity:ref": "blender -b --factory-startup --python scripts/blender-ref.py -- test/fixtures/blender-ref"
   },
   "engines": {
     "node": ">=20.12"

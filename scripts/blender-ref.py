@@ -1,6 +1,6 @@
 # Golden reference dumper: runs REAL Blender Essentials sculpt brushes headless and writes
 # input mesh + per-dab world data + brush settings + output positions, for a JS parity test.
-# Usage: npm run parity:ref   (= blender -b --factory-startup --python scripts/blender-ref.py -- test/fixtures/blender-ref)
+# Usage: blender -b --factory-startup --python blender_ref.py -- <outdir>
 import bpy, sys, json, math, time, os
 from mathutils import Vector, noise
 from bpy_extras import view3d_utils
@@ -72,3 +72,11 @@ for name, brush in CASES:
     except Exception as e: print("FAIL", name, e)
 case("draw_mirror_x", "Draw", x0=-60, n=4, dx=8.0, mirror_x=True)
 case("draw_half_pressure", "Draw", pressure=0.5)
+# The cases above start at x0=-90 px, which is off the sphere: the first dabs miss and the stroke
+# starts right at the silhouette. That is fine for the dab brushes, but it makes Grab anchor its
+# whole deformation on a ray that grazes the surface, where Blender's own two raycasts (the BVH one
+# the sculpt code uses and ob.ray_cast) already disagree by about 4 mm. So we also record pulls and
+# a smooth stroke that start on the face, where the anchor is well conditioned.
+case("grab_pull", "Grab", n=6, x0=0.0, dx=12.0)
+case("grab_pull_short", "Grab", n=2, x0=0.0, dx=12.0)
+case("smooth_short", "Smooth", n=2, x0=0.0, dx=12.0)

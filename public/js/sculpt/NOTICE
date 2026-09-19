@@ -1,0 +1,58 @@
+holosculpt - the sculpting engine of Holomodel
+==============================================
+
+Everything in public/js/sculpt/ except vendor/ is distributed under the
+GNU General Public License version 3 or later (SPDX: GPL-3.0-or-later).
+
+WHY
+---
+The brush behaviour in this directory is a port of Blender's sculpt mode. It was written from the
+mathematics, not transliterated from the C++, but it is still a derivative work of GPL-2.0-or-later
+code, so it is distributed under GPL-3.0-or-later (which that licence allows). Serving this
+JavaScript to a browser counts as distribution, so the source has to stay public.
+
+The numbers themselves (0.25, 1.05, the falloff curves, the Essentials brush defaults) are facts
+about Blender, measured or read off; the expression here is our own.
+
+BLENDER SOURCES PARAPHRASED
+---------------------------
+Blender, GPL-2.0-or-later, Copyright (C) Blender Authors.
+Pinned at commit 235621eec717437a8dfe0a9dfbf78a3f7eb4c32f (blender/blender).
+
+  source/blender/editors/sculpt_paint/paint_stroke.cc
+      -> stroke.js       spacing, the overlap factor, the stabiliser, pressure interpolation,
+                         the first-dab rule
+  source/blender/editors/sculpt_paint/mesh/sculpt.cc
+      -> cache.js        radius, the brush-strength table, area normal and centre, the brush plane
+                         and its stabiliser, the accumulate rule, the hand delta
+      -> factors.js      the per-vertex weight chain (mask, front face, distance, hardness, curve)
+  source/blender/blenkernel/intern/brush.cc
+      -> factors.js      the ten distance falloff presets
+      -> cache.js        which brushes offer Accumulate
+  source/blender/editors/sculpt_paint/mesh/mesh_paint.cc
+      -> symmetry.js     the mirror passes, valid pass combinations, symmetry feather
+  source/blender/editors/sculpt_paint/paint_intern.hh
+      -> symmetry.js     symmetry_flip, is_symmetry_iteration_valid
+  source/blender/editors/sculpt_paint/mesh/brushes/smooth.cc
+  source/blender/editors/sculpt_paint/mesh/brushes/enhance_details.cc
+  source/blender/editors/sculpt_paint/mesh/sculpt_smooth.cc
+      -> smooth.js, brushes/smooth.js   pass splitting, the border and corner rule, Enhance Details
+  source/blender/editors/sculpt_paint/mesh/brushes/draw.cc      -> brushes/draw.js (Draw, Nudge)
+  source/blender/editors/sculpt_paint/mesh/brushes/inflate.cc   -> brushes/inflate.js
+  source/blender/editors/sculpt_paint/mesh/brushes/grab.cc      -> brushes/grab.js
+  source/blender/editors/sculpt_paint/mesh/sculpt_undo.cc       -> undo.js (the first-touch model)
+
+Brush kernels added later (brushes/set-a.js, brushes/set-b.js) name their own sources in their
+file headers; the list above is what exists today.
+
+presets.json is a measurement of Blender 5.2.1's Essentials brush library
+(datafiles/assets/brushes/essentials_brushes-mesh_sculpt.blend), dumped headless.
+scripts/blender-ref.py records golden strokes from the same build for the parity tests.
+
+MIT COMPONENTS (kept under their own licence)
+---------------------------------------------
+  public/js/sculpt/vendor/SculptorMesh.js, SculptorUtils.js
+      three.js r186 examples/jsm/misc/Sculptor*, which is itself adapted from SculptGL by
+      Stephane Ginier. MIT; see vendor/LICENSE-SculptGL.txt. Our fork is marked inline with
+      "HOLOMODEL:" comments and stays MIT.
+  three.js itself (MIT) is a peer dependency, imported as "three".
