@@ -1,0 +1,26 @@
+Holomodel
+Copyright (C) 2026 the Holomodel authors
+
+Holomodel is free software: you can redistribute it and/or modify it under the terms of the GNU General
+Public License as published by the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version. It comes with no warranty. The full licence is in LICENSE.
+
+Third-party code in this repository or served by the app:
+
+- three.js (https://threejs.org), MIT License, Copyright 2010-2024 three.js authors.
+  The page imports three@0.170.0; "npm run vendor" copies it, with its LICENSE, to public/vendor/three.
+
+- Sculptor mesh code in public/js/sculpt/vendor/ (SculptorMesh.js, SculptorUtils.js), from three.js r186
+  examples/jsm/misc, MIT License, three.js authors. It adapts SculptGL by Stéphane Ginier
+  (https://github.com/stephomi/sculptgl), MIT License, Copyright (c) 2019 Stéphane GINIER; that notice is
+  kept in the file headers and in public/js/sculpt/vendor/LICENSE-SculptGL.txt.
+
+- Blender (https://www.blender.org). The sculpt brush, stroke and falloff code in public/js/sculpt/ (outside
+  vendor/) is translated from Blender's source at commit 235621eec717437a8dfe0a9dfbf78a3f7eb4c32f
+  (source/blender/editors/sculpt_paint and related files), which is GPL-2.0-or-later. It is distributed here
+  under GPL-3.0-or-later. public/js/sculpt/presets.json holds brush settings read from Blender 5.2's
+  Essentials brushes.
+
+- MediaPipe Tasks Vision (@mediapipe/tasks-vision 0.10.35) and its face and hand landmarker models,
+  Apache License 2.0, Copyright Google LLC. They are not in this repository: "npm run vendor" copies them
+  to public/vendor, and otherwise the page loads them from jsDelivr and Google.

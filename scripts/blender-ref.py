@@ -1,0 +1,74 @@
+# Golden reference dumper: runs REAL Blender Essentials sculpt brushes headless and writes
+# input mesh + per-dab world data + brush settings + output positions, for a JS parity test.
+# Usage: npm run parity:ref   (= blender -b --factory-startup --python scripts/blender-ref.py -- test/fixtures/blender-ref)
+import bpy, sys, json, math, time, os
+from mathutils import Vector, noise
+from bpy_extras import view3d_utils
+OUT = sys.argv[sys.argv.index('--')+1] if '--' in sys.argv else 'ref'
+os.makedirs(OUT, exist_ok=True)
+FIELDS = ["sculpt_brush_type","strength","curve_distance_falloff_preset","hardness","auto_smooth_factor","normal_radius_factor",
+          "area_radius_factor","spacing","use_space_attenuation","use_accumulate","use_frontface","falloff_shape","sculpt_plane",
+          "use_original_normal","use_original_plane","plane_offset","use_plane_trim","plane_trim","plane_height","plane_depth",
+          "plane_inversion_mode","stabilize_normal","stabilize_plane","tip_roundness","tip_scale_x","crease_pinch_factor",
+          "rake_factor","normal_weight","height","use_persistent","elastic_deform_type","elastic_deform_volume_preservation",
+          "deform_target","use_grab_active_vertex","use_grab_silhouette","snake_hook_deform_type","smooth_deform_type"]
+def mesh_setup():
+    for o in list(bpy.data.objects): bpy.data.objects.remove(o)
+    bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=5, radius=1.0)
+    ob = bpy.context.active_object
+    for v in ob.data.vertices:  # deterministic bumps so smooth/flatten/crease have work to do
+        v.co *= 1.0 + 0.03 * noise.noise(v.co * 4.0)
+    return ob
+def case(name, brush, dx=12.0, n=16, x0=-90.0, y0=0.0, usize=0.6, mirror_x=False, pressure=1.0):
+    ob = mesh_setup()
+    ob.data.use_mirror_x = mirror_x
+    before = [c for v in ob.data.vertices for c in v.co]
+    tris = [i for p in ob.data.polygons for i in p.vertices]
+    win = bpy.context.window_manager.windows[0]
+    area = [a for a in win.screen.areas if a.type=='VIEW_3D'][0]
+    region = [r for r in area.regions if r.type=='WINDOW'][0]
+    rv3d = area.spaces.active.region_3d
+    with bpy.context.temp_override(window=win, area=area, region=region):
+        bpy.ops.ed.undo_push(message='init'); bpy.ops.object.mode_set(mode='SCULPT'); bpy.ops.ed.undo_push(message='s')
+        bpy.ops.brush.asset_activate(asset_library_type='ESSENTIALS', relative_asset_identifier='brushes/essentials_brushes-mesh_sculpt.blend/Brush/'+brush)
+        sc = bpy.context.tool_settings.sculpt; br = sc.brush
+        ups = getattr(sc, 'unified_paint_settings', None)
+        if ups is not None: ups.use_locked_size='SCENE'; ups.unprojected_size=usize
+        br.use_locked_size='SCENE'; br.unprojected_size=usize
+        c = view3d_utils.location_3d_to_region_2d(region, rv3d, Vector((0,0,0)))
+        dabs, stroke, depth = [], [], None
+        for i in range(n):
+            m = (c.x + x0 + i*dx, c.y + y0)
+            o3 = view3d_utils.region_2d_to_origin_3d(region, rv3d, m); d3 = view3d_utils.region_2d_to_vector_3d(region, rv3d, m)
+            ok, hit, nrm, _ = ob.ray_cast(o3, d3)
+            if depth is None and ok: depth = hit.copy()
+            cursor = view3d_utils.region_2d_to_location_3d(region, rv3d, m, depth or Vector())
+            dabs.append({"mouse": list(m), "ray_origin": list(o3), "ray_dir": list(d3), "hit": list(hit) if ok else None,
+                         "cursor_at_start_depth": list(cursor)})
+            stroke.append({"name":"", "location":(0,0,0), "mouse":m, "mouse_event":m, "pressure":pressure, "size":br.size,
+                           "time":i*0.033, "is_start": i==0, "x_tilt":0.0, "y_tilt":0.0})
+        settings = {f: (getattr(br, f) if not hasattr(getattr(br, f, None), '__len__') or isinstance(getattr(br,f),str) else list(getattr(br,f))) for f in FIELDS if hasattr(br, f)}
+        t = time.perf_counter()
+        r = bpy.ops.sculpt.brush_stroke(stroke=stroke, mode='NORMAL', override_location=True)
+        ms = (time.perf_counter()-t)*1000
+        bpy.ops.object.mode_set(mode='OBJECT')
+    after = [c for v in ob.data.vertices for c in v.co]
+    mask = None
+    if '.sculpt_mask' in ob.data.attributes:
+        mask = [a.value for a in ob.data.attributes['.sculpt_mask'].data]
+    disp = [math.dist(before[3*k:3*k+3], after[3*k:3*k+3]) for k in range(len(before)//3)]
+    view_dir = list((rv3d.view_rotation @ Vector((0,0,-1))).normalized())
+    json.dump({"case": name, "brush": brush, "blender": bpy.app.version_string, "radius": usize/2, "pressure": pressure,
+               "mirror_x": mirror_x, "view_dir": view_dir, "view_perspective": rv3d.view_perspective, "settings": settings,
+               "dabs": dabs, "triangles": tris, "before": [round(x,7) for x in before], "after": [round(x,7) for x in after],
+               "mask": mask, "result": str(r), "ms": ms}, open(os.path.join(OUT, name + '.json'), 'w'))
+    print(f"{name:18s} {brush:18s} moved={sum(1 for d in disp if d>1e-7):5d} max={max(disp):.5f} {ms:6.1f} ms {r}")
+CASES = [("draw","Draw"),("draw_sharp","Draw Sharp"),("clay","Clay"),("clay_strips","Clay Strips"),("layer","Layer"),
+         ("inflate","Inflate/Deflate"),("blob","Blob"),("crease_sharp","Crease Sharp"),("smooth","Smooth"),
+         ("flatten","Flatten/Contrast"),("scrape","Scrape/Fill"),("fill","Fill/Deepen"),("pinch","Pinch/Magnify"),
+         ("grab","Grab"),("elastic_grab","Elastic Grab"),("snake_hook","Snake Hook"),("thumb","Thumb"),("nudge","Nudge"),("mask","Mask")]
+for name, brush in CASES:
+    try: case(name, brush)
+    except Exception as e: print("FAIL", name, e)
+case("draw_mirror_x", "Draw", x0=-60, n=4, dx=8.0, mirror_x=True)
+case("draw_half_pressure", "Draw", pressure=0.5)

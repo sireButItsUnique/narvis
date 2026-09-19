@@ -1,5 +1,8 @@
 node_modules/
 .env
 __pycache__/
-handmouse/models/
 blender/test_render_front.png
+.research/
+# filled by npm run vendor and npm run parity:ref
+public/vendor/
+test/fixtures/blender-ref/
