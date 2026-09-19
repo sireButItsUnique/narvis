@@ -183,9 +183,9 @@ test('a third view from the side cuts the error, which is why a spare webcam is 
   assert.ok(three < two * 0.6, `two views ${(two / 300).toFixed(3)} cm, three views ${(three / 300).toFixed(3)} cm`);
 });
 
-// ---- the adapter onto ../track/solve.js, which another agent is building ----
+// ---- the adapter onto ../track/triangulate.js ----
 
-test('the solver adapter falls back to the local midpoint when track/solve.js is missing', async () => {
+test('the solver adapter falls back to the local midpoint when track/ is missing', async () => {
   const info = await loadSolver(async () => { throw new Error('not built yet'); });
   assert.equal(info.external, false);
   assert.equal(info.name, 'local midpoint');
@@ -194,16 +194,22 @@ test('the solver adapter falls back to the local midpoint when track/solve.js is
 });
 
 test('the adapter only takes a solver that gets a known answer right', async () => {
-  setSolver(null, 'local midpoint');
-  const wrong = { triangulate: () => [0, 0, 0] };
+  const wrong = { triangulateRays: () => [0, 0, 0] };
   const { loadSolver: fresh } = await import('../public/js/input/stereo.js?a=1');
   assert.equal((await fresh(async () => wrong)).external, false);
+});
 
-  const right = { triangulateRays: views => { const p = views.map(v => v.origin); return { x: 3, y: 0, z: 30, n: p.length }; } };
+test('the real track/triangulate.js is adopted, and it agrees with the local midpoint', async () => {
   const mod = await import('../public/js/input/stereo.js?a=2');
-  const info = await mod.loadSolver(async () => right);
-  assert.equal(info.external, true);
-  assert.match(info.name, /triangulateRays/);
+  const info = await mod.loadSolver();                       // no importer: the real file
+  assert.equal(info.external, true, info.name);
+  assert.match(info.name, /track\/triangulate\.js/);
+
+  const rays = [{ origin: [0, 0, 0], dir: [3, 0, 30] }, { origin: [12, 0, 0], dir: [-9, 0, 30] }];
+  const a = mod.triangulate(rays), b = mod.triangulateLocal(rays);
+  const gap = Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+  console.log(`      real solver ${a.map(v => v.toFixed(3)).join(', ')} cm, local midpoint differs by ${(gap * 10).toFixed(4)} mm`);
+  assert.ok(gap < 1e-6, `the two estimators must be the same maths, differ by ${gap}`);
 });
 
 test('an injected solver is used, and a throwing one does not take the app down', () => {

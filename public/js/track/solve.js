@@ -425,13 +425,19 @@ export class Tracker {
     };
     if (this.eye && input.eye) { const e = toApp(this.eye); input.eye.set(e[0], e[1], e[2]); }
     if (this.eyeSeenAtMs > -1e8) input.faceSeenAt = this.eyeSeenAtMs;
-    input.mode = this.quality.cameras > 1 ? 'cameras' : this.quality.handSource === 'bridge' ? 'bridge' : 'camera';
+    // input.mode is a two-valued contract the whole app reads ('camera' or 'mouse' — main.js and
+    // interaction.js branch on it), so it must stay that. How many cameras and which source won is in
+    // quality/readout, which is where a debug overlay should look.
+    input.mode = this.quality.cameras || this.quality.handSource === 'bridge' ? 'camera' : input.mode;
     this.slots.forEach((s, i) => {
       const h = input.hands && input.hands[i];
       if (!h) return;
       h.active = nowMs - s.seenAtMs < this.maxAgeMs && !!s.points;
       h.pinch = s.pinch;
       h.pinchRatio = s.pinchRatio;
+      // The metric thumb-index gap in app units. Grab logic should prefer this over pinchRatio now that it
+      // is a real measured distance and not a proportion of a guessed palm.
+      h.pinchCm = Number.isFinite(s.pinchDistMm) ? s.pinchDistMm * k * (T?.scale ?? 1) : null;
       h.seenAt = s.seenAtMs;
       if (s.tip && h.tip) { const p = toApp(s.tip); h.tip.set(p[0], p[1], p[2]); }
       if (s.grip && h.grip) { const p = toApp(s.grip); h.grip.set(p[0], p[1], p[2]); }

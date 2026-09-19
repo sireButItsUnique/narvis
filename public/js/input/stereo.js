@@ -100,19 +100,30 @@ export function rayFromPixel(px, py, k) {
   return norm([x, y, 1]);
 }
 
-// Small-angle rotation of the right eye into the left eye's frame (rx, ry=CV, rz, radians).
-export function rotateVec(v, [rx, ry, rz]) {
+// Rz * Ry * Rx as a flat row-major 3x3. One function so the ray path and the PinholeCamera path
+// (input/solver.js) cannot end up with different ideas of where a camera is pointing.
+export function rotMatrix([rx, ry, rz]) {
   const cx = Math.cos(rx), sx = Math.sin(rx), cy = Math.cos(ry), sy = Math.sin(ry), cz = Math.cos(rz), sz = Math.sin(rz);
-  // Rz * Ry * Rx
-  const m = [
-    [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
-    [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
-    [-sy, cy * sx, cy * cx],
-  ];
-  return [m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-          m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-          m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2]];
+  return [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx,
+          sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx,
+          -sy, cy * sx, cy * cx];
 }
+
+export function matMul3(a, b) {
+  const m = new Array(9);
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+    m[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+  return m;
+}
+
+export const transpose3 = m => [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]];
+
+export const matVec3 = (m, v) => [m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+                                  m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+                                  m[6] * v[0] + m[7] * v[1] + m[8] * v[2]];
+
+// Small-angle rotation of the right eye into the left eye's frame (rx, ry=CV, rz, radians).
+export function rotateVec(v, rot) { return matVec3(rotMatrix(rot), v); }
 
 // The two views of one landmark, as rays in the LEFT camera's frame (the reference frame of a ZED).
 export function stereoViews(uvLeft, uvRight, calib, weightL = 1, weightR = 1) {
@@ -169,9 +180,14 @@ export function residualCm(point, views) {
   return worst;
 }
 
-// ---------- thin adapter onto ../track/solve.js ----------
-// Another agent owns the solver; we do not know its export names yet, so try the plausible ones, check the
-// candidate against a known answer, and keep the local midpoint if it is missing or disagrees.
+// ---------- adapter onto ../track/triangulate.js ----------
+//
+// This is the RAY-level seam. The real pipeline (input/solver.js -> track/solve.js Tracker) works from
+// posed PinholeCameras and pixels and never comes through here; what is left needing a ray API is the
+// no-Tracker fallback and the setup page's per-view arithmetic. Rather than keep a second implementation
+// of the same normal equations, wrap each ray in the smallest thing triangulateRays() actually asks of a
+// camera — a .ray() — so both paths run the SAME estimator. The local midpoint stays as the answer when
+// track/ is absent, and the known-answer check still gates whatever is adopted.
 
 let solverFn = null, solverName = 'local midpoint', tried = false;
 
@@ -183,19 +199,29 @@ const CHECK = [ // two rays that meet at (3, 0, 30) cm
   { origin: [12, 0, 0], dir: norm([-9, 0, 30]) },
 ];
 
-export async function loadSolver(importer = () => import('../track/solve.js')) {
+// A ray dressed as the camera triangulateRays() wants. It only ever calls camera.ray(u, v), so this is the
+// whole contract; anything that needs project() or RT belongs on the PinholeCamera path instead.
+const rayCamera = v => {
+  const o = v.origin || [0, 0, 0], d = norm(v.dir);
+  return { id: v.label || 'ray', noisePx: 1, ray: () => ({ o, d }) };
+};
+const asViews = views => views.map(v => ({ camera: rayCamera(v), u: 0, v: 0, weight: v.weight ?? 1 }));
+
+export async function loadSolver(importer = () => import('../track/triangulate.js')) {
   if (tried) return solverInfo();
   tried = true;
   try {
     const mod = await importer();
-    const names = ['triangulate', 'triangulateViews', 'triangulateRays', 'triangulateDLT', 'solveTriangulation'];
-    for (const n of names) {
-      const fn = mod?.[n];
-      if (typeof fn !== 'function') continue;
-      const p = toXyz(fn(CHECK.map(v => ({ ...v, o: v.origin, d: v.dir, weight: 1 }))));
-      if (p && Math.hypot(p[0] - 3, p[1], p[2] - 30) < 0.05) { solverFn = v => toXyz(fn(v)); solverName = `track/solve.js ${n}`; break; }
+    const fn = mod?.triangulateRays;
+    if (typeof fn === 'function') {
+      const p = toXyz(fn(asViews(CHECK)));
+      // Never adopt a solver on the strength of its name: it has to get a known answer right first.
+      if (p && Math.hypot(p[0] - 3, p[1], p[2] - 30) < 0.05) {
+        solverFn = v => toXyz(fn(asViews(v)));
+        solverName = 'track/triangulate.js triangulateRays';
+      }
     }
-  } catch { /* solver not landed yet: the local midpoint is a correct, if plainer, answer */ }
+  } catch { /* track/ missing: the local midpoint is a correct, if plainer, answer */ }
   return solverInfo();
 }
 
@@ -233,12 +259,26 @@ export function camDirToWorld(d, ext = FACING_USER) {
   return rotateVec(d, (ext.rotDeg || [0, 0, 0]).map(a => a * Math.PI / 180));
 }
 
+// Where one eye sits and which way it looks, in the app's world frame (cm).
+//
+//   R_camToWorld = R(ext.rotDeg) * R(extraRot)
+//
+// and a calibration file's convention is the other way round, so `R` here is WORLD -> CAMERA, which is what
+// track/camera.js PinholeCamera wants. Deriving it from the same ext/offsetCam/extraRot the ray path uses
+// is the point: one description of the rig, two consumers.
+export function cameraPose({ ext = FACING_USER, offsetCam = [0, 0, 0], extraRot = [0, 0, 0] } = {}) {
+  const Rext = rotMatrix((ext.rotDeg || [0, 0, 0]).map(a => a * Math.PI / 180));
+  const R = matMul3(Rext, rotMatrix(extraRot));
+  return { positionCm: camToWorld(offsetCam, ext), R: transpose3(R), RCamToWorld: R };
+}
+
 // One camera (or one eye of a ZED) as the triangulator sees it: normalised image point -> a world-space ray.
 // offsetCam/extraRot place this eye inside its camera rig (the right eye of a ZED sits one baseline over).
 export function makeView({ intr, eyeW, eyeH, ext = FACING_USER, offsetCam = [0, 0, 0], extraRot = [0, 0, 0], label = '' }) {
   const origin = camToWorld(offsetCam, ext);
+  const pose = cameraPose({ ext, offsetCam, extraRot });
   return {
-    label, intr, eyeW, eyeH, ext, origin,
+    label, intr, eyeW, eyeH, ext, origin, pose, offsetCam, extraRot,
     // normalised image point -> world ray
     ray(u, v, weight = 1) {
       const d = rayFromPixel(u * eyeW, v * eyeH, intr);

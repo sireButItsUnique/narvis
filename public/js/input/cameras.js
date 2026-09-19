@@ -12,6 +12,7 @@ import { S, makeFilter3 } from '../settings.js';
 import * as devices from './devices.js';
 import * as stereo from './stereo.js';
 import { ZedClient } from './zed-client.js';
+import { createSolver, camIdFor } from './solver.js';
 
 // ---------------------------------------------------------------- pure helpers
 
@@ -159,8 +160,15 @@ export const cams = {
   eyeSource: 'none',            // 'stereo' | 'mono' | 'legacy' | 'none'
   notes: [],
   solver: 'local midpoint',
+  fusion: 'tracker',            // 'tracker' (track/solve.js) | 'local' (the midpoint fallback below)
   running: false,
 };
+
+// The real solver. Built on start(); everything the cameras see goes through it, and it is the only thing
+// that writes the hands and the eye into input/state.js. The `local` helpers below stay reachable through
+// opts.fusion = 'local' as the honest fallback for a page that cannot load track/ at all.
+let solver = null;
+export const getSolver = () => solver;
 
 const eyeFilt = makeFilter3(0.6, 0.2);                     // steadier than the fingertip: the head moves slowly
 const tipFilt = [makeFilter3(1.2, 0.4), makeFilter3(1.2, 0.4)];
@@ -264,6 +272,7 @@ async function openSource(dev, opts) {
   };
   src.workers = views.map((v, i) => makeWorker(`${src.prefKey}#${i}`, src.tasks, opts, m => onWorkerMessage(src, i, m)));
   track.addEventListener('ended', () => dropSource(src.deviceId, 'the camera was unplugged'));
+  solver?.addSource(src);
   startGrabLoop(src);
   cams.sources.push(src);
   note(`${src.label}: ${width}x${height}${sbs ? ' side-by-side (2 views)' : ''}, role ${src.role}`);
@@ -332,7 +341,13 @@ function onWorkerMessage(src, i, m) {
   while (ring.length > 6) ring.shift();
   if (m.face) src.lastFaceAt = now;
   if (m.hands?.length) src.lastHandAt = now;
-  fuse(now);
+  // Hand it straight to the solver with the CAPTURE time. Solving happens once per rendered frame in
+  // startLoop(), not here: a ZED's two eyes arrive as two messages and solving on each of them would
+  // triangulate a one-eyed frame and then immediately redo it.
+  if (solver) {
+    solver.setRate(camIdFor(src, i), src.gate[i].fps);
+    solver.observeView(src, i, { at: m.at, face: m.face, hands: m.hands || [] });
+  } else fuse(now);
 }
 
 // ---------------------------------------------------------------- fusion
@@ -463,7 +478,18 @@ export async function startCameras(opts = {}) {
   if (cams.running) stopCameras();   // restart cleanly rather than opening a second copy of everything
   cams.opts = opts;
   cams.running = true;
-  cams.solver = (await stereo.loadSolver()).name;
+  cams.fusion = opts.fusion === 'local' ? 'local' : 'tracker';
+  solver = null;
+  if (cams.fusion === 'tracker') {
+    try {
+      solver = createSolver({ eye: S.eye, ipdMm: S.ipdMm });
+      cams.solver = 'track/solve.js Tracker';
+    } catch (e) {
+      note(`the tracking solver would not load (${e?.message || e}); using the local midpoint fusion`);
+      cams.fusion = 'local';
+    }
+  }
+  if (!solver) cams.solver = (await stereo.loadSolver()).name;
   status('Looking for cameras…');
 
   let list = await devices.listCameras();
@@ -523,7 +549,11 @@ export function setBridge(url, ext) {
 function connectBridge(url, ext) {
   cams.bridge = new ZedClient({
     url, ext,
-    onHands: p => { cams.bridgeHands = p; fuseHands(performance.now()); },
+    onHands: p => {
+      cams.bridgeHands = p;
+      if (solver) solver.observeBridge(p);        // solved with everything else, in startLoop
+      else fuseHands(performance.now());
+    },
     onStatus: s => { if (s.state === 'retrying') note(`bridge ${s.state}: ${s.error}`); },
   });
   cams.bridge.connect(url);
@@ -535,6 +565,7 @@ export function dropSource(deviceId, why = 'stopped') {
   const src = cams.sources.find(s => s.deviceId === deviceId);
   if (!src) return false;
   src.stopped = true; src.live = false; src.error = why;
+  solver?.removeSource(src);     // the Tracker must stop believing a camera that is gone, not just age it out
   try { src.workers.forEach(w => w.postMessage({ t: 'stop' })); } catch {}
   try { src.stream.getTracks().forEach(t => t.stop()); } catch {}
   try { src.video.remove(); } catch {}
@@ -572,10 +603,29 @@ function startLoop() {
   const step = now => {
     rafId = requestAnimationFrame(step);
     if (cams.legacy) { try { cams.legacy.track(now); } catch (e) { cams.notes.push(String(e?.message || e)); } return; }
+    if (solver) {
+      // One solve per rendered frame. Every camera's newest landmarks are lined up to a common instant
+      // inside the Tracker, so this is where the 3D actually happens.
+      solver.step(input, now, { hands: S.hands !== false, eyeYNudgeCm: S.eyeYNudgeCm || 0 });
+      const q = solver.quality;
+      cams.handSource = q.handsSeen ? q.handSource : 'none';
+      cams.eyeSource = q.eyeViews ? q.eyeSource : 'none';
+      return;
+    }
     for (const h of input.hands) h.active = S.hands !== false && now - h.seenAt < 300;
     if (cams.bridge && cams.bridgeHands && now - cams.bridgeHands.at > 400 && cams.handSource === 'bridge') cams.handSource = 'none';
   };
   rafId = requestAnimationFrame(step);
+}
+
+// For tests and for pages with no animation frames: do one solve now, exactly as the loop would.
+export function stepSolver(now = (typeof performance !== 'undefined' ? performance.now() : Date.now())) {
+  if (!solver) return null;
+  const out = solver.step(input, now, { hands: S.hands !== false, eyeYNudgeCm: S.eyeYNudgeCm || 0 });
+  const q = solver.quality;
+  cams.handSource = q.handsSeen ? q.handSource : 'none';
+  cams.eyeSource = q.eyeViews ? q.eyeSource : 'none';
+  return out;
 }
 
 export function stopCameras() {
@@ -586,6 +636,7 @@ export function stopCameras() {
   for (const src of [...cams.sources]) dropSource(src.deviceId, 'stopped');
   cams.bridge?.close();
   cams.bridge = null; cams.bridgeHands = null; cams.legacy = null;
+  solver = null;
   cams.mode = 'none'; cams.handSource = 'none'; cams.eyeSource = 'none';
 }
 
@@ -594,7 +645,9 @@ export function camerasStatus() {
   const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
   return {
     mode: cams.mode, handSource: cams.handSource, eyeSource: cams.eyeSource, solver: cams.solver,
-    inputMode: input.mode, notes: [...cams.notes],
+    fusion: cams.fusion, inputMode: input.mode, notes: [...cams.notes],
+    // what the solver itself thinks it is doing, which is the first thing to read when a number looks wrong
+    tracking: solver ? { readout: solver.readout, ...solver.quality } : null,
     sources: cams.sources.map(s => ({
       label: s.label, deviceId: s.deviceId, kind: s.cls.kind, model: s.cls.model, why: s.cls.why,
       role: s.role, width: s.width, height: s.height, sbs: s.sbs, mode: s.layout.mode,

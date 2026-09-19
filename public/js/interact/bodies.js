@@ -108,18 +108,6 @@ export function bindBodies(entries, shared = {}) {
   };
 }
 
-// Hands from the shared input object (public/js/input/state.js) in whatever units it uses.
-// state.js is in centimetres today and metres later; `unitsPerMetre` says which, and grab's config must match.
-export function handsFromInput(input, now, { unitsPerMetre = 1 } = {}) {
-  const out = [];
-  input.hands.forEach((h, id) => {
-    if (!h.active) return;
-    const joints = h.jointsWorld;
-    const at = i => ({ x: joints[i * 3] / unitsPerMetre, y: joints[i * 3 + 1] / unitsPerMetre, z: joints[i * 3 + 2] / unitsPerMetre });
-    // landmark 4 is the thumb tip and 8 the index tip: the pinch pair MediaPipe gives and the ZED body
-    // formats do not (see docs/v3-plan.json research notes)
-    if (joints && joints.length >= 27) out.push({ id, active: true, seenAt: h.seenAt, thumb: at(4), index: at(8) });
-    else out.push({ id, active: true, seenAt: h.seenAt, grip: { x: h.gripRaw.x / unitsPerMetre, y: h.gripRaw.y / unitsPerMetre, z: h.gripRaw.z / unitsPerMetre }, pinch: h.pinch });
-  });
-  return out;
-}
+// handsFromInput lives in wire.js, which imports no three.js, so a page (or a test) can read the solver's
+// hands without pulling the renderer in. Re-exported here because this is where callers look for it.
+export { handsFromInput } from './wire.js';
