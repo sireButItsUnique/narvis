@@ -240,6 +240,21 @@ function config(res) {
   });
 }
 
+// test/fixtures holds the models the tests use, including Fable's teapot, and the rig pages want to put a
+// real model in the volume without a Blender run or a 600 KB copy under public/. GLB only, read only.
+function serveFixture(req, pathname, res) {
+  const name = pathname.slice('/fixtures/'.length);
+  if (!/^[\w.-]+\.glb$/.test(name) || name.includes('..'))
+    return sendJson(res, 404, { error: 'not_found' });
+  const f = path.join(here, 'test', 'fixtures', name);
+  fs.stat(f, (err, st) => {
+    if (err || !st.isFile()) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('not found'); }
+    res.writeHead(200, { 'Content-Type': TYPES['.glb'], 'Content-Length': st.size, 'Cache-Control': 'no-cache' });
+    if (req.method === 'HEAD') return res.end();
+    fs.createReadStream(f).pipe(res);
+  });
+}
+
 function serveStatic(req, pathname, res) {
   let p;
   try { p = decodeURIComponent(pathname); } catch { p = ''; }
@@ -277,6 +292,7 @@ http.createServer((req, res) => {
   if (pathname.startsWith('/api/voice/')) return voiceRoute(req, res, pathname);
   if (pathname === '/api/config') return config(res);
   if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method_not_allowed' });
+  if (pathname.startsWith('/fixtures/')) return serveFixture(req, pathname, res);
   serveStatic(req, pathname, res);
 }).listen(PORT, '127.0.0.1', () => {
   console.log(`serving on http://localhost:${PORT}  (open it in Edge for voice)`);
