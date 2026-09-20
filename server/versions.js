@@ -37,7 +37,10 @@ export function saveVersion(meta) {
         const r = await bridge('export_glb', { path: glbTmp, mode: 'final' }, { timeout: 120000 });
         if (r.ok && !r.empty) glb = glbTmp;
       }
-      const shot = await bridge('render', { views: ['three_quarter'], size: 256 }, { timeout: 60000 }).catch(() => null);
+      // 128, not 256: the strip draws these 58 px wide, so 256 was four times the pixels nobody
+      // sees and about 50 kB each. Measured on an 18-version history that was 700 kB of the page's
+      // first load. 128 covers a 58 px slot on a 2x screen exactly.
+      const shot = await bridge('render', { views: ['three_quarter'], size: 128 }, { timeout: 60000 }).catch(() => null);
       const thumb = shot?.ok ? Buffer.from(shot.images[0].png, 'base64') : null;   // an empty scene has none
       const v = await store.add({ kind: 'build', ...meta, parent: parent?.n ?? null, objects: snap.objects,
                                   bytes: snap.bytes, fingerprint: snap.fingerprint, store: store.kind },

@@ -14,15 +14,29 @@
 // from Blender replaces Part objects, so a handle whose part is no longer in the registry is
 // detached rather than left holding a mesh nobody can see.
 
-import { createSculptEngine } from './sculpt/index.js';
-import { loadPresets } from './sculpt/presets.js';
-import { getBrushForPreset } from './sculpt/brushes/registry.js';
 import { parts, model, beginStroke as modelBeginStroke, endStroke as modelEndStroke } from './model.js';
 import * as edits from './edits.js';
 
 const CM_PER_M = 100;
 
-export const engine = createSculptEngine({ worldUnitsPerMetre: CM_PER_M });
+// The engine arrives on demand, not with the page.
+//
+// js/sculpt/ is 34 modules and 282 kB - a third of every request the page makes at startup - for
+// something nobody uses until they press 3 or 4. It is fetched when the app starts rather than when
+// the page parses, which is a click and then a model build ahead of the first brush stroke, so in
+// practice it is always there by the time a hand reaches for it.
+//
+// `engine` is exported as a live binding: importers see it appear. Everything below tolerates it
+// being null, because a page that throws while the brushes are still on the wire is worse than one
+// that says "one moment".
+export let engine = null;
+let sculptLib = null;         // {createSculptEngine, loadPresets, getBrushForPreset}
+export const engineReady = () => !!engine;
+const getBrushForPreset = (name) => sculptLib?.getBrushForPreset(name);
+
+// What was asked for before the engine existed, replayed onto it when it arrives. Without this, a
+// tool chosen during the load is a tool the engine never hears about.
+const desired = { mode: null, radiusCm: null, mirror: null };
 
 // What the two brush tools brush with. 'extrude' is a pick - the word people use for building a form
 // up out of a surface, and Clay Strips is the brush that does it - while 'smooth' is always Smooth,
@@ -34,17 +48,43 @@ export const engine = createSculptEngine({ worldUnitsPerMetre: CM_PER_M });
 const DEFAULT_EXTRUDE_PRESET = 'Grab';
 export const brushes = { extrude: DEFAULT_EXTRUDE_PRESET, smooth: 'Smooth' };
 
-let presetsPromise = null;
+let readyPromise = null;
 let presetsReady = false;
-/** Load presets.json once. Everything below works without it (the engine has a fallback), but the
- *  brush is only Blender's brush once the measured settings are in. */
+/**
+ * Fetch the brush engine and Blender's measured brush settings, once.
+ *
+ * Called when the app starts, not when the page loads, and never awaited by anything on the frame
+ * path: a slow fetch delays nothing and a failed one breaks nothing but sculpting, which says so.
+ */
 export function ready() {
-  if (!presetsPromise) {
-    presetsPromise = loadPresets()
-      .then(() => { presetsReady = true; setPreset(brushes.extrude); return true; })
-      .catch((e) => { console.warn('sculpt presets did not load; using fallback settings', e); return false; });
+  if (!readyPromise) {
+    readyPromise = Promise.all([
+      import('./sculpt/index.js'),
+      import('./sculpt/presets.js'),
+      import('./sculpt/brushes/registry.js'),
+    ]).then(async ([index, presets, registry]) => {
+      sculptLib = { createSculptEngine: index.createSculptEngine, loadPresets: presets.loadPresets,
+                    getBrushForPreset: registry.getBrushForPreset };
+      engine = sculptLib.createSculptEngine({ worldUnitsPerMetre: CM_PER_M });
+      // Whatever was chosen while this was in flight, applied now that there is something to tell.
+      if (desired.mode) mode = desired.mode;
+      applyBrush();
+      if (desired.radiusCm !== null) engine.setRadiusWorld(desired.radiusCm);
+      if (desired.mirror !== null) engine.setSymmetry(desired.mirror ? { x: true } : {});
+      try {
+        await sculptLib.loadPresets();
+        presetsReady = true;
+        applyBrush();          // the measured settings replace the engine's fallback ones
+      } catch (e) {
+        console.warn('sculpt presets did not load; using fallback settings', e);
+      }
+      return true;
+    }).catch((e) => {
+      console.warn('the sculpt engine did not load', e);
+      return false;
+    });
   }
-  return presetsPromise;
+  return readyPromise;
 }
 export const presetsLoaded = () => presetsReady;
 
@@ -52,7 +92,7 @@ export const presetsLoaded = () => presetsReady;
 
 /** Weld one Part into a sculpt proxy, once. Returns the handle, or null if it cannot be bound. */
 export function bind(part) {
-  if (!part || !part.mesh) return null;
+  if (!engine || !part || !part.mesh) return null;
   if (part.proxy && part.binding) return part.handle || null;
   try {
     const handle = engine.attach(part.mesh, { id: part.id });
@@ -67,11 +107,18 @@ export function bind(part) {
   }
 }
 
-/** Bind whatever is on screen and drop handles for parts that went away with a new rev.
- *  Called when a scene loads rather than at the first pinch: welding a 200k-triangle part takes
- *  long enough to be felt as a stutter, and the brush ring needs the proxies before anyone pinches
- *  anything (engine.hover only sees attached parts). */
-export function syncParts() {
+/**
+ * Throw away proxies for parts that are gone, and rebind any whose mesh was swapped under them.
+ *
+ * What it deliberately does NOT do is weld everything up front. It used to: every scene load paid
+ * for every part, measured at 301 ms for a 25-part, 230k-triangle scene - a third of a second of
+ * frozen page, on a scene where you will touch two parts with a brush and never the other
+ * twenty-three. Welding happens in bind(), when something actually needs that part's proxy.
+ *
+ * @param {boolean} [weldAll] weld everything now anyway - for the tests and the perf harness
+ */
+export function syncParts(weldAll = false) {
+  if (!engine) return 0;
   const live = new Set();
   for (const part of parts.list()) {
     live.add(part.id);
@@ -81,7 +128,7 @@ export function syncParts() {
       part.handle.detach();
       part.handle = part.proxy = part.binding = null;
     }
-    if (!part.handle) bind(part);
+    if (weldAll && !part.handle) bind(part);
   }
   for (const handle of [...engine.parts.values()]) if (!live.has(handle.id)) handle.detach();
   return engine.parts.size;
@@ -103,10 +150,22 @@ export function syncParts() {
  */
 export async function restore(rev) {
   edits.forRev(rev);
-  syncParts();
+  // Ask the database FIRST, and only then the engine. A scene loads before anybody clicks Start, so
+  // waiting for the brushes here was enough to put all 34 of their modules back on the page's
+  // critical path - for a scene that, nine times out of ten, has never been sculpted at all. One
+  // cheap GET that usually answers "nothing" decides whether any of that is worth fetching.
   const records = await edits.loadStrokes(rev);
+  if (!records.length) return { applied: 0, failed: 0 };
+  // There IS sculpting to put back, and it is the only copy, so now it waits.
+  await ready();
+  if (!engine) return { applied: 0, failed: records.length };
+  syncParts();
   let applied = 0, failed = 0;
   for (const rec of records) {
+    // Weld the parts that were sculpted, and only those: on a 25-part scene where two were
+    // touched, that is two welds rather than twenty-five.
+    const part = parts.get(rec.part);
+    if (part && !part.handle) bind(part);
     const handle = engine.part(rec.part);
     if (!handle) { failed++; continue; }   // that part is not on screen any more
     try {
@@ -131,7 +190,7 @@ export const streamState = () => edits.editsState();
 
 export function setPreset(name) {
   const kernel = getBrushForPreset(name);
-  if (!kernel) return null;
+  if (!kernel) return null;   // also the case before the engine is here: the caller keeps its word
   brushes.extrude = name;
   if (mode !== 'smooth') applyBrush();
   return name;
@@ -140,6 +199,7 @@ export function setPreset(name) {
 let mode = 'extrude';
 function applyBrush() {
   const name = mode === 'smooth' ? brushes.smooth : brushes.extrude;
+  if (!engine) return name;
   const kernel = getBrushForPreset(name);
   engine.setBrush(kernel ? kernel.key : 'draw');
   return name;
@@ -149,16 +209,18 @@ function applyBrush() {
 export function setMode(next) {
   if (next !== 'extrude' && next !== 'smooth') return mode;
   mode = next;
+  desired.mode = next;      // remembered in case the engine is still on the wire
+  ready();                  // and asked for, if nobody has yet
   applyBrush();
   return mode;
 }
 
 /** tool.brush is a radius in centimetres, which is what the world is measured in here. */
-export const setRadiusCm = (cm) => engine.setRadiusWorld(cm);
-export const radiusCm = () => engine.getRadiusWorld();
+export const setRadiusCm = (cm) => { desired.radiusCm = cm; return engine ? engine.setRadiusWorld(cm) : cm; };
+export const radiusCm = () => (engine ? engine.getRadiusWorld() : (desired.radiusCm ?? 4));
 /** Mirror across the model's own middle. Blender's X is the model's left-right, which after the
  *  glTF frame is three's X as well, so the mirror the user asks for is the engine's x. */
-export const setMirror = (on) => engine.setSymmetry(on ? { x: true } : {});
+export const setMirror = (on) => { desired.mirror = !!on; return engine ? engine.setSymmetry(on ? { x: true } : {}) : 0; };
 
 // ---------------------------------------------------------------- strokes
 
@@ -179,8 +241,13 @@ const xyz = (v) => (v ? [v.x, v.y, v.z] : null);
  * @returns {boolean} whether a stroke started (false = the ray missed every bound part)
  */
 export function begin(origin, direction, o = {}) {
+  if (!engine) { ready(); return false; }   // still loading: the caller says so rather than throwing
   syncParts();
   const part = o.part || null;
+  // Weld THIS part, now, if it has not been welded before: about 12 ms for a normal part, paid on
+  // the pinch that needs it instead of on every scene load for every part. Without a named part
+  // there is nothing to weld on demand, so the engine can only pick from what is already bound.
+  if (part && !part.handle) bind(part);
   const worldRay = rayOf(origin, direction);
   // Without a part the engine picks by raycast; with one, the stroke is locked to it (Blender's
   // active object), which is what a pinch on a hovered part means.
@@ -281,7 +348,7 @@ function markDirty() {
 // What lives here instead is the one thing handviz cannot know - whether the ray is over a part
 // the ENGINE has bound, which is what decides if a pinch will sculpt or do nothing at all.
 export function overPart(origin, direction) {
-  if (!model.group) return null;
+  if (!engine || !model.group) return null;
   try {
     const hit = engine.hover(rayOf(origin, direction));
     return hit && hit.hit ? hit : null;

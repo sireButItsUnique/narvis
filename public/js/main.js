@@ -632,7 +632,7 @@ window.htw = {
   // Put a .glb on screen without Blender: the fixture the tests use, or anything else being tried.
   load: async (url = '/fixtures/teapot.glb') => {
     showScene({ ...(await fetchScene(url)), rev: -1 });
-    sculpt.syncParts();
+    sculpt.syncParts(true);   // the test hook welds eagerly: a test should not wait for a pinch
     return parts.stats();
   },
   reload: () => refreshScene(),

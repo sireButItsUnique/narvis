@@ -106,7 +106,9 @@ function startAction(p, target, now) {
     // a point that starts off the model anchors the pull to thin air, so the surface hit is what
     // goes in: the hand's travel from there is still the hand's travel.
     if (!sculpt.begin(input.eye, p.dir, { part, point3D: target.point, timeMs: now })) {
-      notify(part?.bindError ? `That part cannot be sculpted: ${part.bindError}` : 'Point at the model, then pinch to sculpt');
+      notify(!sculpt.engineReady() ? 'One moment - the brushes are still loading'
+        : part?.bindError ? `That part cannot be sculpted: ${part.bindError}`
+        : 'Point at the model, then pinch to sculpt');
       return false;
     }
     action = { ...base, kind: 'stroke', mesh: target.mesh, mode: tool.mode, grip0: p.grip?.clone() || null,
