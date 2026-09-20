@@ -234,7 +234,7 @@ def draw_banner(img, ev, age: float) -> None:
         return
     if ev.kind == "SWIPE":
         txt = (f"SWIPE {ev.direction}  {ev.hand}  {ev.distance * 100:.0f} cm  "
-               f"{ev.peak_speed:.2f} m/s")
+               f"{ev.peak_speed:.2f} m/s" + ("  [bridged]" if ev.bridged else ""))
     elif ev.kind.startswith("PINCH"):
         txt = f"{ev.kind}  {ev.hand}  {ev.gap_mm:.0f} mm  in {ev.duration * 1000:.0f} ms"
     else:
@@ -259,7 +259,10 @@ def build_parser() -> argparse.ArgumentParser:
     cam.add_argument("--fps", type=int, default=60)
     cam.add_argument("--depth-mode", default="NEURAL_LIGHT",
                      choices=["PERFORMANCE", "QUALITY", "ULTRA", "NEURAL_LIGHT", "NEURAL"])
-    cam.add_argument("--hands", type=int, default=2)
+    cam.add_argument("--hands", type=int, default=1,
+                     help="one hand is markedly more reliable: the landmarker "
+                          "stops inventing a marginal second hand, and the "
+                          "handedness label cannot collide")
     cam.add_argument("--confidence", type=int, default=100,
                      help="ZED depth confidence; LOWER discards more depth. "
                           "Measured on this rig: 50 keeps 23%% of pixels, "
@@ -304,6 +307,14 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--no-flip-handedness", action="store_true",
                    help="MediaPipe labels hands assuming a mirrored selfie view; "
                         "the ZED is world-facing, so labels are flipped by default")
+    o.add_argument("--lost-after", type=float, default=0.50,
+                   help="seconds before reporting HAND_LOST; below the swipe "
+                        "gap-bridge limit this reports dropouts as lost hands")
+    o.add_argument("--detection-confidence", type=float, default=0.5)
+    o.add_argument("--tracking-confidence", type=float, default=0.3,
+                   help="deliberately low: a hand moving fast enough to swipe "
+                        "motion-blurs, and a strict threshold drops the track "
+                        "exactly mid-gesture")
     o.add_argument("--debug-swipe", action="store_true",
                    help="print why each frame did not produce a swipe, plus "
                         "palm-depth dropout rate")
@@ -353,13 +364,14 @@ def main() -> int:
             base_options=mp_python.BaseOptions(model_asset_path=args.model),
             running_mode=vision.RunningMode.VIDEO,
             num_hands=args.hands,
-            min_hand_detection_confidence=0.6,
-            min_hand_presence_confidence=0.6,
-            min_tracking_confidence=0.6,
+            min_hand_detection_confidence=args.detection_confidence,
+            min_hand_presence_confidence=args.tracking_confidence,
+            min_tracking_confidence=args.tracking_confidence,
         )
     )
 
     registry = HandRegistry(
+        lost_after=args.lost_after,
         close=args.close, open_=args.open_,
         max_transition=args.max_transition, pinch_refractory=args.pinch_refractory,
         swipe_window=args.swipe_window, min_speed=args.min_speed,
@@ -380,9 +392,10 @@ def main() -> int:
         if args.json:
             print(json.dumps(ev.to_dict()), flush=True)
         elif ev.kind == "SWIPE":
+            how = "  (bridged a dropout)" if ev.bridged else ""
             print(f"[{ev.t:7.2f}] SWIPE {ev.direction:<7} {ev.hand:<5} "
                   f"{ev.distance * 100:5.1f} cm  {ev.peak_speed:4.2f} m/s  "
-                  f"straight {ev.straightness:.2f}", flush=True)
+                  f"straight {ev.straightness:.2f}{how}", flush=True)
         elif ev.kind.startswith("PINCH"):
             pos = "" if ev.position is None else (
                 f"  at ({ev.position[0]:+.2f}, {ev.position[1]:+.2f}, {ev.position[2]:+.2f}) m")

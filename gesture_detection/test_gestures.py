@@ -192,6 +192,68 @@ def test_swipe_fires_once_not_per_frame():
     assert len(swipes(feed(tr, path))) == 1
 
 
+def dropout(tr, before, after, hold, gap, gap_gap=0.0, tail=0.5, g=0.9):
+    """Feed `hold` seconds at `before`, vanish for `gap`, reappear at `after`."""
+    events = feed(tr, stationary(before, hold), gap=g)
+    t_resume = hold + gap
+    events += feed(tr, stationary(after, tail), gap=g, t0=t_resume)
+    return events
+
+
+def test_swipe_survives_a_tracking_dropout():
+    """The reported failure: a swipe blurs the hand out of the landmarker and
+    surfaces as HAND_LOST / HAND_FOUND instead of a gesture."""
+    tr = HandTracker("Right")
+    ev = swipes(dropout(tr, [0, 0, -0.8], [0.30, 0, -0.8], hold=0.6, gap=0.25))
+    assert len(ev) == 1, f"expected one bridged swipe, got {len(ev)}"
+    assert ev[0].direction == "RIGHT" and ev[0].bridged
+    assert abs(ev[0].distance - 0.30) < 0.03
+
+
+def test_dropout_without_travel_is_not_a_swipe():
+    """The hand blinked out and came back where it was."""
+    tr = HandTracker("Right")
+    assert swipes(dropout(tr, [0, 0, -0.8], [0.04, 0, -0.8], hold=0.6, gap=0.25)) == []
+
+
+def test_slow_dropout_is_not_a_swipe():
+    """30 cm across a 0.9 s absence is a hand that wandered off and came back,
+    not a gesture -- and the gap is past the bridge limit anyway."""
+    tr = HandTracker("Right")
+    assert swipes(dropout(tr, [0, 0, -0.8], [0.30, 0, -0.8], hold=0.6, gap=0.9)) == []
+
+
+def test_depth_dominant_dropout_is_not_bridged():
+    """Seen live as a 64 cm "SWIPE TOWARD" the instant a hand appeared.
+
+    Across a dropout the depth estimate can change source -- size-bootstrap to
+    real stereo -- and that jump is along Z. Lateral position comes from pixels
+    and is trustworthy; depth across a gap is not.
+    """
+    tr = HandTracker("Right")
+    assert swipes(dropout(tr, [0, 0, -1.4], [0, 0, -0.8], hold=0.6, gap=0.25)) == []
+
+
+def test_implausibly_long_bridge_is_rejected():
+    """No arm covers 90 cm in a quarter second."""
+    tr = HandTracker("Right")
+    assert swipes(dropout(tr, [0, 0, -0.8], [0.90, 0, -0.8], hold=0.6, gap=0.25)) == []
+
+
+def test_bridged_swipe_reports_its_provenance():
+    """A bridged event has no intermediate samples, so straightness is 1.0 by
+    construction. Consumers must be able to tell that apart from a measured one."""
+    tr = HandTracker("Right")
+    bridged = swipes(dropout(tr, [0, 0, -0.8], [0.30, 0, -0.8], hold=0.6, gap=0.25))[0]
+    assert bridged.bridged and bridged.to_dict()["bridged"] is True
+
+    tr2 = HandTracker("Right")
+    path = (stationary([0, 0, -0.8], 0.5)
+            + linear([0, 0, -0.8], [0.30, 0, -0.8], 0.25)
+            + stationary([0.30, 0, -0.8], 0.5))
+    assert swipes(feed(tr2, path))[0].bridged is False
+
+
 def test_duplicate_frame_does_not_explode_speed():
     """Two detections sharing one handedness label arrive at the same timestamp.
 

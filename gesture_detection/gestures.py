@@ -39,10 +39,16 @@ class OneEuroFilter:
     moves. A fixed-width moving average cannot do both, and hand tracking
     needs both -- a held pose must not jitter, a fast swipe must not lag."""
 
-    def __init__(self, min_cutoff: float = 1.2, beta: float = 0.08, d_cutoff: float = 1.0):
+    # max_dt: a gap longer than this means the history is stale. At 60 Hz it is
+    # nine missed frames; blending a position that old into the new one drags
+    # the estimate backwards, which showed up as a bridged swipe measuring
+    # 26 cm of an actual 30 cm.
+    def __init__(self, min_cutoff: float = 1.2, beta: float = 0.08,
+                 d_cutoff: float = 1.0, max_dt: float = 0.15):
         self.min_cutoff = min_cutoff
         self.beta = beta
         self.d_cutoff = d_cutoff
+        self.max_dt = max_dt
         self._x_prev: Optional[float] = None
         self._dx_prev = 0.0
         self._t_prev: Optional[float] = None
@@ -62,7 +68,7 @@ class OneEuroFilter:
             self._x_prev, self._t_prev = x, t
             return x
         dt = t - self._t_prev
-        if dt <= 0.0 or dt > 0.5:          # first frame after a dropout: restart
+        if dt <= 0.0 or dt > self.max_dt:   # first frame after a dropout: restart
             self._x_prev, self._t_prev, self._dx_prev = x, t, 0.0
             return x
         a_d = self._alpha(self.d_cutoff, dt)
@@ -86,9 +92,11 @@ class Vec3Filter:
     # instead of the 5.7 cm that a near-zero beta gives, while a resting hand
     # still sits at the 1 Hz minimum cutoff and stays rock steady.
     def __init__(self, min_cutoff: float = 1.0, beta: float = 4.0,
-                 d_cutoff: float = 1.0, vel_tau: float = 0.06):
-        self._f = [OneEuroFilter(min_cutoff, beta, d_cutoff) for _ in range(3)]
+                 d_cutoff: float = 1.0, vel_tau: float = 0.06,
+                 max_dt: float = 0.15):
+        self._f = [OneEuroFilter(min_cutoff, beta, d_cutoff, max_dt) for _ in range(3)]
         self._vel_tau = vel_tau
+        self._max_dt = max_dt
         self._p_prev: Optional[np.ndarray] = None
         self._t_prev: Optional[float] = None
         self.position: Optional[np.ndarray] = None
@@ -107,7 +115,7 @@ class Vec3Filter:
         f = np.array([self._f[i](float(p[i]), t) for i in range(3)])
         if self._p_prev is not None and self._t_prev is not None:
             dt = t - self._t_prev
-            if 0.0 < dt <= 0.5:
+            if 0.0 < dt <= self._max_dt:
                 v = (f - self._p_prev) / dt
                 a = dt / (self._vel_tau + dt)
                 self.velocity = a * v + (1.0 - a) * self.velocity
@@ -157,6 +165,7 @@ class SwipeEvent:
     straightness: float               # net / path length, 1.0 == perfectly straight
     start: np.ndarray
     end: np.ndarray
+    bridged: bool = False             # inferred across a tracking dropout
 
     def to_dict(self) -> dict:
         return {
@@ -166,6 +175,7 @@ class SwipeEvent:
             "peak_speed_mps": round(self.peak_speed, 3),
             "duration_ms": round(self.duration * 1000.0, 1),
             "straightness": round(self.straightness, 3),
+            "bridged": self.bridged,
             "from_m": _xyz(self.start), "to_m": _xyz(self.end),
         }
 
@@ -320,6 +330,19 @@ class SwipeDetector:
     refractory: float = 0.50
     rearm_speed: float = 0.25         # must slow below this to fire again
     max_speed: float = 12.0           # m/s; above this the track jumped, see feed()
+    # A hand that is moving fast enough to swipe is also moving fast enough to
+    # motion-blur out of the landmarker's reach. The dropout is not noise, it
+    # is evidence: see _try_bridge.
+    gap_min: float = 0.06             # below this it is one dropped frame
+    gap_max: float = 0.45             # above this, too long to assume one motion
+    # A bridge compares two isolated samples, so it inherits whatever the depth
+    # estimate was doing at each end. Across a dropout that estimate can change
+    # source entirely (size-bootstrap to real stereo), and the jump reads as
+    # motion along Z -- observed live as a 64 cm "SWIPE TOWARD" from a hand
+    # that had just appeared. Bridge only in the image plane, where position
+    # comes from pixels, and cap the distance at something an arm can do.
+    bridge_lateral_only: bool = True
+    bridge_max_travel: float = 0.60
     # A wave reverses every ~0.2 s; a person deliberately swiping again first
     # returns their hand, which takes longer. 0.45 s splits them. Longer than
     # this and testing the gesture by swiping back and forth silently
@@ -338,11 +361,13 @@ class SwipeDetector:
     # the outside -- every rejection path records which gate stopped it.
     reject: str = "no data"
     stats: dict = field(default_factory=dict)
+    _bridge: Optional[Tuple[float, np.ndarray, float, np.ndarray]] = None
 
     def reset(self) -> None:
         self._buf.clear()
         self._armed = True
         self._last_dir = None
+        self._bridge = None
 
     def _reversal(self, axis: int, sign: int, t: float) -> bool:
         """True if this stroke merely undoes the previous one.
@@ -364,6 +389,20 @@ class SwipeDetector:
         while the gesture is gated off, so that history is already warm the
         moment the gate opens again."""
         p = np.asarray(p, dtype=np.float64)
+        if self._buf:
+            dt = t - self._buf[-1][0]
+            if dt > self.gap_min:
+                if dt <= self.gap_max:
+                    # the hand vanished and came back somewhere else; remember
+                    # the endpoints so the motion can still be judged
+                    self._bridge = (self._buf[-1][0], self._buf[-1][1].copy(),
+                                    t, p.copy())
+                # A dropout breaks the trajectory. Samples from before it can
+                # still be inside the time window, and leaving them there lets
+                # the ordinary windowed path report a gap-crossing jump as a
+                # normal swipe -- with none of the bridge's safeguards, which
+                # is how a depth-estimate jump became a 64 cm "SWIPE TOWARD".
+                self._buf.clear()
         if self._buf and t <= self._buf[-1][0]:
             # same frame delivered twice (two detections sharing one handedness
             # label). Appending would put a zero dt in the buffer and divide a
@@ -384,11 +423,78 @@ class SwipeDetector:
         while self._buf and t - self._buf[0][0] > self.window:
             self._buf.popleft()
 
+    def _try_bridge(self, t: float, speed: float) -> Optional[SwipeEvent]:
+        """Judge a swipe from the two samples either side of a tracking gap.
+
+        Observed live: a swipe would motion-blur the hand out of the
+        landmarker for ~0.4 s and surface as HAND_LOST / HAND_FOUND instead of
+        a gesture. The sliding window cannot help -- its samples have aged out
+        by the time the hand returns -- but the two endpoints still describe
+        the motion, and a hand that travelled 30 cm while it was invisible was
+        unambiguously swiping.
+
+        With only two samples the path length equals the net displacement, so
+        straightness is 1.0 by construction rather than by measurement. The
+        event is flagged `bridged` so consumers can tell the difference.
+        """
+        if self._bridge is None:
+            return None
+        t0, p0, t1, p1 = self._bridge
+        self._bridge = None
+
+        if not self._armed or t - self._last_event_t < self.refractory:
+            return None
+        net = p1 - p0
+        travel = float(np.linalg.norm(net))
+        dt = max(t1 - t0, 1e-6)
+        v = travel / dt
+        if travel < self.min_travel or v < self.min_speed:
+            self.reject = f"bridge: {travel * 100:.1f} cm at {v:.2f} m/s over {dt * 1000:.0f} ms"
+            return None
+
+        if travel > self.bridge_max_travel:
+            self.reject = f"bridge: {travel * 100:.0f} cm is too far to be one swipe"
+            return None
+
+        order = np.argsort(np.abs(net))[::-1]
+        axis = int(order[0])
+        if abs(net[axis]) < self.min_dominance * max(float(abs(net[order[1]])), 1e-9):
+            self.reject = "bridge: no dominant axis"
+            return None
+        if self.bridge_lateral_only and axis == 2:
+            self.reject = "bridge: depth-dominant, most likely a depth estimate jump"
+            return None
+
+        sign = 1 if net[axis] > 0 else -1
+        reversing = self._reversal(axis, sign, t)
+        self._last_dir, self._last_dir_t = (axis, sign), t
+        if reversing:
+            self._armed = False
+            self._buf.clear()
+            self.reject = "bridge: reversal of the previous stroke"
+            return None
+
+        if axis == 0 and self.mirror_x:
+            sign = -sign
+        self.reject = ""
+        self._last_event_t = t
+        self._armed = False
+        self._buf.clear()
+        return SwipeEvent(kind="SWIPE", hand=self.hand, t=t,
+                          direction=_DIRECTIONS[(axis, sign)], axis=axis,
+                          distance=travel, peak_speed=v, duration=dt,
+                          straightness=1.0, start=p0.copy(), end=p1.copy(),
+                          bridged=True)
+
     def update(self, p: np.ndarray, t: float, speed: float) -> Optional[SwipeEvent]:
         self.feed(p, t)
 
         if not self._armed and speed < self.rearm_speed:
             self._armed = True
+
+        bridged = self._try_bridge(t, speed)
+        if bridged is not None:
+            return bridged
 
         if len(self._buf) < 4:
             self.reject = f"only {len(self._buf)} samples"
@@ -557,7 +663,7 @@ class HandRegistry:
     landmarker will not report anyway.
     """
 
-    def __init__(self, lost_after: float = 0.35, **tracker_kwargs):
+    def __init__(self, lost_after: float = 0.50, **tracker_kwargs):
         self.lost_after = lost_after
         self._kwargs = tracker_kwargs
         self.trackers: Dict[str, HandTracker] = {}
