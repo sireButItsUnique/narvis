@@ -9,6 +9,7 @@
 import * as THREE from 'three';
 import { canvas, rect, boxDepth } from './view.js';
 import { input } from './input/state.js';
+import { S } from './settings.js';
 import { model, parts, beginEdit, cancelEdit, discardEdit, endGrab, clampPosition,
          setTransform, setGestureFlush } from './model.js';
 import { highlight } from './scene/highlight.js';
@@ -27,7 +28,9 @@ export const tool = { mode: 'move', brush: 4, mirror: false };   // brush: radiu
                                                                 // feature, big enough that one hand pass is visible.
 export const setBrush = r => (tool.brush = THREE.MathUtils.clamp(r, 0.5, 12));
 
-const PUSH_GAIN = 2.0;          // hand toward the screen -> object deeper (move, part)
+// Hand toward the screen -> object deeper; hand toward your chest -> object closer, which is the
+// zoom. Two means a comfortable 30 cm of arm covers 60 cm of the room, which is most of the box.
+const PUSH_GAIN = 2.0;
 const TURN_GAIN = 1.5;          // two-hand turn
 const TURN_PER_CM = 6 * Math.PI / 180;   // one hand: turn per centimetre of hand travel across the model
 const MIN_TURN_CM = 6;          // hands closer than this side to side (one above the other) can't steer a turn
@@ -44,6 +47,15 @@ let action = null;
 let lastHover = { mesh: null, t: -1e9 };
 let notify = () => {};
 export const setNotify = fn => { notify = fn; };
+
+// How far the model is from your eye, and whether a pull is being stopped by the front of the box
+// rather than by you. The HUD reads this: "zoom" on this rig is the model's distance, so the number
+// that changes has to be on screen or nobody can tell zooming from dragging.
+export function zoomState() {
+  if (!model.group) return null;
+  return { distanceCm: input.eye.distanceTo(model.group.position), zCm: model.group.position.z,
+           atFront: !!action?.atFront, popout: !!S.popout, dragging: action?.kind === 'grab' };
+}
 
 // the part you're pointing at (or just were), for "delete that", "make that red", "duplicate that"
 export function pointedPart(now = performance.now()) {
@@ -131,8 +143,19 @@ function updateAction(p) {
     return;
   }
   if (action.kind === 'grab') {
+    // The depth axis of this gesture IS the zoom: move your hand toward your chest and the model
+    // comes with it, which makes it bigger the way bringing anything closer does. There is no other
+    // kind of zoom available here - the frustum is built from your eye and the screen corners, so
+    // there is no field of view to widen, and inventing one would stop the picture matching where
+    // your head is.
     const t = action.dist + (action.handZ0 - p.handZ) * PUSH_GAIN;
-    root.position.lerp(clampPosition(rayPoint(p, t).add(action.offset)), 0.5);
+    const wanted = rayPoint(p, t).add(action.offset);
+    const zWanted = wanted.z;
+    root.position.lerp(clampPosition(wanted), 0.5);
+    // Pulling it past the screen is what "zoom in" means, and popout is the setting that allows it.
+    // It is off by default and invisible, so a pull that runs into that wall reads as the model
+    // being stuck rather than as a setting: say so, once, with the key that changes it.
+    action.atFront = zWanted > (S.popout ? 15 : -1) + 0.5;
     p.end = root.position.clone().sub(action.offset);
   }
 }

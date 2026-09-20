@@ -5,7 +5,7 @@ import { S, saveSettings } from './settings.js';
 import { renderer, scene, camera, rect, buildRoom, applyOffAxis, renderViews, clayMaterial } from './view.js';
 import { input } from './input/state.js';
 import { startCamera, track, drawDebug, eyeFilt, cam } from './input/webcam.js';
-import { updateInteraction, pointedPart, tool, TOOLS, SCULPT_TOOLS, setBrush, setNotify } from './interaction.js';
+import { updateInteraction, pointedPart, tool, TOOLS, SCULPT_TOOLS, setBrush, setNotify, zoomState } from './interaction.js';
 import * as sculpt from './sculpting.js';
 import { model, parts, showScene, clearScene, scaleBy, setSpin, turnBy, undo, resetPlacement, focusPart,
          deletePart, duplicatePart, quickColor, quickFinish, layout, update as updateModel } from './model.js';
@@ -71,7 +71,7 @@ function begin() {
 
 // ---------- tool badge: what a pinch does right now ----------
 const TOOL_HINT = {
-  move: 'pinch to move it · two hands: turn and resize',
+  move: 'pinch it and pull toward you to zoom in, push away to zoom out · two hands: turn and resize',
   rotate: 'pinch anywhere on it and drag across to turn it',
   extrude: 'pinch on the model and drag to build clay out of it',
   smooth: 'pinch on the model and drag to melt it smooth',
@@ -79,8 +79,13 @@ const TOOL_HINT = {
 function showTool() {
   const brush = SCULPT_TOOLS.has(tool.mode);
   const name = tool.mode === 'smooth' ? 'Smooth' : sculpt.brushes.extrude;
+  // In move mode the badge carries the distance, because that IS the zoom here: there is no field
+  // of view to change, so the only thing that makes the model bigger is it being nearer, and a
+  // number that moves is the difference between "I am zooming" and "it is dragging oddly".
+  const z = tool.mode === 'move' ? zoomState() : null;
   $('tool-name').textContent = tool.mode.toUpperCase() +
     (brush ? ` · ${name} ${tool.brush.toFixed(1)} cm${tool.mirror ? ' · mirror' : ''}` : '') +
+    (z ? ` · ${z.distanceCm.toFixed(0)} cm away` : '') +
     (clayOn ? ' · clay view' : '');
   $('tool-hint').textContent = TOOL_HINT[tool.mode];
 }
@@ -417,6 +422,26 @@ function runCommand(cmd) {
 // back from Blender as a new rev, which means anything sculpted in the browser and not yet sent
 // back is lost - so say that out loud before doing it rather than after.
 let addingDetail = false;
+// The zoom readout, while a hand is actually zooming. Two jobs: keep the distance on the badge
+// live, and explain the one wall a pull can run into that is not the user's arm - pop-out is off,
+// so the model stops at the screen and cannot come any nearer. That is a setting nobody can see,
+// and without this it reads as the model being stuck.
+let zoomShownAt = 0, frontToldAt = 0, wasZooming = false;
+function zoomFeedback(now) {
+  const z = zoomState();
+  if (!z || !z.dragging) {
+    // one last refresh when the hand lets go, or the badge keeps the second-to-last distance
+    if (wasZooming) { wasZooming = false; showTool(); }
+    return;
+  }
+  wasZooming = true;
+  if (now - zoomShownAt > 100) { zoomShownAt = now; showTool(); }
+  if (z.atFront && !z.popout && now - frontToldAt > 4000) {
+    frontToldAt = now;
+    flash('That is as close as it comes with pop-out off — press P to let it out in front of the screen', 3500);
+  }
+}
+
 async function addDetail() {
   if (!model.group) return flash('Nothing to add detail to. Say "make a ___" first.');
   if (addingDetail) return flash('Still adding detail; one moment.');
@@ -512,6 +537,7 @@ function tick(now) {
   applyOffAxis(input.eye);
   renderViews();
   drawDebug($('htw-cam'));
+  zoomFeedback(now);
 
   frames++;
   if (now - fpsT0 > 500) { fps = frames * 1000 / (now - fpsT0); frames = 0; fpsT0 = now; }
