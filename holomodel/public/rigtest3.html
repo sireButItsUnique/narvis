@@ -562,10 +562,16 @@ function mountModelScene() {
   if (holo || holoLoading) return;
   holoLoading = true;
   flash('Starting Holomodel...');
-  import('./js/holo-host.js').then(m => m.mountHolomodel({ renderer, grab: grabOptions(), ownFrame: frame }))
-    .then(h => { holo = h; flash('Say "Narvis, make a teapot". Keys 1-6 pick the tool; Y puts a test teapot down; 0 leaves.'); hint(); })
+  import('./js/holo-host.js').then(m => m.mountHolomodel({ renderer, grab: grabOptions(), ownFrame: frame, setup }))
+    .then(h => { holo = h; holo.setKeys(holoKey); holo.setShown(sceneKind === 'model'); flash('Say "Narvis, make a teapot". Keys 1-6 pick the tool; Y puts a test teapot down; 0 leaves.'); hint(); })
     .catch(e => { holoLoading = false; console.error(e); flash('Holomodel could not start: ' + (e?.message || e) + ' - is this page served by holomodel (npm start, port 8765)?'); });
 }
+// Two key listeners share this window once Holomodel is mounted: this page's and Holomodel's own. These are
+// this page's even in scene 8; the rest are Holomodel's THERE, and nowhere else - and not while a panel of
+// this page's (P placement, Q stability, T trim, S setup) is taking the arrows and letters for itself.
+const RIG_KEYS = ['s', 'h', 'p', 'q', 'f', 'o', 'g', 'y', '0', 'escape'];
+const holoKey = k => sceneKind === 'model' && !tuneMode && !stabMode && !trimMode && !setupVisible() && !RIG_KEYS.includes(k);
+let holoFaultAt = -1e9;
 const grabOptions = () => ({ close: setup.demo.grabClose, open: setup.demo.grabOpen, wideOpen: setup.demo.grabOpen + 0.38 });
 
 const lineMat = (c, o = 1) => new THREE.LineBasicMaterial({ color: c, transparent: o < 1, opacity: o, toneMapped: false });
@@ -716,10 +722,11 @@ function buildScene() {
   // line, or three posts stacked in a single column: a lit, plausible, meaningless picture, which is worse
   // than a black screen because it looks like something. The banner says what is wrong instead.
   demo = demoView = null;
+  holo?.setShown(sceneKind === 'model');       // elsewhere it neither listens for its name nor talks
   if (HAND_SCENES.has(sceneKind)) {
     // Your hand, and the mat grid to judge the display by. Neither needs the "usable volume" box, which is
     // empty on this rig, so these scenes are built before that box gets a say.
-    if (gridOn) world.add(matGrid(DEMO_SCENES.has(sceneKind)));
+    if (gridOn) world.add(matGrid(DEMO_SCENES.has(sceneKind) || sceneKind === 'model'));   // on this display every line is light: under a model, faint
     if (sceneKind === 'model') mountModelScene();
     if (DEMO_SCENES.has(sceneKind)) {
       demo = DM.makeDemo(sceneKind, { floorY: -setup.rig.baseDropCm, grab: grabOptions() });
@@ -877,23 +884,28 @@ function frame(now) {
     // Holomodel is told where the hand and eye are, runs its own tools on them, and its scene is drawn here
     // first; this page's scene - the black hand - goes over it with the depth kept, so a real hand in front
     // of the model hides it and one behind does not.
-    holo.feed({ eyeRig, tracked: !!source.usable, handRig: handDrawn, pinch: handDrawn ? gated.pinch : null, now });
-    holo.tick(now);
-    holo.aim(rc);
-    if (!setupVisible()) {
-      const tone = renderer.toneMapping;
-      renderer.autoClear = false;
-      renderer.clear();
-      renderer.toneMapping = THREE.NeutralToneMapping;
-      renderer.render(holo.scene, holo.camera);
-      renderer.toneMapping = tone;
-      // a Scene whose background is a Color clears the canvas when it is drawn, autoClear or not - which
-      // would wipe the model that was just drawn. The canvas is already cleared to black.
-      const bg = scene.background;
-      scene.background = null;
-      renderer.render(scene, camera);
-      scene.background = bg;
-      renderer.autoClear = true;
+    // All of it guarded: this frame is the page's only loop, and a throw from Holomodel's tools or sculpt
+    // engine here used to be the last frame ever drawn - hologram, hand and keys frozen until a reload.
+    const tone = renderer.toneMapping, bg = scene.background;
+    try {
+      holo.feed({ eyeRig, tracked: !!source.usable, handRig: handDrawn, pinch: handDrawn ? gated.pinch : null, now });
+      holo.tick(now);
+      holo.aim(rc);
+      if (!setupVisible()) {
+        renderer.autoClear = false;
+        renderer.clear();
+        renderer.toneMapping = THREE.NeutralToneMapping;
+        renderer.render(holo.scene, holo.camera);
+        renderer.toneMapping = tone;
+        // a Scene whose background is a Color clears the canvas when it is drawn, autoClear or not - which
+        // would wipe the model that was just drawn. The canvas is already cleared to black.
+        scene.background = null;
+        renderer.render(scene, camera);
+      }
+    } catch (err) {
+      if (now - holoFaultAt > 3000) { holoFaultAt = now; console.error('Holomodel frame failed', err); flash('Holomodel hit an error (see the console); still running'); }
+    } finally {
+      renderer.toneMapping = tone; scene.background = bg; renderer.autoClear = true;
     }
   } else if (!setupVisible()) renderer.render(scene, camera);
   frames++;
@@ -1010,7 +1022,10 @@ const escapeHtml = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '
 function hint() {
   $('hint').textContent = [
     `scene: ${sceneKind}${droppedName ? ' (' + droppedName + ')' : ''}   1 cube · 2 posts · 3 teapot · 4 dropped .glb · 5 your hand only · 6 pick things up · 7 press the sheet · 8 model by voice`,
-    ...(sceneKind === 'model' ? [holo ? (() => { const st = holo.status(); return `Holomodel: ${st.tool || '-'}${st.heard ? '   heard: ' + st.heard : ''}${st.hasModel ? '' : '   (no model yet: say "Narvis, make a ...", or Y for a test teapot)'}   keys 1-6 tools · Y test teapot · O hand black / bones · 0 leave`; })() : 'Holomodel is starting...'] : []),
+    ...(sceneKind === 'model' ? [holo ? (() => { const st = holo.status(); return `Holomodel: ${st.tool || '-'}${st.heard ? '   heard: ' + st.heard : ''}${st.hasModel ? '' : '   (no model yet: say "Narvis, make a ...", or Y for a test teapot)'}   keys 1-6 tools · Y test teapot · O hand black / bones · 0 leave`
+      // what Holomodel is SAYING (a build's progress, "Blender did not take it") goes to a banner in its own
+      // page, which nobody can see from here
+      + (st.banner && !/^Press F for fullscreen/.test(st.banner) ? '\n' + st.banner : ''); })() : 'Holomodel is starting...'] : []),
     ...(DEMO_SCENES.has(sceneKind) ? ['R start the demo again   O hand drawn in black (hides what is behind it) / as bones   ; \' grab less / more easily'] : []),
     'S setup   H readout   P place your hand by eye   Q tracking stability   G mat grid   D copy diagnostics   A measure the ZED’s tilt from your head   M mouse stand-in   T trim   F fullscreen   X panel mounted upside down   V flip the setup page too',
   ].join('\n');
@@ -1801,7 +1816,7 @@ addEventListener('keydown', e => {
   // In the model scene most keys are Holomodel's (1-6 tools, [ ] brush, arrows turn...). It has its own
   // listener; this page keeps only the keys that are about the RIG, and must not also act on the others
   // (C would start a calibration capture, X would flip the panel).
-  if (sceneKind === 'model' && !['s', 'h', 'p', 'q', 'f', 'o', 'g', 'y', '0', 'escape'].includes(k)) return;
+  if (sceneKind === 'model' && !RIG_KEYS.includes(k)) return;
   if (sceneKind === 'model' && k === '0') { sceneKind = 'hands'; buildScene(); return; }
   if (sceneKind === 'model' && k === 'y') { holo?.loadFixture().then(() => flash('A test teapot. Pinch it (tool 1 moves, 2 turns, 3 nearer, 4 bigger, 5 adds clay, 6 smooths).')); return; }
   if (k === 's') showSetup($('setup').classList.contains('hidden'));

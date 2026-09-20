@@ -3,7 +3,7 @@
 // undo (strokes, part ops, Fable builds) arrives with undo.js in M2.
 import * as THREE from 'three';
 import { S } from './settings.js';
-import { scene, rect, boxDepth } from './view.js';
+import { scene, rect, boxDepth, onStage } from './view.js';
 import { createParts } from './scene/parts.js';
 
 const HOME = { fx: 0, fy: 0, fz: 0.5 };   // centre of the floor, halfway back
@@ -134,10 +134,15 @@ function attach() {
 }
 
 // ---------- placement ----------
+// On the rig's stage the box is the whole of where a hologram can be: above it is the acrylic sheet (no image
+// forms there, and the camera under the sheet sees no hand there to hide it behind), and in front of it is
+// past the panel's edge. So there the model's TOP stays under the sheet, and pop-out means nothing.
 export function clampPosition(v) {
+  const stage = onStage(), g = model.group;
+  const tall = stage && g ? g.userData.height * fit * model.userScale : 1;
   v.x = THREE.MathUtils.clamp(v.x, rect.x0 + 1, rect.x1 - 1);
-  v.y = THREE.MathUtils.clamp(v.y, rect.y0, rect.y1 - 1);
-  v.z = THREE.MathUtils.clamp(v.z, -boxDepth + 1, S.popout ? 15 : -1);
+  v.y = THREE.MathUtils.clamp(v.y, rect.y0, Math.max(rect.y0, rect.y1 - tall));
+  v.z = THREE.MathUtils.clamp(v.z, -boxDepth + 1, !stage && S.popout ? 15 : -1);
   return v;
 }
 

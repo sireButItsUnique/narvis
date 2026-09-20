@@ -28,10 +28,18 @@ import * as RS from '../rig/rig-setup.js';
 import { makeHandGate, makeHandSmoother, scaleAboutLens } from '../rig/hands.js';
 import { makeGrab, centroid } from '../rig/demo.js';
 
-export const STAGE = { origin: [0, -6.75, 24], diagIn: 10.84 };   // a 24 x 13.5 cm "display": the slot's front face
+export const STAGE = { origin: [0, -6.75, 24], W: 24, H: 13.5 };   // a 24 x 13.5 cm "display": the slot's front face
 export const worldFromRig = p => [p[0] - STAGE.origin[0], p[1] - STAGE.origin[1], p[2] - STAGE.origin[2]];
 // column-major 4x4 for geometry.js applyRigCamera(camera, rc, worldFromRig)
 export const WORLD_FROM_RIG = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -STAGE.origin[0], -STAGE.origin[1], -STAGE.origin[2], 1];
+// The slot is as tall as the sheet is above the mat, and that is a MEASURED number (setup.rig.baseDropCm, the
+// same one rigtest3's mat grid and demo floor stand on). The stage's floor is the mat: with 13.5 written in
+// here, a rig measured at 12.2 had its models set down 1.3 cm inside the table. Call before the room is built.
+export function stageFromSetup(setup) {
+  const drop = Number(setup?.rig?.baseDropCm);
+  if (Number.isFinite(drop) && drop > 2) { STAGE.H = drop; STAGE.origin[1] = -drop / 2; WORLD_FROM_RIG[13] = drop / 2; }
+  return STAGE;
+}
 
 const STORE = {                        // rigtest3's saved setup: same origin, so the same calibration
   getItem: () => globalThis.localStorage?.getItem('holo-rigtest3') ?? null,
@@ -108,7 +116,10 @@ export function writeHand(s, pts, pinch, now) {
   other.active = false; other.pinch = false; other.jointsWorld = null;
   if (!pts) {
     const g = s.grab.update(null, now);
-    h.active = false; h.jointsWorld = null; h.pinch = g.held;      // a coasting grip outlives a lost hand, briefly
+    // A coasting grip outlives a lost hand, briefly - and for that it has to still BE a hand: a gesture ends on
+    // !active, so with active false the model was dropped anyway, and the pinch that stayed true through the
+    // coast then had no rising edge to take it up again when the hand came back still closed.
+    h.active = g.held; h.jointsWorld = null; h.pinch = g.held;
     if (!g.held) h.pinchRatio = 1;
     s.rel = null;
     return;
@@ -123,7 +134,9 @@ export function writeHand(s, pts, pinch, now) {
   // grip: carried on the palm, with the fingertips' offset from it smoothed hard while holding - they are the
   // shakiest joints there are, and whatever is held is hiding them
   const palm = centroid(world), raw = mid(world[4], world[8]).map((v, i) => v - palm[i]);
-  const k = state.rel ? 1 - Math.exp(-(1 / 60) / (g.held ? 0.14 : 0.04)) : 1;
+  const dt = state.rel && state.relAt ? Math.min(0.1, Math.max(0.001, (now - state.relAt) / 1000)) : 1 / 60;   // this page runs at 25-60 fps
+  state.relAt = now;
+  const k = state.rel ? 1 - Math.exp(-dt / (g.held ? 0.14 : 0.04)) : 1;
   state.rel = state.rel ? state.rel.map((v, i) => v + (raw[i] - v) * k) : raw;
   h.grip.set(palm[0] + state.rel[0], palm[1] + state.rel[1], palm[2] + state.rel[2]);
   h.gripRaw.fromArray(mid(world[4], world[8]));

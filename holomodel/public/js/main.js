@@ -6,7 +6,7 @@ import { renderer, scene, camera, rect, buildRoom, applyOffAxis, renderViews, cl
 import { input } from './input/state.js';
 // Hands and eyes come from the ZED tracker over a socket (input/bridge.js), not from a webcam and MediaPipe in
 // the page; and the picture goes to the hologram rig (rig/output.js), not to a window on a desk.
-import { startBridge, bridgeTick, bridgeStatus, bridgeState, STAGE, WORLD_FROM_RIG, loadSetup, rigFromSetup } from './input/bridge.js';
+import { startBridge, bridgeTick, bridgeStatus, bridgeState, stageFromSetup, WORLD_FROM_RIG, loadSetup, rigFromSetup } from './input/bridge.js';
 import { RigView } from './rig/output.js';
 import { applyRigCamera } from './rig/geometry.js';
 import { makeHandMask } from './rig/hands.js';
@@ -117,12 +117,14 @@ function setTool(mode) {
 // pixel is hologram), and the camera is the rig's off-axis one, handed the stage's place in the rig.
 let rigView = null, handMask = null;
 const params = new URLSearchParams(location.search);
+const STAGE_BRUSH_CM = 1.3;      // a sixth of a model fitted to the STAGE, as 4 cm is of one fitted to a desk monitor
 function startRig() {
-  S.diagIn = STAGE.diagIn;
-  useStage(true);
+  const setup = loadSetup();
+  useStage(stageFromSetup(setup));          // the stage's own size; the saved screen diagonal is left alone
+  setBrush(STAGE_BRUSH_CM);
   const bridgeParam = params.get('bridge');
   startBridge(/^wss?:/.test(bridgeParam || '') ? bridgeParam : undefined);
-  rigView = new RigView({ rig: rigFromSetup(loadSetup()), renderer, canvas: renderer.domElement, scene,
+  rigView = new RigView({ rig: rigFromSetup(setup), renderer, canvas: renderer.domElement, scene,
                           assumeFullscreen: params.has('full') });
   begin();
   setRoomVisible(false);
@@ -561,9 +563,22 @@ async function doExport() {
 }
 
 // ---------- keys ----------
+// Hosted inside rigtest3 (holo-host.js) this listener shares a window with that page's own, and P, F, V, R, T
+// and the arrows mean something there: P is hand placement and turned pop-out on here, F picks the rig's panel
+// and this one's plain request went fullscreen on the laptop first, V mirrors the setup page and switched
+// the microphone off. The host says which keys are this page's, and when (setKeyGate); alone, all of them are.
+let keyGate = null;
+export function setKeyGate(fn) { keyGate = typeof fn === 'function' ? fn : null; }
+// ...and out of sight is out of earshot: while the host shows something else, "Narvis, make a lamp" from
+// across the table must not start a build nobody can see. The microphone setting itself is left as it was.
+export function setListening(on) {
+  if (on) { if (started && S.mic && !voice.wanted) voice.start(); }
+  else { voice.stop(); speaker.stop(); }
+}
 addEventListener('keydown', async e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
   const k = e.key.toLowerCase();
+  if (keyGate && !keyGate(k, e)) return;
   if ((e.ctrlKey || e.metaKey) && k === 'z') { e.preventDefault(); runCommand({ type: 'undo' }); return; }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (k === '/') { if (started) { e.preventDefault(); openCmd(); } }

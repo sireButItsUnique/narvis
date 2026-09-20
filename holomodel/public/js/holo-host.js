@@ -20,7 +20,7 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { applyRigCamera } from './rig/geometry.js';
 
-export async function mountHolomodel({ renderer, grab = {}, ownFrame = null }) {
+export async function mountHolomodel({ renderer, grab = {}, ownFrame = null, setup = null }) {
   // ONE loop, not two. Holomodel's main.js runs itself off requestAnimationFrame; left to that, its tick and
   // this page's frame would interleave in whatever order the browser chose, a frame of lag between the hand
   // being fed and being used. So its frame function is caught as it registers, never handed to the browser
@@ -43,14 +43,19 @@ export async function mountHolomodel({ renderer, grab = {}, ownFrame = null }) {
   }
   document.body.appendChild(box);
 
-  const [{ S }, V, B, { input }, M, HV] = await Promise.all([
-    import('./settings.js'), import('./view.js'), import('./input/bridge.js'), import('./input/state.js'),
-    import('./model.js'), import('./handviz.js')]);
-  S.diagIn = B.STAGE.diagIn;                    // the stage's front face, not a monitor
-  V.useStage(true);
-  await import('./main.js');
+  const [V, B, { input }, M, HV, I] = await Promise.all([
+    import('./view.js'), import('./input/bridge.js'), import('./input/state.js'),
+    import('./model.js'), import('./handviz.js'), import('./interaction.js')]);
+  V.useStage(B.stageFromSetup(setup || B.loadSetup()));   // the stage's front face, not a monitor - and not saved as one
+  I.setBrush(1.3);                              // a sixth of a model fitted to the stage (main.js STAGE_BRUSH_CM)
+  input.source = 'host';
+  const MAIN = await import('./main.js');
   catching = false;
-  document.getElementById('btn-mouse').click();   // begin(): the start that asks nothing of any camera
+  MAIN.setKeyGate(() => false);                 // no keys until the host says which are Holomodel's (setKeys)
+  // begin(): the start that asks nothing of any camera. That button also writes its screen-size field into the
+  // saved settings, so the field is emptied first - it is somebody's desk monitor, and none of this page's business.
+  document.getElementById('s-diag').value = '';
+  document.getElementById('btn-mouse').click();
   V.views.length = 0;                           // their renderer draws nothing; ours draws their scene
   V.setRoomVisible(false);                      // the box's walls are not hologram
   HV.setBonesVisible(false);                    // the hand is rigtest3's black one
@@ -74,6 +79,10 @@ export async function mountHolomodel({ renderer, grab = {}, ownFrame = null }) {
     },
     // Holomodel's own per-frame work (its tools acting on what was just fed), driven from here
     tick(now) { theirFrame?.(now); },
+    // which keys are Holomodel's right now: fn(key) -> true. The rest are the rig page's, and only its.
+    setKeys(fn) { MAIN.setKeyGate(fn); },
+    // shown / not shown: a scene nobody is looking at does not listen for its name or talk
+    setShown(on) { MAIN.setListening(!!on); },
     // the rig camera `rc` (geometry.js rigCamera), moved into Holomodel's frame
     aim(rc) { return applyRigCamera(camera, rc, B.WORLD_FROM_RIG); },
     // what their page is saying, for rigtest3 to put on the glass the right way round
