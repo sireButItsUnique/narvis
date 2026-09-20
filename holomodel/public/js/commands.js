@@ -57,6 +57,32 @@ const MODES = [
   [/^(?:move|move mode|grab mode|normal mode|object mode|done|done sculpting|stop sculpting|stop smoothing|exit (?:extrude|sculpt|smooth|rotate|zoom|scale)(?: mode)?)$/, 'move'],
 ];
 
+// Asking for a TOOL, however it is put. The patterns above want the tool's name and little else, and anything
+// they missed fell through to "make": "give me the rotate tool" came back as a 3D model of a rotate tool, and
+// "move tool" went to Fable as a change. Two rules, both narrow enough not to eat a modelling request:
+//   - the words "tool" or "mode" next to a tool's name ARE a tool request, whatever else is in the sentence;
+//   - a tool's name on its own, once the asking ("give me", "can I have", "switch to", "please") is taken off.
+const TOOL_NAMES = [
+  ['move', /\b(?:move|moving|movement|grab|grabbing|carry|carrying|drag|dragging|pick ?up|hand)\b/],
+  ['rotate', /\b(?:rotate|rotating|rotation|turn|turning|spin|spinning|twist)\b/],
+  ['zoom', /\b(?:zoom|zooming|distance|dolly|closer)\b/],
+  ['scale', /\b(?:scale|scaling|resize|resizing|size|sizing)\b/],
+  ['extrude', /\b(?:extrude|extruding|extrusion|sculpt|sculpting|clay|pull|pulling)\b/],
+  ['smooth', /\b(?:smooth|smoothing|polish|polishing|melt)\b/],
+];
+const ASKING = /^(?:(?:please|ok|okay|now|hey|um|uh) )*(?:(?:can|could|may) (?:i|you|we) (?:please )?(?:have|get|use|give me|switch to|go to) |(?:i|we) (?:want|need|would like)(?: to (?:use|have|get|switch to))? |(?:give|get|hand|pass) me |let me (?:use|have) |(?:switch|change|go|swap)(?: back)? (?:to|into|over to) |(?:use|enter|select|pick|choose|activate|enable|open|set|start|bring up|put it (?:in|on|into)) )?(?:the |a |an |my )?/;
+export function toolRequest(t) {
+  const hasToolWord = /\b(?:tool|tools|mode)\b/.test(t);
+  const bare = t.replace(ASKING, '').replace(/ (?:tool|tools|mode)\b/g, '').replace(/ (?:please|now|again|it|thanks|thank you)$/g, '').trim();
+  const whole = (text, re) => { const m = text.match(re); return !!m && m[0].length === text.length; };
+  const plain = t.replace(/ (?:please|now|again|thanks|thank you)$/g, '').trim();     // "pick up": the asking-words must not eat it
+  for (const [mode, re] of TOOL_NAMES) {
+    if (hasToolWord && re.test(t)) return mode;
+    if (whole(bare, re) || whole(plain, re)) return mode;
+  }
+  return null;
+}
+
 // Blender sculpt brushes by what people call them -> the brush's name in Blender's built-in library
 export const BRUSHES = {
   draw: 'Draw', 'draw sharp': 'Draw Sharp', clay: 'Clay', 'clay strips': 'Clay Strips', 'clay thumb': 'Clay Thumb',
@@ -305,6 +331,9 @@ export function parseCommand(text) {
   // "switch to sculpt mode", "go back to move mode", "use smooth"
   const modeText = t.replace(/^(?:(?:switch|change|go|swap)(?: back)? (?:to|into)|use|enter) (?:the )?/, '');
   for (const [re, mode] of MODES) if (re.test(modeText)) return { type: 'mode', mode };
+  // ...and however else a tool is asked for (toolRequest, above). "turn" and "spin" on their own keep meaning
+  // the turntable, and a brush asked for by name is a brush pick, both decided before this line is reached.
+  if (!/^(?:turn|spin|spinning|stop spinning)(?: it)?$/.test(t)) { const asked = toolRequest(t); if (asked) return { type: 'mode', mode: asked }; }
   const MIRROR = '(?:the )?(?:mirror|symmetry)(?: mode)?';
   if (new RegExp(`^${MIRROR}(?: on)?$|^turn on ${MIRROR}$|^turn ${MIRROR} on$`).test(t)) return { type: 'mirror', on: true };
   if (new RegExp(`^${MIRROR} off$|^turn off ${MIRROR}$|^turn ${MIRROR} off$|^no (?:mirror|symmetry)$`).test(t)) return { type: 'mirror', on: false };
