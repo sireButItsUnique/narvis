@@ -13,7 +13,7 @@ import { fetchScene } from './scene/load.js';
 import { initBuild, build, cancelBuild, work, toggleLog } from './scene/build.js';
 import { initVersions, refreshVersions, noteCurrent, restoreVersion, saveVersion, showVersions } from './scene/versions.js';
 import { highlighted } from './scene/highlight.js';
-import { parseCommand, parseTyped, afterWake, WAKE } from './commands.js';
+import { parseCommand, parseTyped, heardCommand, WAKE } from './commands.js';
 import { quip, quipFor } from './narvis.js';
 import { createVoice, createCloudVoice } from './voice.js';
 import { createSpeaker } from './speak.js';
@@ -167,13 +167,19 @@ const voiceHandlers = {
     // nothing - there is no window afterwards where the next thing anybody says is taken as an
     // order, which is the failure mode of every always-on microphone, and at a demo table the next
     // thing anybody says is usually about the demo.
-    const said = afterWake(text);
-    if (said === null) { showHeard(text, 'asleep'); return; }
-    if (!said) { showHeard(`“${text}” — and then a command, like “Narvis, make a sphere”`, 'hint'); say(quip('nothing')); return; }
-    const cmd = parseCommand(said);
-    showHeard(said, cmd ? 'command' : 'ignored');
+    // In a loud room the recogniser does not hand you a sentence, it hands you a paragraph with the
+    // command somewhere inside it. heardCommand finds the name anywhere in there, cuts at the point
+    // the speaker changed the subject, and only acts if what is left parses.
+    const h = heardCommand(text);
+    if (!h.woke) { showHeard(text, 'asleep'); return; }
+    if (!h.said) { showHeard(`“${text}” — and then a command, like “Narvis, make a sphere”`, 'hint'); say(quip('nothing')); return; }
+    if (!h.cmd) { showHeard(h.said, 'ignored'); say(quip('unknown')); return; }
+    // Show what was taken AND what was dropped: in a room where half of what you say is not for the
+    // rig, "why did it do that" is answered by seeing which words it acted on.
+    showHeard(h.rest ? `“${h.said}” · ignored “${h.rest}”` : `“${h.said}”`, 'hint');
     // The screen says what happened; the voice has a personality. Never both saying the same thing.
-    if (cmd) { say(quipFor(cmd)); runCommand(cmd); } else say(quip('unknown'));
+    say(quipFor(h.cmd));
+    runCommand(h.cmd);
   },
 };
 let voice = createVoice(voiceHandlers);   // Edge's recogniser until /api/config says ElevenLabs is set up

@@ -162,20 +162,79 @@ function editDistance(a, b) {
 const soundsLikeWake = (word) => !!word
   && (word === WAKE || WAKE_ALIASES.has(word) || editDistance(word, WAKE) <= 2);
 
+const bare = (w) => String(w || '').replace(/[^a-z]/g, '');
+
+/**
+ * Every place the name is heard in a run of words, with how many words it took to say it.
+ * Recognisers split an unfamiliar name as often as they mangle it: "nar vis", "gnar viss".
+ */
+function wakePoints(words) {
+  const out = [];
+  for (let i = 0; i < words.length; i++) {
+    if (soundsLikeWake(bare(words[i]))) out.push({ at: i, len: 1 });
+    else if (i + 1 < words.length && soundsLikeWake(bare(words[i]) + bare(words[i + 1]))) out.push({ at: i, len: 2 });
+  }
+  return out;
+}
+
+// Where a spoken command ends and the conversation starts again. A microphone in a loud room does
+// not hand you a sentence, it hands you a paragraph: "...so if we just, yeah, narvis make it bigger
+// and then we should go find food". Nobody pauses for the parser. These are the words people
+// actually use to change the subject mid-breath - and NOT a bare "and", because "a cube and a
+// sphere" is one thing somebody is asking for.
+const SEGMENT_BREAK = /\b(?:and then|then again|then|after that|anyway|by the way|you know|i mean|actually|wait|hold on|never mind|forget it|but|because|so that|alright|all right|thanks|thank you|right okay|okay so|ok so)\b/;
+
 /**
  * What was said after the rig's name, or null if its name was not said.
  * An empty string means the name and nothing else ("Narvis?"), which is worth answering.
+ * The name is looked for ANYWHERE, and the LAST one wins: if it is said twice in a paragraph, the
+ * second is the one the person meant.
  */
 export function afterWake(text) {
   const t = normalize(text);
   if (!t) return null;
   const words = t.split(' ');
-  if (soundsLikeWake(words[0].replace(/[^a-z]/g, ''))) return words.slice(1).join(' ');
-  // recognisers split an unfamiliar name as often as they mangle it: "nar vis", "gnar viss"
-  if (words.length > 1 && soundsLikeWake((words[0] + words[1]).replace(/[^a-z]/g, ''))) {
-    return words.slice(2).join(' ');
+  const hits = wakePoints(words);
+  if (!hits.length) return null;
+  const last = hits[hits.length - 1];
+  return words.slice(last.at + last.len).join(' ');
+}
+
+/**
+ * The command inside a paragraph, if there is one.
+ *
+ * Three filters, in this order, and the last one is what makes scanning a whole paragraph safe
+ * rather than reckless: the name has to be in there; what follows it is cut at the first place the
+ * speaker changed the subject; and whatever is left has to parse as an actual command. A stray
+ * "nervous" in somebody's conversation gets through the first filter all day and never gets past
+ * the third, because "about the demo" is not something this page can do.
+ *
+ * @returns {{woke: boolean, said: string, cmd: object|null, rest: string}}
+ *   woke  the name was in there somewhere
+ *   said  the words that were taken as the command (for the transcript)
+ *   cmd   the parsed command, or null
+ *   rest  what came after it, which nobody acts on - kept so the HUD can show what was ignored
+ */
+export function heardCommand(text) {
+  const tail = afterWake(text);
+  if (tail === null) return { woke: false, said: '', cmd: null, rest: '' };
+  if (!tail) return { woke: true, said: '', cmd: null, rest: '' };
+
+  // Cut at the point the sentence stops being an instruction.
+  const cut = tail.search(SEGMENT_BREAK);
+  const head = (cut > 0 ? tail.slice(0, cut) : tail).trim();
+  const rest = cut > 0 ? tail.slice(cut).trim() : '';
+
+  // Longest first: the segment is already bounded, so the whole of it is the best guess at what was
+  // asked for ("make a coffee mug with a gold handle" is one request, not three). Shortening from
+  // the end is for the words a recogniser tacks on that a person did not say.
+  const words = head.split(' ').filter(Boolean);
+  for (let len = words.length; len > 0; len--) {
+    const said = words.slice(0, len).join(' ');
+    const cmd = parseCommand(said);
+    if (cmd) return { woke: true, said, cmd, rest: [words.slice(len).join(' '), rest].filter(Boolean).join(' ') };
   }
-  return null;
+  return { woke: true, said: head, cmd: null, rest };
 }
 
 export function parseCommand(text) {
