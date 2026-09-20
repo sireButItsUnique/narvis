@@ -49,7 +49,12 @@ const MODES = [
   [/^(?:extrude|extruding|extrude mode|sculpt|sculpting|sculpt mode|clay|clay mode|start sculpting|add clay|build(?: it)? up)$/, 'extrude'],
   [/^(?:smooth|smoothing|smooth mode|smooth it(?: out)?|polish|melt)$/, 'smooth'],
   [/^(?:rotate|rotating|rotate mode|turn mode|spin mode|turntable)$/, 'rotate'],
-  [/^(?:move|move mode|grab mode|normal mode|object mode|done|done sculpting|stop sculpting|stop smoothing|exit (?:extrude|sculpt|smooth|rotate)(?: mode)?)$/, 'move'],
+  // "zoom" and "scale" name TOOLS now, because they are separate tools. "zoom in on the handle" is
+  // still framing a part (below) - that is a different request, and it keeps the word that has
+  // meant it since before there was a zoom tool.
+  [/^(?:zoom|zooming|zoom mode|closer|distance|distance mode|dolly)$/, 'zoom'],
+  [/^(?:scale|scaling|scale mode|size|size mode|resize|resize mode)$/, 'scale'],
+  [/^(?:move|move mode|grab mode|normal mode|object mode|done|done sculpting|stop sculpting|stop smoothing|exit (?:extrude|sculpt|smooth|rotate|zoom|scale)(?: mode)?)$/, 'move'],
 ];
 
 // Blender sculpt brushes by what people call them -> the brush's name in Blender's built-in library

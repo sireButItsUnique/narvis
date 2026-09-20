@@ -1,6 +1,8 @@
 // Hands (or the mouse) -> what you're pointing at, and what a pinch does in the current tool:
-//   move     pinch the model and carry it; pull it toward you to zoom in, push it away to zoom out
-//   rotate   pinch anywhere on it: drag across to turn it, pull toward you to make it bigger
+//   move     pinch the model and carry it about the picture (its depth is held)
+//   rotate   pinch anywhere on it and drag across to turn it on its own axis
+//   zoom     pull it toward you and it comes nearer, at the size it already is
+//   scale    pull it toward you and it gets bigger, where it already stands
 //   extrude  build clay up out of the surface (Clay Strips)
 //   smooth   melt what you built back into the form
 // The last two are the Blender brush engine (js/sculpt, through js/sculpting.js): pinch and drag to brush.
@@ -16,24 +18,26 @@ import { highlight } from './scene/highlight.js';
 import { updateViz } from './handviz.js';
 import * as sculpt from './sculpting.js';
 
-// Four tools, in the order they sit on the keys 1-4: move it, turn it, add clay, smooth it.
+// Six tools, in the order they sit on the keys 1-6: carry it, turn it, bring it nearer, make it
+// bigger, add clay, smooth it. One property each, and one number on the badge each - zoom and scale
+// used to share a pinch with move and rotate, which was quicker to reach and impossible to say out
+// loud, because "pull it toward you" meant nearer in one tool and bigger in another.
 // 'extrude' is the word people bring with them from box modelling for "pull material out of the
 // surface", and it brushes with Clay Strips (js/sculpting.js) because that is what building a form
-// up with your hand actually feels like. Per-part moves were the fifth and are gone: it was the
-// same pinch aimed at a smaller thing, and a demo has room for four.
-export const TOOLS = ['move', 'rotate', 'extrude', 'smooth'];
+// up with your hand actually feels like. Per-part moves are gone: the same pinch, aimed smaller.
+export const TOOLS = ['move', 'rotate', 'zoom', 'scale', 'extrude', 'smooth'];
 export const SCULPT_TOOLS = new Set(['extrude', 'smooth']);
 export const tool = { mode: 'move', brush: 4, mirror: false };   // brush: radius in cm. 4 cm is about a sixth
                                                                 // of a model fitted to this box: small enough to shape a
                                                                 // feature, big enough that one hand pass is visible.
 export const setBrush = r => (tool.brush = THREE.MathUtils.clamp(r, 0.5, 12));
 
-// Hand toward the screen -> object deeper; hand toward your chest -> object closer, which is the
-// zoom. Two means a comfortable 30 cm of arm covers 60 cm of the room, which is most of the box.
+// Zoom tool: hand toward your chest -> the model comes with it. Two means a comfortable 30 cm of
+// arm covers 60 cm of the room, which is most of the box.
 const PUSH_GAIN = 2.0;
 const TURN_GAIN = 1.5;          // two-hand turn
 const TURN_PER_CM = 6 * Math.PI / 180;   // one hand: turn per centimetre of hand travel across the model
-const SCALE_DOUBLE_CM = 20;     // one hand, rotate mode: pull it this far toward you and it doubles in size
+const SCALE_DOUBLE_CM = 20;     // scale tool: pull it this far toward you and it doubles in size
 const MIN_TURN_CM = 6;          // hands closer than this side to side (one above the other) can't steer a turn
 const HOVER_MS = 33;            // how often a pointer re-picks: hands arrive at about 30 Hz, and a pick over a
                                 // 200-400k-tri model costs 4.5-14 ms of the frame (a BVH lands with the M2 proxy)
@@ -57,7 +61,7 @@ export function zoomState() {
   return { distanceCm: input.eye.distanceTo(model.group.position), zCm: model.group.position.z,
            scale: model.userScale,
            atFront: !!action?.atFront, popout: !!S.popout,
-           dragging: action?.kind === 'grab' || action?.kind === 'turn' || action?.kind === 'two' };
+           dragging: !!action && action.kind !== 'stroke' };
 }
 
 // the part you're pointing at (or just were), for "delete that", "make that red", "duplicate that"
@@ -109,15 +113,20 @@ function startAction(p, target, now) {
                point0: target.point.clone() };
     return true;
   }
+  // One tool, one property, one number on the badge. A gesture that changed two things at once was
+  // quicker to reach and impossible to describe: "pull it toward you" meant nearer in one tool and
+  // bigger in another, and the only way to know which you had just done was to look at the model.
   if (tool.mode === 'rotate') {
-    // Turn the model on its own axis, one hand: drag across to spin the turntable, up and down to
-    // tip it toward you. Two hands still turn it as well - this is the one-handed way, and the way
-    // a mouse can do it at all.
-    beginEdit();
-    action = { ...base, kind: 'turn', rot0: model.rotY, scale0: model.userScale,
-               aim0: rayPoint(p, target.dist).clone() };
+    beginEdit();                                    // rotation is a property of the thing: undoable
+    action = { ...base, kind: 'turn', rot0: model.rotY, aim0: rayPoint(p, target.dist).clone() };
+  } else if (tool.mode === 'scale') {
+    beginEdit();                                    // so is size
+    action = { ...base, kind: 'scale', scale0: model.userScale };
+  } else if (tool.mode === 'zoom') {
+    // Where it stands is not what it is: no undo step. See model.beginMove().
+    beginMove();
+    action = { ...base, kind: 'zoom', startPos: root.position.clone() };
   } else {
-    // No undo step for a move: see model.beginMove(). Where it stands is not what it is.
     beginMove();
     action = { ...base, kind: 'grab', startPos: root.position.clone(), offset: root.position.clone().sub(rayPoint(p, target.dist)) };
   }
@@ -138,37 +147,45 @@ function updateAction(p) {
     return;
   }
   if (action.kind === 'turn') {
-    // A turntable: how far your hand travels across the model is how far it turns. TURN_PER_CM is
-    // set so a comfortable 20 cm sweep is most of a half turn, which is as much as anyone wants to
-    // do without letting go.
-    //
-    // The depth of the same pinch is SCALE, and that is the whole difference from zoom. Zoom leaves
-    // the model the size it is and brings it nearer: it covers more of your view, it passes the
-    // grid lines behind it, and it can come out through the glass. Scale changes how big the thing
-    // actually is: it stays exactly where it stands, the room behind it does not move, and a 10 cm
-    // teapot becomes a 20 cm teapot in the same room. Two questions, two axes, one hand each -
-    // "how close is it" in move, "how big is it" in rotate.
+    // A turntable, and nothing but: how far your hand travels ACROSS the model is how far it turns.
+    // TURN_PER_CM is set so a comfortable 20 cm sweep is most of a half turn, which is as much as
+    // anyone wants to do without letting go.
     const at = rayPoint(p, action.dist);
-    const scale = action.scale0 * Math.pow(2, (p.handZ - action.handZ0) / SCALE_DOUBLE_CM);
     setTransform({ rotY: action.rot0 + (at.x - action.aim0.x) * TURN_PER_CM,
-                   userScale: scale, position: root.position.clone() });
+                   userScale: model.userScale, position: root.position.clone() });
     p.end = at;
     return;
   }
-  if (action.kind === 'grab') {
-    // The depth axis of this gesture IS the zoom: move your hand toward your chest and the model
-    // comes with it, which makes it bigger the way bringing anything closer does. There is no other
-    // kind of zoom available here - the frustum is built from your eye and the screen corners, so
-    // there is no field of view to widen, and inventing one would stop the picture matching where
-    // your head is.
-    const t = action.dist + (action.handZ0 - p.handZ) * PUSH_GAIN;
-    const wanted = rayPoint(p, t).add(action.offset);
+  if (action.kind === 'scale') {
+    // How BIG the thing is. It does not move: the model stands where it stood, your distance to it
+    // is unchanged, the room and the grid squares behind it do not shift, and a 10 cm teapot
+    // becomes a 20 cm teapot in the same room. Pull it SCALE_DOUBLE_CM toward you and it doubles.
+    setTransform({ rotY: model.rotY, position: root.position.clone(),
+                   userScale: action.scale0 * Math.pow(2, (p.handZ - action.handZ0) / SCALE_DOUBLE_CM) });
+    return;
+  }
+  if (action.kind === 'zoom') {
+    // How NEAR it is. The model keeps the size it is and travels through the room toward you: it
+    // covers more of your view, it passes the grid squares behind it, and with pop-out on it comes
+    // out through the glass. This is the only zoom available - the frustum is built from your eye
+    // and the screen corners, so there is no field of view to widen, and inventing one would stop
+    // the picture matching where your head is. Sideways is locked, so a zoom cannot drift.
+    const wanted = action.startPos.clone();
+    wanted.z += (p.handZ - action.handZ0) * PUSH_GAIN;
     const zWanted = wanted.z;
     root.position.lerp(clampPosition(wanted), 0.5);
-    // Pulling it past the screen is what "zoom in" means, and popout is the setting that allows it.
-    // It is off by default and invisible, so a pull that runs into that wall reads as the model
-    // being stuck rather than as a setting: say so, once, with the key that changes it.
+    // Pop-out is what allows it past the screen. It is off by default and invisible, so a pull that
+    // runs into that wall reads as the model being stuck rather than as a setting: say so.
     action.atFront = zWanted > (S.popout ? 15 : -1) + 0.5;
+    p.end = root.position.clone();
+    return;
+  }
+  if (action.kind === 'grab') {
+    // Carry it about the picture. The depth is held where it was - bringing it nearer is zoom, and
+    // that is its own tool now, so a move can never quietly resize what you are looking at.
+    const wanted = rayPoint(p, action.dist).add(action.offset);
+    wanted.z = action.startPos.z;
+    root.position.lerp(clampPosition(wanted), 0.5);
     p.end = root.position.clone().sub(action.offset);
   }
 }
@@ -177,10 +194,9 @@ function updateAction(p) {
 function changed(a) {
   const moved = (p, q, eps) => p.distanceTo(q) > eps;
   if (a.kind === 'stroke') return !!a.moved;
-  if (a.kind === 'grab') return moved(a.root.position, a.startPos, 0.01);
-  // Turn AND scale live on this one gesture, so asking only about the rotation threw away the
-  // undo step for every resize done with one hand - the edit happened, the way back did not.
-  if (a.kind === 'turn') return Math.abs(model.rotY - a.rot0) > 1e-3 || Math.abs(model.userScale - a.scale0) > 1e-4;
+  if (a.kind === 'grab' || a.kind === 'zoom') return moved(a.root.position, a.startPos, 0.01);
+  if (a.kind === 'turn') return Math.abs(model.rotY - a.rot0) > 1e-3;
+  if (a.kind === 'scale') return Math.abs(model.userScale - a.scale0) > 1e-4;
   return moved(a.root.position, a.pos0, 0.01) || Math.abs(model.rotY - a.rot0) > 1e-3 || Math.abs(model.userScale - a.scale0) > 1e-3;
 }
 

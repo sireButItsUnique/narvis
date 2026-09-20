@@ -72,19 +72,22 @@ function begin() {
 
 // ---------- tool badge: what a pinch does right now ----------
 const TOOL_HINT = {
-  move: 'pinch it and pull toward you to zoom in, push away to zoom out · two hands: turn and resize',
-  rotate: 'pinch it: drag across to turn it, pull toward you to make it bigger',
+  move: 'pinch it and carry it about · its distance is held, so it cannot drift nearer',
+  rotate: 'pinch it and drag across to turn it on its own axis',
+  zoom: 'pinch it and pull toward you: it comes nearer at the size it is',
+  scale: 'pinch it and pull toward you: it gets bigger where it stands',
   extrude: 'pinch on the model and drag to build clay out of it',
   smooth: 'pinch on the model and drag to melt it smooth',
 };
 function showTool() {
   const brush = SCULPT_TOOLS.has(tool.mode);
   const name = tool.mode === 'smooth' ? 'Smooth' : sculpt.brushes.extrude;
-  // Distance in move (that is the zoom), size in rotate (that is the scale). Two different
-  // questions, and the badge answers whichever one this hand is currently able to change.
+  // One number per tool, and only for the tool that owns it: centimetres away belongs to zoom, and
+  // x size belongs to scale. Move used to show the distance too, which quietly suggested that
+  // carrying the model was a way of zooming - the exact confusion these two tools exist to end.
   const z = zoomState();
-  const readout = !z ? '' : tool.mode === 'move' ? ` · ${z.distanceCm.toFixed(0)} cm away`
-    : tool.mode === 'rotate' ? ` · ${z.scale.toFixed(2)}× size` : '';
+  const readout = !z ? '' : tool.mode === 'zoom' ? ` · ${z.distanceCm.toFixed(0)} cm away`
+    : tool.mode === 'scale' ? ` · ${z.scale.toFixed(2)}× size` : '';
   $('tool-name').textContent = tool.mode.toUpperCase() +
     (brush ? ` · ${name} ${tool.brush.toFixed(1)} cm${tool.mirror ? ' · mirror' : ''}` : '') +
     readout +
@@ -520,7 +523,7 @@ addEventListener('keydown', async e => {
   else if (k === 't') { S.talk = !S.talk; saveSettings(); if (!S.talk) speaker.stop(); flash(`Spoken replies ${S.talk ? 'on' : 'off'}`); }
   else if (k === 'l') { if (started) toggleLog(); }
   else if (k === 'k') { if (started) runCommand({ type: 'clay', on: !clayOn }); }
-  else if (k >= '1' && k <= '4') { if (started) setTool(TOOLS[+k - 1]); }
+  else if (k >= '1' && k <= '6') { if (started) setTool(TOOLS[+k - 1]); }
   else if (k === '[' || k === ']') { if (started) runCommand({ type: 'brush', factor: k === ']' ? 1.35 : 1 / 1.35 }); }
   else if (k === 'x') { if (started) runCommand({ type: 'mirror', on: !tool.mirror }); }
   else if (k === 'arrowleft' || k === 'arrowright') { if (started) { e.preventDefault(); runCommand({ type: 'turn', deg: k === 'arrowleft' ? -30 : 30 }); } }
