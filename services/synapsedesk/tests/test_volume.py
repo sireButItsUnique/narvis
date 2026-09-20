@@ -1,12 +1,16 @@
 """The rig, the working volume, and hands inside it."""
+import contextlib
+import http.client
 import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from laptop_hand_tracking.volume_hands import VolumeHands, PINCH_CLOSE_CM, PINCH_OPEN_CM, SETTLE_FRAMES
+from laptop_hand_tracking.volume_hands import (VolumeHands, PINCH_CLOSE_CM, PINCH_OPEN_CM,
+                                               SETTLE_FRAMES, SETTLE_MS)
 from laptop_hand_tracking.volume_simulator import packet as sim_packet
 from synapsedesk.contracts import (DEFAULT_HAND_FRAME, DEFAULT_RIG, DEFAULT_VOLUME, register_point,
                                    validate_eye, validate_hand_frame, validate_hands, validate_rig)
@@ -14,6 +18,31 @@ from synapsedesk.server import Server
 from synapsedesk.state import State
 
 VOL = dict(DEFAULT_VOLUME)
+
+
+@contextlib.contextmanager
+def own_server():
+    """A server of one's own, for tests that consume a shared bounded resource."""
+    with tempfile.TemporaryDirectory() as tmp:
+        state = State(tmp)
+        server = Server(0, state)
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .02}, daemon=True)
+        thread.start()
+        try:
+            yield server.server_port, state
+        finally:
+            state.stop.set()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+
+def open_stream(port):
+    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+    conn.request('GET', '/events')
+    response = conn.getresponse()
+    body = response.read() if response.status != 200 else b''
+    return response.status, body, conn
 
 
 def hand(thumb, index, label="right"):
@@ -90,11 +119,13 @@ class VolumeGateTests(unittest.TestCase):
 
     def test_pinch_needs_settling_then_holds_with_hysteresis(self):
         g = self.gate()
-        closed, open_ = [0, -13, 0], [PINCH_CLOSE_CM + 1, -13, 0]
-        for i in range(SETTLE_FRAMES - 1):
-            snap = g.ingest(frame([hand(closed, closed)]), now=10 + i * .03)
-            self.assertFalse(snap["hands"][0]["pinch"], "must not grab before it has settled")
-        snap = g.ingest(frame([hand(closed, closed)]), now=10.1)
+        closed = [0, -13, 0]
+        # Settling is a DURATION: three frames arriving in 20 ms is a tracker having a fast moment, not a
+        # hand that has held still, so it must not arm yet.
+        for i in range(SETTLE_FRAMES):
+            snap = g.ingest(frame([hand(closed, closed)]), now=10 + i * .01)
+            self.assertFalse(snap["hands"][0]["pinch"], "must not grab before SETTLE_MS has passed")
+        snap = g.ingest(frame([hand(closed, closed)]), now=10 + SETTLE_MS / 1000 + .02)
         self.assertTrue(snap["hands"][0]["pinch"])
         # Between the two thresholds the pinch HOLDS rather than chattering.
         between = [(PINCH_CLOSE_CM + PINCH_OPEN_CM) / 2, -13, 0]
@@ -105,13 +136,61 @@ class VolumeGateTests(unittest.TestCase):
     def test_a_silence_disarms_instead_of_resuming_mid_grab(self):
         g = self.gate()
         closed = [0, -13, 0]
-        for i in range(4):
-            g.ingest(frame([hand(closed, closed)]), now=10 + i * .03)
-        self.assertTrue(g.snapshot(now=10.12)["enabled"])
+        for i in range(6):
+            g.ingest(frame([hand(closed, closed)]), now=10 + i * .04)
+        self.assertTrue(g.snapshot(now=10.22)["enabled"])
         self.assertFalse(g.snapshot(now=11)["enabled"], "a stale hand must not keep its grip")
         again = g.ingest(frame([hand(closed, closed)]), now=11.01)
         self.assertEqual(again["reason"], "acquiring")
         self.assertFalse(again["hands"][0]["pinch"])
+
+    def test_two_unlabelled_hands_do_not_collide(self):
+        """The contract defaults a missing label to "unknown" and permits two of them.
+
+        Every per-hand dict here was keyed by that label, so the second unlabelled hand overwrote the
+        first: a pinching hand's state was replaced by an open one's, and two-handed gestures could never
+        arm for any tracker that does not label its hands.
+        """
+        g = self.gate()
+        closed, open_ = [-5, -13, 0], [12, -13, 0]
+        packet = dict(version=1, age_ms=0, simulated=True, hands=[
+            dict(thumb_tip=closed, index_tip=closed),        # pinching
+            dict(thumb_tip=[5, -13, 0], index_tip=open_)])   # open
+        for i in range(6):
+            snap = g.ingest(packet, now=10 + i * .04)
+        labels = [h["label"] for h in snap["hands"]]
+        self.assertEqual(sorted(labels), ["left", "right"], "two hands must get two slots")
+        self.assertTrue(snap["labels_inferred"], "and it must admit the labels were inferred")
+        pinches = {h["label"]: h["pinch"] for h in snap["hands"]}
+        self.assertTrue(pinches["left"], "the pinching hand is the left one, by x")
+        self.assertFalse(pinches["right"], "and the open one must not inherit its state")
+
+    def test_explicit_labels_are_believed_and_not_reordered(self):
+        g = self.gate()
+        packet = dict(version=1, age_ms=0, simulated=True, hands=[
+            dict(label="left", thumb_tip=[6, -13, 0], index_tip=[6, -13, 0]),
+            dict(label="right", thumb_tip=[-6, -13, 0], index_tip=[-6, -13, 0])])
+        for i in range(6):
+            snap = g.ingest(packet, now=10 + i * .04)
+        self.assertFalse(snap["labels_inferred"])
+        self.assertEqual([h["label"] for h in snap["hands"]], ["left", "right"],
+                         "a tracker that labels its hands is believed, even if they have crossed")
+
+    def test_the_cursor_is_the_midpoint_not_the_index_tip(self):
+        """Closing a pinch swings the index a centimetre toward the thumb.
+
+        An index-tip cursor therefore lurches sideways at the exact moment a gesture starts, which is the
+        moment it must not move. The midpoint of the two barely shifts.
+        """
+        g = self.gate()
+        open_hand = hand([-3, -13, 0], [1, -13, 0])
+        snap = g.ingest(frame([open_hand]), now=10)
+        self.assertEqual(snap["hands"][0]["anchor_cm"], [-1, -13, 0])
+        # Now the fingers close onto the thumb: the index moved 4 cm, the anchor only 2.
+        closed = hand([-3, -13, 0], [-3, -13, 0])
+        snap = g.ingest(frame([closed]), now=10.04)
+        self.assertEqual(snap["hands"][0]["anchor_cm"], [-3, -13, 0])
+        self.assertEqual(snap["hands"][0]["index_tip_cm"], [-3, -13, 0])
 
     def test_a_hand_outside_the_slab_is_seen_but_disarmed(self):
         g = self.gate()
@@ -143,11 +222,11 @@ class VolumeGateTests(unittest.TestCase):
     def test_a_pinch_that_starts_on_nothing_releases_on_its_own(self):
         g = self.gate()
         # Pinch, hold, then open: the gate must report the release, not stay latched.
-        for i in range(4):
-            g.ingest(sim_packet(2.5, VOL), now=10 + i * .03)
-        self.assertTrue(g.snapshot(now=10.12)["hands"][0]["pinch"])
-        for i in range(4):
-            snap = g.ingest(sim_packet(0.5, VOL), now=10.15 + i * .03)
+        for i in range(6):
+            g.ingest(sim_packet(2.5, VOL), now=10 + i * .04)
+        self.assertTrue(g.snapshot(now=10.22)["hands"][0]["pinch"])
+        for i in range(6):
+            snap = g.ingest(sim_packet(0.5, VOL), now=10.25 + i * .04)
         self.assertFalse(snap["hands"][0]["pinch"], "opening the hand must end the pinch")
 
     def test_the_simulator_drives_the_gate_it_will_face(self):
@@ -223,8 +302,9 @@ class VolumeHTTPTests(unittest.TestCase):
         self.post('/api/hand-frame', dict(version=1, units="m", axes=["x", "y", "-z"], offset=[0, -13, 0]))
         self.assertEqual(self.get('/api/hand-frame')['units'], 'm')
         # ...then post raw tracker numbers, at whatever rate you track at.
-        for _ in range(4):
+        for _ in range(8):
             self.post('/api/hands', frame([hand([0.02, 0.01, 0.03], [0.025, 0.01, 0.03])], age_ms=5))
+            time.sleep(.02)
         state = self.get('/api/state')['hands']
         self.assertTrue(state['enabled'])
         got = state['hands'][0]
@@ -258,6 +338,43 @@ class VolumeHTTPTests(unittest.TestCase):
             with self.assertRaises(HTTPError) as error:
                 self.post(path, bad)
             self.assertEqual(error.exception.code, 400, path)
+
+    def test_the_three_rig_views_can_all_hold_a_stream_at_once(self):
+        """Editor, projector display and hologram is three streams before anything has gone wrong.
+
+        The cap was four, and a browser that navigates away can hold its slot until the kernel notices,
+        so the fourth client was refused and — because nothing surfaced the refusal — simply looked frozen.
+
+        Its own server: stream slots are a shared, slow-to-release resource, so a test that counts them
+        cannot share one with a test that deliberately exhausts them.
+        """
+        with own_server() as (port, _):
+            held = []
+            try:
+                for i in range(3):
+                    status, _body, conn = open_stream(port)
+                    self.assertEqual(status, 200, f'stream {i + 1} of 3 was refused')
+                    held.append(conn)
+            finally:
+                for conn in held:
+                    conn.close()
+
+    def test_a_refused_stream_says_what_to_do_about_it(self):
+        with own_server() as (port, _):
+            held, refused = [], None
+            try:
+                for _ in range(12):
+                    status, body, conn = open_stream(port)
+                    if status == 503:
+                        refused = json.loads(body)
+                        break
+                    held.append(conn)
+                self.assertIsNotNone(refused, 'the cap must eventually refuse rather than accept forever')
+                self.assertIn('close a browser tab', refused['error'],
+                              'a refusal has to tell you what to do about it')
+            finally:
+                for conn in held:
+                    conn.close()
 
     def test_demo_mode_refuses_a_real_tracker(self):
         with tempfile.TemporaryDirectory() as tmp:

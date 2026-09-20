@@ -2,8 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {toRig, fromRig, cardQuad, levelDepth, rayThrough, rayCard, pick, eyeState, cardSize,
         EYE_MAX_AGE_MS, DEFAULT_VOLUME, DEFAULT_RIG_SPEC, panelCm, ghostOffsetMm, fitSlab,
-        rigFromSpec, panelRectOnCanvas, onPanel, LEVEL_STEP, touch, aim,
-        TOUCH_CM} from '../web_ar_canvas/public/volume.mjs';
+        rigFromSpec, panelRectOnCanvas, onPanel, LEVEL_STEP, touch, aim, TOUCH_CM,
+        packLevel, fitZoom, boardToRig, rigToBoard, clampView, withinSlab, anyIntersecting,
+        prismCorners, facesToward, farthestFirst, PACK} from '../web_ar_canvas/public/volume.mjs';
 import {makeRig, rigCamera, projectToMonitor, rigCheck, DEFAULT_EYE} from '../web_ar_canvas/public/rig-geometry.mjs';
 
 const VOLUME = DEFAULT_VOLUME;
@@ -254,4 +255,87 @@ test('touch prefers the nearest card when several are in reach', () => {
   const far = {id: 'far', centre: [0, -13, 3.5], widthCm: 4, heightCm: 2};
   assert.equal(touch([0, -13, 1.6], [far, near]).id, 'near');
   assert.equal(touch([0, -13, 3.4], [near, far]).id, 'far');
+});
+
+const level = (n, kind) => Array.from({length: n}, (_, i) => ({id: 'n' + i, kind}));
+const laid = (nodes, view) => {
+  const packed = packLevel(VOLUME, nodes);
+  const zoom = view?.zoom ?? fitZoom(VOLUME, packed.board);
+  const v = {panX: 0, panY: 0, ...view, zoom};
+  return packed.placed.map((p) => ({...p, centre: boardToRig(VOLUME, p.board, v, .65),
+    widthCm: p.widthCm * zoom, heightCm: p.heightCm * zoom, depthCm: p.depthCm * zoom}));
+};
+
+test('no level ever lays two prisms on top of each other', () => {
+  // The bug this replaces: nine 6.2 cm folders were laid out on a 5.35 cm pitch, because the pitch came
+  // from a fixed fraction of the slab instead of from the card size.
+  for (const kind of ['folder', 'file', 'function', 'external'])
+    for (const n of [1, 2, 3, 5, 9, 12, 27, 60, 120]) {
+      const clash = anyIntersecting(laid(level(n, kind)));
+      assert.equal(clash, null, `${n} ${kind}: ${clash && clash.join(' overlaps ')}`);
+    }
+});
+
+test('the pitch carries the box depth, or lids cover the row above', () => {
+  const packed = packLevel(VOLUME, level(9, 'folder'));
+  const [, h, d] = cardSize('folder');
+  assert.ok(packed.cell[1] >= h + d, `vertical pitch ${packed.cell[1]} must clear height+depth ${h + d}`);
+  assert.ok(packed.cell[0] >= cardSize('folder')[0], 'horizontal pitch must clear the width');
+});
+
+test('zoom-to-fit shows the whole level rather than truncating it', () => {
+  for (const n of [1, 9, 27, 60]) {
+    const placed = laid(level(n, 'function'));
+    assert.equal(placed.length, n, 'every node is placed');
+    const visible = placed.filter((p) => withinSlab(VOLUME, p.centre, [p.widthCm, p.heightCm])).length;
+    assert.equal(visible, n, `${n} nodes: only ${visible} landed inside the slab`);
+  }
+});
+
+test('a board bigger than the slab is reached by panning, not by shrinking to nothing', () => {
+  const packed = packLevel(VOLUME, level(400, 'function'));
+  const zoom = fitZoom(VOLUME, packed.board);
+  assert.equal(zoom, PACK.minZoom, 'a huge level stops shrinking at the floor');
+  // At the floor it no longer all fits, which is exactly when panning has to work.
+  const placed = laid(level(400, 'function'), {zoom});
+  const visible = placed.filter((p) => withinSlab(VOLUME, p.centre, [p.widthCm, p.heightCm])).length;
+  assert.ok(visible < 400 && visible > 0, `expected a partial view, got ${visible}`);
+  const panned = laid(level(400, 'function'), {zoom, panX: 30});
+  assert.notDeepEqual(panned[0].centre, placed[0].centre, 'panning must move the board');
+});
+
+test('panning is clamped so the board cannot be lost off the edge', () => {
+  const packed = packLevel(VOLUME, level(9, 'folder'));
+  const far = clampView(VOLUME, packed.board, {panX: 1e6, panY: -1e6, zoom: 1});
+  assert.ok(Number.isFinite(far.panX) && Math.abs(far.panX) < 1e5, 'pan is bounded');
+  assert.ok(far.zoom >= PACK.minZoom && far.zoom <= PACK.maxZoom);
+  assert.equal(clampView(VOLUME, packed.board, {zoom: 99}).zoom, PACK.maxZoom);
+  assert.equal(clampView(VOLUME, packed.board, {zoom: 0.001}).zoom, PACK.minZoom);
+});
+
+test('board and rig coordinates are exact inverses, so a drag lands where it was let go', () => {
+  const view = {panX: 2.5, panY: -1.25, zoom: .73};
+  for (const point of [[0, 0], [5, -3], [-11.5, 8.25]]) {
+    const back = rigToBoard(VOLUME, boardToRig(VOLUME, point, view, .65), view);
+    assert.ok(Math.abs(back[0] - point[0]) < 1e-9 && Math.abs(back[1] - point[1]) < 1e-9);
+  }
+});
+
+test('a prism shows only the faces turned toward the eye', () => {
+  const centre = [0, -13, 1.5];
+  assert.equal(prismCorners(centre, 6, 2, 1.5).length, 8);
+  const seated = facesToward(centre, [0, 42, 44]).map((f) => f.name);
+  assert.ok(seated.includes('front') && seated.includes('top'), 'looking down at it: front and top');
+  assert.ok(!seated.includes('back') && !seated.includes('bottom'), 'never the far side');
+  assert.ok(facesToward(centre, [-40, 20, 20]).map((f) => f.name).includes('left'),
+            'stepping left reveals the left side, which is what makes it read as solid');
+  assert.ok(facesToward(centre, [40, 20, 20]).map((f) => f.name).includes('right'));
+});
+
+test('solid boxes are drawn far to near, or the near ones vanish behind the far ones', () => {
+  const eye = [0, 42, 44];
+  const items = [{id: 'near', centre: [0, -13, 4]}, {id: 'far', centre: [0, -13, -4]},
+                 {id: 'mid', centre: [0, -13, 0]}];
+  assert.deepEqual(farthestFirst(items, eye).map((i) => i.id), ['far', 'mid', 'near']);
+  assert.deepEqual(farthestFirst([], eye), []);
 });

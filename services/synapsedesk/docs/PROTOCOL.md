@@ -7,7 +7,7 @@ All traffic stays on `127.0.0.1:8770`. The port is 8770 rather than 8765 so this
 | `/api/health` | GET | Process readiness; camera/model readiness is separate |
 | `/api/session` | GET | `{token, demo}` |
 | `/api/state` | GET | `{tracking, spatial, revision, job, demo}` |
-| `/events` | GET | SSE `event: state`, same state payload at 30 Hz; maximum four streams |
+| `/events` | GET | SSE `event: state`, same state payload at 30 Hz; maximum eight streams |
 | `/api/graph` | GET | `{revision, graph: {version:1, nodes, edges, findings, meta}}` |
 | `/api/analyze` | POST | `{source: "C:\\projects\\repo"}` or an HTTPS git URL; one job at a time |
 | `/api/tracking` | POST | Camera packet below; rejected in demo mode |

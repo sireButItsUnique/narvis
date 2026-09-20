@@ -14,8 +14,11 @@
 
 // Card sizes in centimetres of floating image. The slab is only ~33 x 10 cm, so these are what decide
 // how many cards a level can show at all: about nine. That is the constraint the drill-down exists for.
-export const CARD_CM = { folder: [6.2, 2.1], file: [5.9, 1.9], class: [5.4, 1.8],
-                         function: [5.4, 1.8], elsewhere: [5.0, 1.6], external: [4.6, 1.5] };
+// Width, height, DEPTH in centimetres. They are rectangular prisms, not cards: a flat quad in a
+// head-tracked volume reads as a picture of a rectangle, because the cue that says "solid" is watching its
+// sides change as you move. Depth also gives a crowded level somewhere to stack.
+export const CARD_CM = { folder: [6.2, 2.1, 1.5], file: [5.9, 1.9, 1.3], class: [5.4, 1.8, 1.1],
+                         function: [5.4, 1.8, 1.1], elsewhere: [5.0, 1.6, 0.9], external: [4.6, 1.5, 0.8] };
 export const DEFAULT_VOLUME = { version: 1, width_cm: 21.1, depth_cm: 10.0, height_cm: 11.9 };
 export const DEFAULT_RIG_SPEC = { version: 1, panel_diagonal_in: 27, panel_aspect_w: 16, panel_aspect_h: 9,
   sheet_width_cm: 60.96, sheet_depth_cm: 34.29, sheet_thickness_mm: 2.03,
@@ -96,6 +99,7 @@ export function fitSlab(rig, eye, project, { margin = 0.96, step = 0.5, max = 12
   return { version: 1, ...best };
 }
 export const cardSize = (kind) => CARD_CM[kind] || CARD_CM.function;
+export const cardFace = (kind) => cardSize(kind).slice(0, 2);
 
 // Where each level sits through the depth of the slab. The level you are on is forward and the ones you
 // came through recede behind it, so the way down is visible as depth instead of remembered.
@@ -124,6 +128,38 @@ export function fromRig(volume, point, anchor = [0, -13, 0]) {
           z: (point[2] - anchor[2]) / volume.depth_cm + .5};
 }
 
+// ---- prisms -----------------------------------------------------------------------------------
+// Eight corners: 0-3 the front face (toward the viewer) from top-left clockwise, 4-7 the back face.
+export function prismCorners(centre, widthCm, heightCm, depthCm) {
+  const [x, y, z] = centre, hw = widthCm / 2, hh = heightCm / 2, hd = depthCm / 2;
+  return [[x - hw, y + hh, z + hd], [x + hw, y + hh, z + hd], [x + hw, y - hh, z + hd], [x - hw, y - hh, z + hd],
+          [x - hw, y + hh, z - hd], [x + hw, y + hh, z - hd], [x + hw, y - hh, z - hd], [x - hw, y - hh, z - hd]];
+}
+
+export const PRISM_FACES = [
+  {name: 'front',  corners: [0, 1, 2, 3], normal: [0, 0, 1]},
+  {name: 'back',   corners: [5, 4, 7, 6], normal: [0, 0, -1]},
+  {name: 'top',    corners: [4, 5, 1, 0], normal: [0, 1, 0]},
+  {name: 'bottom', corners: [3, 2, 6, 7], normal: [0, -1, 0]},
+  {name: 'left',   corners: [4, 0, 3, 7], normal: [-1, 0, 0]},
+  {name: 'right',  corners: [1, 5, 6, 2], normal: [1, 0, 0]},
+];
+
+// Only the faces turned toward the eye. Drawing all six lays the back face's outline across the front one
+// and the box reads as a wireframe instead of something solid.
+export function facesToward(centre, eyeCm) {
+  return PRISM_FACES.filter((face) => {
+    const toEye = [eyeCm[0] - centre[0], eyeCm[1] - centre[1], eyeCm[2] - centre[2]];
+    return face.normal[0] * toEye[0] + face.normal[1] * toEye[1] + face.normal[2] * toEye[2] > 0;
+  });
+}
+
+// Painter's algorithm: solid boxes occlude each other, so the far ones are drawn first.
+export function farthestFirst(items, eyeCm) {
+  const d = (p) => Math.hypot(p[0] - eyeCm[0], p[1] - eyeCm[1], p[2] - eyeCm[2]);
+  return [...items].sort((a, b) => d(b.centre) - d(a.centre));
+}
+
 // A card stands upright facing the viewer: a quad in the rig's X-Y plane at one depth.
 export function cardQuad(centre, widthCm, heightCm) {
   const hw = widthCm / 2, hh = heightCm / 2;
@@ -145,6 +181,99 @@ export function panelRectOnCanvas(canvasW, canvasH, panelW, panelH) {
 }
 
 export const onPanel = (rect, u, v) => [rect.x + u * rect.w, rect.y + v * rect.h];
+
+// ---- packing a level onto a board ---------------------------------------------------------------
+// The old layout spread nodes across a FIXED fraction of the slab whatever size they were, so nine folder
+// cards 6.2 cm wide were laid out on a 5.35 cm pitch and overlapped in three dimensions before the
+// projection got near them. The pitch has to come from the card size.
+//
+// A level is laid out on a BOARD at its natural size, and the slab is a window onto that board. When a
+// level has more on it than the slab can show, the answer is to move the window — which is what pan and
+// zoom are for — rather than to shrink everything until it cannot be read, or to hide the remainder
+// behind an apology. A board that fits is simply shown whole.
+export const PACK = {gapCm: 1.6, minZoom: 0.35, maxZoom: 2.4};
+
+export function packLevel(volume, nodes, sizeOf = cardSize, options = {}) {
+  const {gapCm} = {...PACK, ...options};
+  if (!nodes.length) return {placed: [], board: [0, 0], grid: {columns: 0, rows: 0}};
+  // One pitch for the whole level, taken from its largest member, so no two cells can intersect.
+  const largest = nodes.reduce((big, n) => {
+    const s = sizeOf(n.kind);
+    return [Math.max(big[0], s[0]), Math.max(big[1], s[1]), Math.max(big[2], s[2])];
+  }, [0, 0, 0]);
+  // The vertical pitch has to carry the box DEPTH as well as its height. The viewer looks down at the
+  // slab, so a prism's top face projects upward: without this, a box in one row draws its lid across the
+  // bottom of the box above it. Correct occlusion, unreadable result.
+  const cell = [largest[0] + gapCm, largest[1] + largest[2] + gapCm];
+  // Choose a column count whose board is shaped roughly like the slab, so zooming to fit wastes neither
+  // axis: a tall thin board in a wide slab leaves the sides empty and reads as small.
+  const aspect = (volume.width_cm / cell[0]) / (volume.height_cm / cell[1]);
+  const columns = Math.max(1, Math.min(nodes.length, Math.round(Math.sqrt(nodes.length * aspect)) || 1));
+  const rows = Math.ceil(nodes.length / columns);
+  const board = [columns * cell[0], rows * cell[1]];
+  const placed = nodes.map((node, i) => {
+    const row = Math.floor(i / columns), column = i % columns;
+    const [w, h, d] = sizeOf(node.kind);
+    return {...node, widthCm: w, heightCm: h, depthCm: d,
+            board: [(column - (columns - 1) / 2) * cell[0], (row - (rows - 1) / 2) * cell[1]]};
+  });
+  return {placed, board, grid: {columns, rows}, cell};
+}
+
+// The zoom at which a whole board just fits the slab, so a level opens showing everything it has.
+export function fitZoom(volume, board, options = {}) {
+  const {minZoom, maxZoom} = {...PACK, ...options};
+  if (!(board[0] > 0) || !(board[1] > 0)) return 1;
+  return Math.max(minZoom, Math.min(maxZoom, Math.min(volume.width_cm / board[0], volume.height_cm / board[1])));
+}
+
+export const IDENTITY_VIEW = {panX: 0, panY: 0, zoom: 1};
+
+// Board centimetres -> rig centimetres, through the pan/zoom window.
+export function boardToRig(volume, boardPoint, view, depthNorm, anchor = [0, -13, 0]) {
+  const {panX, panY, zoom} = {...IDENTITY_VIEW, ...view};
+  return [anchor[0] + (boardPoint[0] + panX) * zoom,
+          anchor[1] - (boardPoint[1] + panY) * zoom,
+          anchor[2] + (depthNorm - .5) * volume.depth_cm];
+}
+
+// Rig centimetres -> board centimetres: the inverse, so a prism dragged in space knows where it now
+// sits ON THE BOARD, not merely where it sits in the slab the board is being viewed through.
+export function rigToBoard(volume, rigPoint, view, anchor = [0, -13, 0]) {
+  const {panX, panY, zoom} = {...IDENTITY_VIEW, ...view};
+  const z = zoom || 1;
+  return [(rigPoint[0] - anchor[0]) / z - panX, -((rigPoint[1] - anchor[1]) / z) - panY];
+}
+
+// Keep the board from being dragged off into nothing: at least a quarter of it stays in the slab.
+export function clampView(volume, board, view) {
+  const {panX, panY, zoom} = {...IDENTITY_VIEW, ...view};
+  const z = Math.max(PACK.minZoom, Math.min(PACK.maxZoom, zoom));
+  const limitX = Math.max(0, (board[0] * z - volume.width_cm) / 2) / z + volume.width_cm / (2 * z);
+  const limitY = Math.max(0, (board[1] * z - volume.height_cm) / 2) / z + volume.height_cm / (2 * z);
+  return {zoom: z,
+          panX: Math.max(-limitX, Math.min(limitX, panX)),
+          panY: Math.max(-limitY, Math.min(limitY, panY))};
+}
+
+// Is a placed prism inside the slab at all? Things scrolled off the board are not drawn.
+export function withinSlab(volume, centre, size, anchor = [0, -13, 0], margin = 1) {
+  return Math.abs(centre[0] - anchor[0]) <= volume.width_cm / 2 + size[0] / 2 + margin &&
+         Math.abs(centre[1] - anchor[1]) <= volume.height_cm / 2 + size[1] / 2 + margin;
+}
+
+// Do any two placed prisms intersect? Nothing should ever be able to answer yes.
+export function anyIntersecting(placed) {
+  for (let i = 0; i < placed.length; i++) {
+    for (let j = i + 1; j < placed.length; j++) {
+      const a = placed[i], b = placed[j];
+      if (Math.abs(a.centre[0] - b.centre[0]) < (a.widthCm + b.widthCm) / 2 &&
+          Math.abs(a.centre[1] - b.centre[1]) < (a.heightCm + b.heightCm) / 2 &&
+          Math.abs(a.centre[2] - b.centre[2]) < (a.depthCm + b.depthCm) / 2) return [a.id, b.id];
+    }
+  }
+  return null;
+}
 
 // ---- pointing -------------------------------------------------------------------------------
 // In a Pepper's ghost the eye position is already tracked, so a ray from the eye through the fingertip
@@ -188,9 +317,12 @@ export const TOUCH_CM = 3.2;
 export function touch(fingertipCm, cards, reach = TOUCH_CM) {
   let best = null;
   for (const card of cards) {
+    // Distance to the BOX, on every axis. Z used to be measured to the centre plane while X and Y were
+    // measured to the faces, which was right for flat quads and biases picking by up to half a prism's
+    // depth now that they are solid — on the noisiest axis of the three.
     const dx = Math.max(0, Math.abs(fingertipCm[0] - card.centre[0]) - card.widthCm / 2);
     const dy = Math.max(0, Math.abs(fingertipCm[1] - card.centre[1]) - card.heightCm / 2);
-    const dz = Math.abs(fingertipCm[2] - card.centre[2]);
+    const dz = Math.max(0, Math.abs(fingertipCm[2] - card.centre[2]) - (card.depthCm || 0) / 2);
     const distance = Math.hypot(dx, dy, dz);
     if (distance <= reach && (!best || distance < best.distance))
       best = {id: card.id, card, distance, point: fingertipCm.slice(), how: 'touch'};

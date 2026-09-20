@@ -24,8 +24,24 @@ THUMB_TIP, INDEX_TIP = 4, 8
 LEVEL_FRONT = 0.65
 
 
+def _hand(tip, pinching, label):
+    points = [[tip[0] + dx, tip[1] + dy, tip[2] + dz] for dx, dy, dz in HAND_CM]
+    if label == "left":
+        points = [[2 * tip[0] - p[0], p[1], p[2]] for p in points]   # mirror about the fingertip
+    if pinching:
+        # Closing the pinch moves the THUMB to the index tip, never the other way round: the cursor is the
+        # index fingertip and it must not jump sideways at the moment the gesture starts.
+        points[THUMB_TIP] = list(points[INDEX_TIP])
+    return dict(label=label, landmarks_cm=points)
+
+
 def packet(elapsed, volume, anchor=(0., -13., 0.), fault="none"):
-    """One frame of a hand wandering the slab, pinching for two seconds in every six."""
+    """One or two hands working the slab.
+
+    The cycle deliberately exercises every branch of the gesture machine: one hand touching and pinching,
+    then both hands pinching and drawing apart, which is the only gesture that can zoom. A simulator that
+    only ever shows one hand cannot tell you whether the two-handed path works.
+    """
     w, h, d = volume["width_cm"], volume["height_cm"], volume["depth_cm"]
     # Sweep the plane the current level actually occupies (LEVEL_FRONT in volume.mjs), not the whole slab:
     # a hand wandering in free space never comes within touching distance of a card, so a demo built on
@@ -35,15 +51,18 @@ def packet(elapsed, volume, anchor=(0., -13., 0.), fault="none"):
            anchor[2] + (LEVEL_FRONT - .5) * d + 1.2 * math.sin(elapsed * .9)]
     if fault == "boundary":
         tip[0] = anchor[0] + w * 3
-    points = [[tip[0] + dx, tip[1] + dy, tip[2] + dz] for dx, dy, dz in HAND_CM]
-    pinching = int(elapsed) % 6 in (2, 3)
-    if pinching:
-        # Closing the pinch moves the THUMB to the index tip, never the other way round: the cursor is the
-        # index fingertip and it must not jump sideways at the moment the gesture starts.
-        points[THUMB_TIP] = list(points[INDEX_TIP])
+    phase = elapsed % 18.0
+    two_handed = 11.0 <= phase < 16.0
+    if two_handed:
+        # Both hands close, then draw apart: the span grows, which is a zoom.
+        spread = 5.0 + 4.5 * (phase - 11.0) / 5.0
+        right_tip = [tip[0] + spread, tip[1], tip[2]]
+        left_tip = [tip[0] - spread, tip[1], tip[2]]
+        hands = [_hand(right_tip, True, "right"), _hand(left_tip, True, "left")]
+    else:
+        hands = [_hand(tip, int(elapsed) % 6 in (2, 3), "right")]
     return dict(version=1, frame="rig_cm", age_ms=400. if fault == "stale" else 0.,
-                simulated=True,
-                hands=[] if fault == "lost" else [dict(label="right", landmarks_cm=points)])
+                simulated=True, hands=[] if fault == "lost" else hands)
 
 
 def head(elapsed, fault="none"):

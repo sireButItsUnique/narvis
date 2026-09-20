@@ -27,7 +27,11 @@ class Server(ThreadingHTTPServer):
     def __init__(self, port, state):
         self.state = state
         self.clients = threading.BoundedSemaphore(24)
-        self.streams = threading.BoundedSemaphore(4)
+        # Four was too tight once the rig arrived: the editor, the projector display and the hologram are
+        # three streams before anything goes wrong, and a browser that navigates away can hold its slot
+        # until the kernel notices the peer is gone. A refused client then looks frozen rather than
+        # refused, so the cap is generous and the refusal is explicit.
+        self.streams = threading.BoundedSemaphore(8)
         super().__init__(("127.0.0.1",port),Handler)
 
     def process_request(self, request, client_address):
@@ -175,7 +179,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def events(self):
         if not self.server.streams.acquire(blocking=False):
-            self.json({"error":"too many projection clients"},503)
+            self.json({"error":"too many projection clients; close a browser tab and this one will reconnect"},503)
             return
         try:
             self.headers_out(200,"text/event-stream")
