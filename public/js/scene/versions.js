@@ -2,6 +2,7 @@
 // Restoring opens that version's .blend in the hidden Blender, which exports it as a new rev; the page then
 // loads it like any other scene change.
 import { work, startJob, endJob, log, setStatus } from './build.js';
+import { quip } from '../narvis.js';
 
 const $ = id => document.getElementById(id);
 
@@ -66,7 +67,7 @@ export async function restoreVersion(which) {
     const text = `Back to version ${r.version.n}${r.version.prompt ? ` (${r.version.prompt})` : ''}`;
     log(text + (r.checkpoint ? `. What you had is kept as version ${r.checkpoint.n}.` : ''), 'done');
     hooks.flash(text, 3500);
-    hooks.say(`Back to version ${r.version.n}.`);
+    hooks.say(quip('restore_version'));
   } catch (err) {
     log(err.message, 'error');
     hooks.flash(err.message, 5000);
@@ -90,7 +91,7 @@ export async function saveVersion(label) {
     if (!r.ok) throw new Error(r.message || r.error || `couldn't save (${res.status})`);
     log(`Saved as version ${r.version.n}${label ? `: ${label}` : ''}`, 'saved');
     hooks.flash(`Saved version ${r.version.n}`);
-    hooks.say(`Saved version ${r.version.n}.`);
+    hooks.say(quip('save_version'));
   } catch (err) {
     log(err.message, 'error');
     hooks.flash(err.message, 5000);

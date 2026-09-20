@@ -1,7 +1,7 @@
 // "make ___" / "make it ___": Claude Fable builds in the hidden Blender and progress streams back as
 // server-sent events. When a build ends, the server has exported the new scene, so the page reloads it.
 // Also the activity log on the right, which versions.js writes to as well.
-import { speakable } from '../speak.js';
+import { quip } from '../narvis.js';
 
 const $ = id => document.getElementById(id);
 
@@ -149,7 +149,8 @@ function onEvent(ev) {
     case 'done':
       setStatus('');
       log(ev.summary, 'done');
-      hooks.say(speakable(ev.summary) || 'Done.');
+      // The summary is on screen and it is accurate; the voice is a personality, not a narrator.
+      hooks.say(quip('done'));
       hooks.flash('Done', 2500);
       hooks.reload();
       return true;
@@ -164,7 +165,7 @@ function onEvent(ev) {
     case 'error':
       setStatus('');
       log(ev.message, 'error');
-      hooks.say("That didn't work. The reason is on screen.");
+      hooks.say(quip('failed'));   // the one moment it is sincere: see narvis.js
       hooks.flash(ev.message, 6000);
       return false;
   }

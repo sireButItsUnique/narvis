@@ -1,6 +1,6 @@
 // Hands (or the mouse) -> what you're pointing at, and what a pinch does in the current tool:
-//   move     pinch the model and drag it; push toward the screen to send it deeper
-//   rotate   pinch anywhere on it and drag across to turn it on its own axis
+//   move     pinch the model and carry it; pull it toward you to zoom in, push it away to zoom out
+//   rotate   pinch anywhere on it: drag across to turn it, pull toward you to make it bigger
 //   extrude  build clay up out of the surface (Clay Strips)
 //   smooth   melt what you built back into the form
 // The last two are the Blender brush engine (js/sculpt, through js/sculpting.js): pinch and drag to brush.
@@ -33,6 +33,7 @@ export const setBrush = r => (tool.brush = THREE.MathUtils.clamp(r, 0.5, 12));
 const PUSH_GAIN = 2.0;
 const TURN_GAIN = 1.5;          // two-hand turn
 const TURN_PER_CM = 6 * Math.PI / 180;   // one hand: turn per centimetre of hand travel across the model
+const SCALE_DOUBLE_CM = 20;     // one hand, rotate mode: pull it this far toward you and it doubles in size
 const MIN_TURN_CM = 6;          // hands closer than this side to side (one above the other) can't steer a turn
 const HOVER_MS = 33;            // how often a pointer re-picks: hands arrive at about 30 Hz, and a pick over a
                                 // 200-400k-tri model costs 4.5-14 ms of the frame (a BVH lands with the M2 proxy)
@@ -54,7 +55,9 @@ export const setNotify = fn => { notify = fn; };
 export function zoomState() {
   if (!model.group) return null;
   return { distanceCm: input.eye.distanceTo(model.group.position), zCm: model.group.position.z,
-           atFront: !!action?.atFront, popout: !!S.popout, dragging: action?.kind === 'grab' };
+           scale: model.userScale,
+           atFront: !!action?.atFront, popout: !!S.popout,
+           dragging: action?.kind === 'grab' || action?.kind === 'turn' || action?.kind === 'two' };
 }
 
 // the part you're pointing at (or just were), for "delete that", "make that red", "duplicate that"
@@ -111,7 +114,8 @@ function startAction(p, target, now) {
     // tip it toward you. Two hands still turn it as well - this is the one-handed way, and the way
     // a mouse can do it at all.
     beginEdit();
-    action = { ...base, kind: 'turn', rot0: model.rotY, aim0: rayPoint(p, target.dist).clone() };
+    action = { ...base, kind: 'turn', rot0: model.rotY, scale0: model.userScale,
+               aim0: rayPoint(p, target.dist).clone() };
   } else {
     beginEdit();
     action = { ...base, kind: 'grab', startPos: root.position.clone(), offset: root.position.clone().sub(rayPoint(p, target.dist)) };
@@ -136,9 +140,17 @@ function updateAction(p) {
     // A turntable: how far your hand travels across the model is how far it turns. TURN_PER_CM is
     // set so a comfortable 20 cm sweep is most of a half turn, which is as much as anyone wants to
     // do without letting go.
+    //
+    // The depth of the same pinch is SCALE, and that is the whole difference from zoom. Zoom leaves
+    // the model the size it is and brings it nearer: it covers more of your view, it passes the
+    // grid lines behind it, and it can come out through the glass. Scale changes how big the thing
+    // actually is: it stays exactly where it stands, the room behind it does not move, and a 10 cm
+    // teapot becomes a 20 cm teapot in the same room. Two questions, two axes, one hand each -
+    // "how close is it" in move, "how big is it" in rotate.
     const at = rayPoint(p, action.dist);
+    const scale = action.scale0 * Math.pow(2, (p.handZ - action.handZ0) / SCALE_DOUBLE_CM);
     setTransform({ rotY: action.rot0 + (at.x - action.aim0.x) * TURN_PER_CM,
-                   userScale: model.userScale, position: root.position.clone() });
+                   userScale: scale, position: root.position.clone() });
     p.end = at;
     return;
   }

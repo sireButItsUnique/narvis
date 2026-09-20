@@ -14,6 +14,7 @@ import { initBuild, build, cancelBuild, work, toggleLog } from './scene/build.js
 import { initVersions, refreshVersions, noteCurrent, restoreVersion, saveVersion, showVersions } from './scene/versions.js';
 import { highlighted } from './scene/highlight.js';
 import { parseCommand, parseTyped, afterWake, WAKE } from './commands.js';
+import { quip, quipFor } from './narvis.js';
 import { createVoice, createCloudVoice } from './voice.js';
 import { createSpeaker } from './speak.js';
 import { startSentry, tag } from './observability.js';
@@ -72,20 +73,21 @@ function begin() {
 // ---------- tool badge: what a pinch does right now ----------
 const TOOL_HINT = {
   move: 'pinch it and pull toward you to zoom in, push away to zoom out · two hands: turn and resize',
-  rotate: 'pinch anywhere on it and drag across to turn it',
+  rotate: 'pinch it: drag across to turn it, pull toward you to make it bigger',
   extrude: 'pinch on the model and drag to build clay out of it',
   smooth: 'pinch on the model and drag to melt it smooth',
 };
 function showTool() {
   const brush = SCULPT_TOOLS.has(tool.mode);
   const name = tool.mode === 'smooth' ? 'Smooth' : sculpt.brushes.extrude;
-  // In move mode the badge carries the distance, because that IS the zoom here: there is no field
-  // of view to change, so the only thing that makes the model bigger is it being nearer, and a
-  // number that moves is the difference between "I am zooming" and "it is dragging oddly".
-  const z = tool.mode === 'move' ? zoomState() : null;
+  // Distance in move (that is the zoom), size in rotate (that is the scale). Two different
+  // questions, and the badge answers whichever one this hand is currently able to change.
+  const z = zoomState();
+  const readout = !z ? '' : tool.mode === 'move' ? ` · ${z.distanceCm.toFixed(0)} cm away`
+    : tool.mode === 'rotate' ? ` · ${z.scale.toFixed(2)}× size` : '';
   $('tool-name').textContent = tool.mode.toUpperCase() +
     (brush ? ` · ${name} ${tool.brush.toFixed(1)} cm${tool.mirror ? ' · mirror' : ''}` : '') +
-    (z ? ` · ${z.distanceCm.toFixed(0)} cm away` : '') +
+    readout +
     (clayOn ? ' · clay view' : '');
   $('tool-hint').textContent = TOOL_HINT[tool.mode];
 }
@@ -167,10 +169,11 @@ const voiceHandlers = {
     // thing anybody says is usually about the demo.
     const said = afterWake(text);
     if (said === null) { showHeard(text, 'asleep'); return; }
-    if (!said) { showHeard(`“${text}” — and then a command, like “Narvis, make a sphere”`, 'hint'); return; }
+    if (!said) { showHeard(`“${text}” — and then a command, like “Narvis, make a sphere”`, 'hint'); say(quip('nothing')); return; }
     const cmd = parseCommand(said);
     showHeard(said, cmd ? 'command' : 'ignored');
-    if (cmd) runCommand(cmd);
+    // The screen says what happened; the voice has a personality. Never both saying the same thing.
+    if (cmd) { say(quipFor(cmd)); runCommand(cmd); } else say(quip('unknown'));
   },
 };
 let voice = createVoice(voiceHandlers);   // Edge's recogniser until /api/config says ElevenLabs is set up
