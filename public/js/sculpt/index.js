@@ -600,6 +600,19 @@ export function createSculptEngine(engineOptions = {}) {
         grabPoint[1] - cache.origGrabLocation[1],
         grabPoint[2] - cache.origGrabLocation[2],
       ];
+      // How far a grab may pull, as a fraction of the brush radius. A hand override, and the one
+      // that decides whether a pull looks like clay or like a tent: a surface can only bend so far
+      // over the width of the brush before the falloff edge becomes a crease and the middle a thin
+      // sail. Measured on the rig's own model, a 7 cm brush pulling 2.5 cm is a clay dome (mean
+      // angle between neighbouring faces 0.95 deg) while a 4 cm brush pulling 7 cm is a folded
+      // sheet (2.37 deg, with 80 deg creases). A pen artist knows to resize the brush; a hand in
+      // the air just keeps pulling, so the limit is enforced here and "pull further" means "bigger
+      // brush", which is one word of voice away.
+      const maxPull = (settings.max_pull_radius_fraction ?? 0) * cache.radius;
+      if (maxPull > 0) {
+        const g = cache.grabDelta, len = Math.hypot(g[0], g[1], g[2]);
+        if (len > maxPull) { const k = maxPull / len; g[0] *= k; g[1] *= k; g[2] *= k; }
+      }
       cache.location = cache.origGrabLocation.slice();
     } else {
       cache.grabDelta = [

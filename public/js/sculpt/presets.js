@@ -22,9 +22,17 @@ let PRESETS = null;
  */
 export const HAND_OVERRIDES = {
   // Essentials Grab is 0.4, so the grabbed point only follows 40% of the hand and feels like lag.
-  Grab: { strength: 1.0 },
-  'Grab Silhouette': { strength: 1.0 },
-  'Elastic Grab': { strength: 1.0 },
+  //
+  // max_pull_radius_fraction and auto_smooth_factor are what make a pull read as CLAY. A surface can
+  // only bend so far across the width of the brush: pull further than about half the radius and the
+  // falloff edge becomes a crease and the middle a thin sail, which is what "extrude" looked like
+  // before these two numbers existed. Measured on the rig's own model: 7 cm brush pulling 2.5 cm
+  // gives a dome (0.95 deg between neighbouring faces), 4 cm brush pulling 7 cm gives a folded sheet
+  // (2.37 deg, 80 deg creases). So the pull is capped and the surface is smoothed as it goes, and
+  // pulling further is done by asking for a bigger brush.
+  Grab: { strength: 1.0, max_pull_radius_fraction: 0.5, auto_smooth_factor: 0.4 },
+  'Grab Silhouette': { strength: 1.0, max_pull_radius_fraction: 0.5, auto_smooth_factor: 0.4 },
+  'Elastic Grab': { strength: 1.0, max_pull_radius_fraction: 0.6, auto_smooth_factor: 0.3 },
   // Pointing error is magnified into the box, so never sculpt the back of a part you cannot see.
   '*': { use_frontface: true },
   // Layer's height is absolute object units in Blender (0.05 m); relative to the radius is what
@@ -32,10 +40,17 @@ export const HAND_OVERRIDES = {
   Layer: { height_is_radius_fraction: 0.15 },
 
   // Smooth at Blender's 0.7 is two and a bit averaging passes per dab, which is a polish - you are
-  // meant to scrub. Here it is a verb ("smooth it out") that has to land in one pass, so it gets
-  // full strength and three times the passes: twelve averages of a neighbourhood visibly melts a
-  // ridge into the form around it, which is exactly what the word promises.
-  Smooth: { strength: 1.0, smooth_passes: 12 },
+  // meant to scrub, and a hand gets one pass. Full strength is four passes, which is Blender's own
+  // ceiling and where this stops.
+  //
+  // It went to twelve for a day and that was a mistake worth writing down: averaging a vertex
+  // towards its neighbours SHRINKS a surface, so on anything thin the extra passes do not round it,
+  // they collapse it. Measured on a pulled ridge, smoothing at 2 / 4 / 6 / 12 passes took the mean
+  // angle between neighbouring faces from 2.4 deg to 5.6 / 6.4 / 6.5 / 7.0 and folded faces back on
+  // themselves (180 deg) at every setting - the picture was a beak, not a smooth form. Smoothing
+  // cannot rescue a shape the surface could not bend into; capping the pull above is what stops that
+  // shape being made in the first place.
+  Smooth: { strength: 1.0 },
 
   // Pulling material OUT is the move people mean by "extrude", and Snake Hook is Blender's brush
   // for it. Its 10% spacing leaves gaps when a hand moves fast, and a hand pulls a long way in one

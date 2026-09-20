@@ -180,6 +180,11 @@ export function parseCommand(text) {
     const key = m[1].replace(/\bit\s+/, '').replace(/^build up$/, 'build');
     if (BRUSHES[key]) return { type: 'brush_pick', name: BRUSHES[key] };
   }
+  // "add detail": subdivide, so the brush has vertices to move. Said a dozen ways because it is the
+  // thing you reach for the moment a pull comes out as flat sails instead of clay.
+  if (/^(?:(?:add|more|give me|i need|needs?) (?:more )?(?:detail|resolution|geometry|polys?|polygons?|vertices)|subdivide(?: it)?|more detail|denser|make it denser|smoother mesh)$/.test(t)) {
+    return { type: 'detail' };
+  }
   if (/^(?:(?:stop|quit) listening|mute(?: the)?(?: mic)?|mic off)$/.test(t)) return { type: 'mic', on: false };
   // "switch to sculpt mode", "go back to move mode", "use smooth"
   const modeText = t.replace(/^(?:(?:switch|change|go|swap)(?: back)? (?:to|into)|use|enter) (?:the )?/, '');

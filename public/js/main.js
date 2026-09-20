@@ -368,6 +368,7 @@ function runCommand(cmd) {
     }
     case 'unfocus': return flash(model.focusId && focusPart(null) ? 'Whole model' : 'Already showing the whole model');
     case 'clay':   return setClay(cmd.on);
+    case 'detail': return addDetail();
     case 'mode':   return setTool(cmd.mode);
     case 'brush_pick': {
       // Smooth is a mode of its own on the badge, so asking for it by name ("polish", "melt it")
@@ -394,6 +395,43 @@ function runCommand(cmd) {
     case 'export': return doExport();
     case 'cancel': return cancelBuild() || flash(work.job ? 'That can\'t be cancelled, one moment' : 'Nothing to cancel');
     case 'mic':    voice.stop(); S.mic = false; saveSettings(); return;
+  }
+}
+
+// "Add detail": ask Blender to split every edge, so the brush has vertices to move. The model comes
+// back from Blender as a new rev, which means anything sculpted in the browser and not yet sent
+// back is lost - so say that out loud before doing it rather than after.
+let addingDetail = false;
+async function addDetail() {
+  if (!model.group) return flash('Nothing to add detail to. Say "make a ___" first.');
+  if (addingDetail) return flash('Still adding detail; one moment.');
+  const sculpted = parts.list().some(p => p.dirty.mesh);
+  if (sculpted && !confirm('Adding detail reloads the model from Blender, and the sculpting you have done here has not been sent back yet, so it will be lost.\n\nAdd detail anyway?')) return;
+  addingDetail = true;
+  // The part you are pointing at, not the whole scene: a six-part model is already heavy in total
+  // while the one flat face you are trying to sculpt is as coarse as two triangles, and quadrupling
+  // all of it to fix one of them buys nothing but frames.
+  const aimed = pointedPart();
+  const targets = aimed ? [aimed] : parts.list();
+  const before = targets.reduce((n, p) => n + (p.mesh.geometry.index ? p.mesh.geometry.index.count : p.mesh.geometry.attributes.position.count) / 3, 0);
+  flash(`Adding detail to ${aimed ? aimed.name : 'the model'} in Blender…`, 8000);
+  try {
+    const res = await fetch('/api/blender/detail', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: targets.map(p => p.id) }),
+    });
+    const r = await res.json().catch(() => ({}));
+    if (!res.ok) return flash(r.message || `Could not add detail (${res.status})`, 5000);
+    if (!r.changed) return flash(r.message || 'It is already as dense as this box can draw', 5000);
+    await refreshScene();
+    sculpt.syncParts();
+    const after = parts.stats();
+    flash(`Detail added to ${aimed ? aimed.name : 'the model'}: ${Math.round(before).toLocaleString()} → `
+        + `${after.tris.toLocaleString()} triangles in the scene. The brush has four times as much to work with.`, 6000);
+  } catch (err) {
+    flash(`Could not add detail: ${err.message}`, 5000);
+  } finally {
+    addingDetail = false;
   }
 }
 

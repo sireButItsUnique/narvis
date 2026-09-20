@@ -48,6 +48,7 @@ function status(res) {
 }
 
 const BUSY_MESSAGES = { build: 'Still building the last one. Say "cancel" to stop it.',
+                        detail: 'Still adding detail; one moment.',
                         reconcile: 'Just catching up with Blender; one moment.' };
 const busyMessage = () => BUSY_MESSAGES[busyWith()] || 'Still switching versions; one moment.';
 
@@ -59,6 +60,63 @@ async function blenderStatus(res) {
     sendJson(res, 200, { ...base, connected: !!r.ok, blender: r.blender, file: r.file, objects: r.objects });
   } catch (err) {
     sendJson(res, 200, { ...base, connected: false, message: err.message });
+  }
+}
+
+// "Add detail": subdivide the mesh so there is something to sculpt WITH.
+//
+// A model Fable builds is as coarse as it can be and still look right - a flat face is two
+// triangles, because nothing about the picture needs more. Sculpting needs the opposite: the brush
+// moves vertices, so a 4 cm brush on a face with a vertex every centimetre has about nineteen of
+// them to work with, and pulling those nineteen a long way gives flat sails with hard creases
+// instead of clay. Smoothing cannot fix that - it averages vertices, and there are none to average.
+//
+// So this splits every edge in two: a quad becomes four, the shape is unchanged (a linear split
+// moves nothing), and the brush has four times the vertices per pass. One level at a time, with a
+// ceiling, because each level quadruples the triangle count and the page has to draw it at 60 fps.
+const DETAIL_CAP_TRIS = 400_000;
+const DETAIL_PY = (ids) => `
+ids = ${JSON.stringify(ids)}
+targets = [o for o in bpy.data.objects
+           if o.type == 'MESH' and (not ids or o.get('holo_id') in ids)]
+total = sum(len(o.data.polygons) for o in targets)
+if not targets:
+    print('nothing to subdivide')
+elif total * 4 > ${DETAIL_CAP_TRIS}:
+    print('already dense: %d faces' % total)
+else:
+    for o in targets:
+        me = o.data
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        bmesh.ops.subdivide_edges(bm, edges=bm.edges[:], cuts=1, use_grid_fill=True)
+        bm.to_mesh(me)
+        bm.free()
+        me.update()
+    print('subdivided %d part(s): %d -> %d faces'
+          % (len(targets), total, sum(len(o.data.polygons) for o in targets)))
+`;
+
+async function blenderDetail(req, res) {
+  let body;
+  try { body = await readJson(req); } catch (err) { return sendJson(res, 400, { error: 'bad_request', message: err.message }); }
+  const ids = Array.isArray(body.ids) ? body.ids.filter(s => typeof s === 'string').slice(0, 40) : [];
+  const release = lock('detail');
+  if (!release) return sendJson(res, 409, { error: 'busy', message: busyMessage() });
+  try {
+    const r = await bridge('exec', { code: DETAIL_PY(ids), label: 'Add detail' }, { timeout: 120000 });
+    if (!r.ok) return sendJson(res, 502, { error: 'blender', message: r.error || 'subdivide failed' });
+    const note = String(r.output || '').trim().split('\n').pop() || 'detail added';
+    // Nothing to export if Blender decided it was already dense enough; publishing anyway would
+    // hand the page a new rev that is byte-for-byte the old one and throw away its sculpt edits.
+    if (/already dense|nothing to subdivide/.test(note)) return sendJson(res, 200, { ok: true, changed: false, message: note });
+    const state = await publish('detail added');
+    return sendJson(res, 200, { ok: true, changed: true, message: note, rev: state.rev });
+  } catch (err) {
+    const status = err instanceof BridgeError || err instanceof SceneError ? 502 : 500;
+    return sendJson(res, status, { error: 'blender', message: err.message });
+  } finally {
+    release();
   }
 }
 
@@ -287,6 +345,9 @@ http.createServer((req, res) => {
   if (pathname === '/api/blender/status') return blenderStatus(res);
   if (pathname === '/api/blender/build') {
     return req.method === 'POST' ? blenderBuild(req, res) : sendJson(res, 405, { error: 'method_not_allowed', message: 'POST only' });
+  }
+  if (pathname === '/api/blender/detail') {
+    return req.method === 'POST' ? blenderDetail(req, res) : sendJson(res, 405, { error: 'method_not_allowed', message: 'POST only' });
   }
   if (pathname === '/api/history' || pathname.startsWith('/api/history/')) return historyRoute(req, res, pathname);
   if (pathname.startsWith('/api/voice/')) return voiceRoute(req, res, pathname);
