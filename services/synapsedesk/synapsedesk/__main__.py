@@ -58,6 +58,8 @@ def main():
             server=Server(args.port,state)
             if args.demo:
                 threading.Thread(target=run,args=(state,state.stop),daemon=True).start()
+                from laptop_hand_tracking.volume_simulator import run as run_volume
+                threading.Thread(target=run_volume,args=(state,state.stop),daemon=True).start()
             source=args.repo or (str(ROOT/"tests"/"fixtures"/"messy_repo") if args.demo else None)
             if source:
                 state.start_analysis(source)

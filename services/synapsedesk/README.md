@@ -29,6 +29,7 @@ Installation may need internet for packaging dependencies; the installed demo an
 | `laptop_hand_tracking/` | Optional Windows camera worker, local MediaPipe palm/landmark inference, pinch gating, simulator, calibrated depth-point filtering |
 | `web_ar_canvas/` | Dependency-free HTML5 Canvas, skeletal HUD, homography calibration, pinch/mouse dragging, animated wires, evidence panel, component search, chrome-free `/display` route |
 | `repo_triage_agent/` | Polyglot evidence extraction (`analyze.py`, `adapters.py`, `universal.py`, `rust.py`, `tsplugins.py`), source/doc reconciliation, import-cycle detection, optional local LLM review (`reasoner.py`), scoped agent tasks (`provider.py`, `workingcopy.py`) |
+| `web_ar_canvas/public/hologram.mjs` | Rig view: off-axis projection through the vendored `rig-geometry.mjs`, level placement, touch and pointing in the volume |
 | `frontend/` | Pinned React/Monaco/Three.js toolchain, dormant until [the tripwire](frontend/TRIPWIRE.md) trips; vendored builds serve from `/vendored/*` |
 | `scripts/`, `config/`, `docs/` | PowerShell launchers, service manifest, API and pitch runbook |
 
@@ -147,6 +148,39 @@ is the replaceable boundary — `GET /api/provider/status` reports which one is 
 probes it. This path sends bounded task text to whatever endpoint you configure; the deterministic analysis
 above, and the local Ollama reviewer below, do not.
 
+
+## The hologram rig
+
+`/hologram` draws the level you are on into the volume under the acrylic sheet, from where your eye is.
+It is the same graph, the same levels and the same shared focus as the flat canvas — only projected. No
+three.js and no npm: cards and links are flat quads, so the off-axis projection is applied per corner and
+drawn on the same dependency-free canvas.
+
+Tell the service what you built, in the units you measured it in:
+
+```powershell
+# a 27" 16:9 panel over a 24 x 13.5 in acrylic sheet
+Invoke-RestMethod http://127.0.0.1:8770/api/rig -Method Post -ContentType 'application/json' -Headers @{'X-Synapse-Token'=$Token} -Body '{"version":1,"panel_diagonal_in":27,"sheet_width_cm":60.96,"sheet_depth_cm":34.29,"monitor_drop_cm":24,"tilt_deg":40}'
+```
+
+**Check the panel diagonal.** Everything scales off it: a 27 inch panel entered as 24 puts the image about
+12% out and no trimming fixes it. The working volume is then derived from the rig rather than chosen.
+
+### Bringing your own hand tracker
+
+You keep your tracker; the service only needs to know how to read its numbers. `POST /api/hand-frame` once
+with your units, axis order and origin offset, then `POST /api/hands` with raw tracker coordinates —
+either the 21 MediaPipe landmarks or just the thumb and index fingertips, which is all a pinch needs.
+`scripts/hand_bridge.py` is a working reference you can copy; `--demo` posts a circling hand to prove the
+wiring before you touch your own code.
+
+Pinch is derived by the service, never accepted from upstream, so two trackers behave identically on the
+desk. Touch a card to select it, pinch and release without moving to open it, pinch and move to place it.
+A hand that goes stale, leaves the volume or disappears disarms rather than keeping its grip, and a head
+position that cannot be trusted freezes the volume instead of drawing a confident hologram from a bad one.
+
+`.\scripts\Start-SynapseDesk.ps1 -Demo` simulates both a head and a hand in the volume, so the whole
+interaction can be rehearsed with no cameras attached. See [the protocol](docs/PROTOCOL.md).
 
 ## Optional Kinect/depth input
 

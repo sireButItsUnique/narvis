@@ -12,6 +12,7 @@ from repo_triage_agent.provider import ChatCompletionsProvider, ProviderError, S
 from synapsedesk.__main__ import DEFAULT_PORT, build_parser
 from synapsedesk.server import Server
 from synapsedesk.state import State
+from synapsedesk.contracts import DEFAULT_VOLUME, validate_volume
 from synapsedesk.store import Store
 
 FIXTURE = Path(__file__).parent/'fixtures'/'messy_repo'
@@ -91,6 +92,39 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(second.revision, revision)
             self.assertEqual(len(second.graph['nodes']), nodes)
             self.assertEqual(second.job['status'], 'complete')
+
+
+class VolumeTests(unittest.TestCase):
+    """The rig slab the hologram draws into. The service carries it; clients map into it."""
+
+    def test_validation_bounds_every_axis(self):
+        self.assertEqual(validate_volume(DEFAULT_VOLUME)["width_cm"], DEFAULT_VOLUME["width_cm"])
+        for bad in ({}, {"version": 2}, dict(DEFAULT_VOLUME, width_cm=0), dict(DEFAULT_VOLUME, depth_cm=501),
+                    dict(DEFAULT_VOLUME, height_cm="tall"), dict(DEFAULT_VOLUME, height_cm=float("inf"))):
+            with self.assertRaises(ValueError):
+                validate_volume(bad)
+
+    def test_volume_survives_a_restart_because_it_describes_the_desk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = State(tmp)
+            self.assertEqual(first.volume, dict(DEFAULT_VOLUME))
+            self.assertEqual(first.snapshot()["volume"], dict(DEFAULT_VOLUME))
+            first.set_volume(dict(version=1, width_cm=60, depth_cm=24, height_cm=18))
+            first.store.db.close()
+            second = State(tmp)
+            self.assertEqual(second.volume["width_cm"], 60)
+            self.assertEqual(second.snapshot()["volume"]["height_cm"], 18)
+
+    def test_a_corrupt_volume_file_falls_back_to_the_rig_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "volume.json").write_text('{"version": 1, "width_cm": -5}', encoding="utf-8")
+            self.assertEqual(State(tmp).volume, dict(DEFAULT_VOLUME))
+
+    def test_positions_carry_depth_for_the_slab(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(tmp)
+            store.set_positions({"~|m:a": {"x": .5, "y": .5, "z": .75}})
+            self.assertEqual(store.get_positions()["~|m:a"]["z"], .75)
 
 
 class ProviderTests(unittest.TestCase):
@@ -409,6 +443,26 @@ class AgentHTTPTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as unauthorized:
             self.post('/api/positions', {'positions': {}}, token=False)
         self.assertEqual(unauthorized.exception.code, 403)
+
+    def test_volume_endpoint_round_trips_and_rejects_bad_geometry(self):
+        self.assertEqual(self.get('/api/volume')['version'], 1)
+        saved = self.post('/api/volume', dict(version=1, width_cm=53.1, depth_cm=21.1, height_cm=15.2))
+        self.assertEqual(saved['width_cm'], 53.1)
+        self.assertEqual(self.get('/api/state')['volume']['depth_cm'], 21.1)
+        for bad in (dict(version=1, width_cm=0, depth_cm=1, height_cm=1), dict(version=9), {}):
+            with self.assertRaises(HTTPError) as error:
+                self.post('/api/volume', bad)
+            self.assertEqual(error.exception.code, 400)
+
+    def test_view_trail_is_shared_and_bounded(self):
+        self.assertEqual(self.post('/api/view', {'trail': ['synapsedesk', 'synapsedesk/store.py']})['view'],
+                         ['synapsedesk', 'synapsedesk/store.py'])
+        self.assertEqual(self.get('/api/state')['view'], ['synapsedesk', 'synapsedesk/store.py'])
+        for bad in ({'trail': 'not-a-list'}, {'trail': [1, 2]}, {'trail': ['x']*9}, {'trail': ['']}):
+            with self.assertRaises(HTTPError) as error:
+                self.post('/api/view', bad)
+            self.assertEqual(error.exception.code, 400)
+        self.post('/api/view', {'trail': []})
 
     def test_provider_status_reports_the_blocked_gate(self):
         status = self.get('/api/provider/status')

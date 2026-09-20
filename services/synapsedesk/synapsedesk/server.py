@@ -11,6 +11,10 @@ PUBLIC = Path(__file__).resolve().parent.parent/"web_ar_canvas"/"public"
 VENDORED = Path(__file__).resolve().parent/"vendored"
 ASSETS = {"/":("index.html","text/html; charset=utf-8"),
           "/display":("display.html","text/html; charset=utf-8"),
+          "/hologram":("hologram.html","text/html; charset=utf-8"),
+          "/hologram.mjs":("hologram.mjs","text/javascript; charset=utf-8"),
+          "/volume.mjs":("volume.mjs","text/javascript; charset=utf-8"),
+          "/rig-geometry.mjs":("rig-geometry.mjs","text/javascript; charset=utf-8"),
           "/app.js":("app.js","text/javascript; charset=utf-8"),
           "/homography.mjs":("homography.mjs","text/javascript; charset=utf-8"),
           "/style.css":("style.css","text/css; charset=utf-8")}
@@ -116,6 +120,15 @@ class Handler(BaseHTTPRequestHandler):
             self.json({"tasks":self.server.state.store.list_tasks()})
         elif path=="/api/positions":
             self.json({"positions":self.server.state.get_positions()})
+        elif path=="/api/volume":
+            with self.server.state.lock:
+                self.json(dict(self.server.state.volume))
+        elif path=="/api/rig":
+            with self.server.state.lock:
+                self.json(dict(self.server.state.rig))
+        elif path=="/api/hand-frame":
+            with self.server.state.lock:
+                self.json(dict(self.server.state.hand_frame))
         elif path.startswith("/api/agent/tasks/"):
             rest=path[len("/api/agent/tasks/"):].split("/")
             try:
@@ -207,6 +220,22 @@ class Handler(BaseHTTPRequestHandler):
                 state.wire(data["source"],data["target"],data.get("revision"))
             elif path=="/api/bounds":
                 state.set_bounds(data)
+            elif path=="/api/eye":
+                state.set_eye(data)
+            elif path=="/api/hands":
+                if state.demo:
+                    raise ValueError("stop demo mode before connecting a volume hand tracker")
+                with state.lock:
+                    state.hands.ingest(data, frame=state.hand_frame)
+            elif path=="/api/volume":
+                self.json(state.set_volume(data))
+                return
+            elif path=="/api/rig":
+                self.json(state.set_rig(data))
+                return
+            elif path=="/api/hand-frame":
+                self.json(state.set_hand_frame(data))
+                return
             elif path=="/api/view":
                 self.json(state.set_view(data.get("trail")))
                 return

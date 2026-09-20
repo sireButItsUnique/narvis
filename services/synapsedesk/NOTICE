@@ -1,0 +1,20 @@
+# SynapseDesk — third-party code
+
+## web_ar_canvas/public/rig-geometry.mjs
+
+Vendored verbatim from `rig/rigtest2/js/rig/geometry.js` in this repository, which carries
+`SPDX-License-Identifier: GPL-3.0-or-later`. It is the Pepper's-ghost projection maths: plane
+reflection plus Kooima's generalized off-axis perspective through the monitor's mirror image.
+It was written dependency-free (plain arrays in, plain arrays out) specifically so it could be
+reused like this, and it is kept byte-identical so fixes flow in either direction.
+
+**This has a licensing consequence and it has not been decided.** Combining GPL-3.0-or-later
+code with the rest of SynapseDesk means the combined work must be distributed under
+GPL-3.0-or-later. SynapseDesk currently declares no licence at all — neither a LICENSE file nor
+a `license` field in `pyproject.toml`. Before this is published or shipped to anyone, either:
+
+  - adopt GPL-3.0-or-later for SynapseDesk (add the licence text and set it in pyproject), or
+  - drop this file and reach the rig over HTTP instead of linking its code, keeping the two
+    works separate.
+
+Nothing here decides that. It is recorded so the choice is made deliberately.

@@ -7,12 +7,15 @@ import threading
 import time
 from laptop_hand_tracking.gestures import GestureGate
 from laptop_hand_tracking.spatial import SpatialFilter
+from laptop_hand_tracking.volume_hands import VolumeHands
 from repo_triage_agent.analyze import from_source, ident
 from repo_triage_agent.reasoner import reason
 from repo_triage_agent.provider import from_config, ProviderError
 from repo_triage_agent import workingcopy
 from repo_triage_agent.adapters import adapter_for
-from .contracts import validate_graph, validate_view
+from .contracts import (DEFAULT_HAND_FRAME, DEFAULT_RIG, DEFAULT_VOLUME, validate_eye,
+                        validate_graph, validate_hand_frame, validate_rig, validate_view,
+                        validate_volume)
 from .store import Store
 
 
@@ -46,6 +49,14 @@ class State:
         self.stop = threading.Event()
         self.analysis = None
         self.view = []
+        self.eye = None
+        self.eye_received = 0.
+        # Rig geometry, unlike the graph, survives a restart: it describes the desk, not the session.
+        self.rig = self._restore("rig.json", validate_rig, DEFAULT_RIG)
+        self.volume = self._restore("volume.json", validate_volume, DEFAULT_VOLUME)
+        self.hand_frame = self._restore("hand-frame.json", validate_hand_frame, DEFAULT_HAND_FRAME)
+        self.hands = VolumeHands(self.volume)
+        self.hands.set_volume(self.volume, [0., -self.rig["anchor_drop_cm"], 0.])
         self.tasks = {}
         self.cancel_flags = set()
         # SQLite is authoritative; legacy JSON stays as export. Restore on restart.
@@ -56,10 +67,18 @@ class State:
         if restored is not None:
             self.graph, self.revision, self.job = restored["graph"], restored["rev"], restored["job"]
 
+    def _restore(self, name, validate, default):
+        try:
+            return validate(json.loads((self.runtime/name).read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return dict(default)
+
     def snapshot(self):
         with self.lock:
             return dict(tracking=self.gate.snapshot(),spatial=self.spatial.snapshot(),revision=self.revision,
-                        job=dict(self.job),demo=self.demo,demo_fault=self.demo_fault,view=list(self.view))
+                        job=dict(self.job),demo=self.demo,demo_fault=self.demo_fault,view=list(self.view),
+                        volume=dict(self.volume),rig=dict(self.rig),eye=self.eye_snapshot(),
+                        hands=self.hands.snapshot())
 
     def graph_snapshot(self):
         with self.lock:
@@ -126,6 +145,42 @@ class State:
         with self.lock:
             self.view = validate_view(trail)
             return {"view": list(self.view)}
+
+    def eye_snapshot(self, now=None):
+        """Head position with the age the client should judge it by, not the age the tracker claimed."""
+        if self.eye is None:
+            return None
+        now = time.monotonic() if now is None else now
+        age = (now - self.eye_received) * 1000 + self.eye["age_ms"]
+        return dict(self.eye, age_ms=round(age, 1))
+
+    def set_eye(self, packet, now=None):
+        with self.lock:
+            self.eye = validate_eye(packet)
+            self.eye_received = time.monotonic() if now is None else now
+            return {"ok": True}
+
+    def set_hand_frame(self, frame):
+        """How the tracker's own coordinates become rig centimetres. Set once; it describes the room."""
+        with self.lock:
+            self.hand_frame = validate_hand_frame(frame)
+            atomic_json(self.runtime/"hand-frame.json", self.hand_frame)
+            return dict(self.hand_frame)
+
+    def set_rig(self, rig):
+        with self.lock:
+            self.rig = validate_rig(rig)
+            atomic_json(self.runtime/"rig.json", self.rig)
+            # The reach test is in rig coordinates, so it has to follow the anchor when the rig moves.
+            self.hands.set_volume(self.volume, [0., -self.rig["anchor_drop_cm"], 0.])
+            return dict(self.rig)
+
+    def set_volume(self, volume):
+        with self.lock:
+            self.volume = validate_volume(volume)
+            atomic_json(self.runtime/"volume.json", self.volume)
+            self.hands.set_volume(self.volume, [0., -self.rig["anchor_drop_cm"], 0.])
+            return dict(self.volume)
 
     def set_bounds(self,bounds):
         with self.lock:

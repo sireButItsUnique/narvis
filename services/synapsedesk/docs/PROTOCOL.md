@@ -30,6 +30,12 @@ All traffic stays on `127.0.0.1:8770`. The port is 8770 rather than 8765 so this
 | `/api/agent/tasks/{id}/rollback` | POST | Undoes the task's writes inside its working copy |
 | `/` and `/display` | GET | Editor page and chrome-free projection page, same bundle |
 | `/vendored/*` | GET | Vendored React build; explicit 404 JSON while none is vendored |
+| `/hologram` | GET | The rig view: the current level drawn into the working volume |
+| `/api/rig` | GET/POST | Physical measurements of the rig, in the units you measured them in |
+| `/api/volume` | GET/POST | The working volume in centimetres that content is laid out inside |
+| `/api/hand-frame` | GET/POST | How your tracker's coordinates become rig centimetres. Set once |
+| `/api/hands` | POST | Hand landmarks from your tracker; refused in demo mode |
+| `/api/eye` | POST | Head position, already registered to `rig_cm` |
 
 POSTs require `Content-Type: application/json`, Content-Length, and at most 64 KB. Success is `{ok:true}`; errors use `{error:"..."}` with 400/403/404/500 status. Accepted analysis returns immediately; observe `job.status` (`running`, `complete`, `error`). Graph revision advances on publication and wiring. Invalid analysis leaves the last valid graph available.
 
@@ -95,6 +101,48 @@ Without `--model-endpoint` and `--model-name`, the provider is a stub that refus
 gate is blocked and says so rather than pretending to reason. The API key is read from `SYNAPSEDESK_API_KEY`
 in the environment (the earlier `SYNASEDESK_` spelling is still accepted) and never appears in a response,
 an artifact, or the index.
+
+## The rig, and hands inside it
+
+`/hologram` draws the level you are on into the volume under the acrylic sheet, from where your eye
+actually is. The projection maths is `web_ar_canvas/public/rig-geometry.mjs`, vendored verbatim from
+`rig/rigtest2` — see [NOTICE](../NOTICE), which records a licence consequence that has not been decided.
+
+`POST /api/rig` carries the measurements. Everything scales off `panel_diagonal_in`: entering a 27 inch
+panel as 24 puts the image about 12% out and no trimming fixes it. The volume is then derived from the
+rig rather than chosen, and depth is treated as a requirement, not as whatever is left over — filling the
+panel first leaves about 2 cm of depth, which reads as a flat picture.
+
+### Connecting a hand tracker
+
+You keep your tracker. Tell the service once how to read its numbers:
+
+```json
+POST /api/hand-frame
+{"version": 1, "units": "m", "axes": ["x", "y", "-z"], "scale": [1,1,1], "offset": [0,-13,0]}
+```
+
+`units` is cm, m, mm or in. `axes` says which of YOUR axes becomes rig X, Y and Z, with a leading minus to
+flip one. `offset` is centimetres added last. Then post raw tracker numbers at whatever rate you track at:
+
+```json
+POST /api/hands
+{"version": 1, "age_ms": 8, "hands": [
+  {"label": "right", "thumb_tip": [0.02, 0.01, 0.03], "index_tip": [0.025, 0.01, 0.03]}]}
+```
+
+Send the 21 MediaPipe landmarks as `landmarks` if you have them; the extra joints are drawn but never
+interpreted, so two fingertips are genuinely enough. A landmark that lands more than 3 m from the desk is
+rejected with a message naming the hand frame, rather than dropping a hand somewhere absurd.
+
+**Pinch is not accepted from upstream.** The service derives it from the thumb-index distance in
+centimetres, with two thresholds and a settling count, so one tracker's idea of "pinching" cannot change
+what the desk does. `scripts/hand_bridge.py` is a working reference; `--demo` posts a circling hand.
+
+Touching decides what a gesture means when the hand is among the cards, and a ray from the eye through the
+fingertip takes over when it is not — a finger held below the content would otherwise aim above it. A
+pinch that does not move opens a card; one that moves places it. A hand that goes stale, leaves the volume
+or disappears disarms rather than keeping its grip.
 
 ## Graph artifacts
 
