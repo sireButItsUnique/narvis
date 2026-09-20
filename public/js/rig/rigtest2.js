@@ -22,7 +22,7 @@
 
 import {
   makeRig, rigCamera, projectPoint, virtualScreen, plane, rayPlane, rectUV,
-  add, sub, scale, v3, DEG,
+  add, sub, scale, v3, dot, cross, unit, DEG,
 } from './geometry.js';
 
 export const INCH_CM = 2.54;
@@ -38,8 +38,9 @@ const round = (x, n = 2) => Math.round(x * 10 ** n) / 10 ** n;
 // toward them, the acrylic sheet 6 inches below the panel, black paper 6 inches below the sheet, the whole
 // screen used, the picture sent flipped; and the head tracker is two 1080p webcams at sheet height, 40
 // inches apart, angled in.
+export const SETUP_VERSION = 3;
 export const DEFAULT_SETUP = {
-  version: 2,
+  version: SETUP_VERSION,
   units: 'in',
   rig: {
     monitorDiagIn: 24,          // 16:9; the only monitor number most people can actually read off the box
@@ -50,15 +51,26 @@ export const DEFAULT_SETUP = {
     baseDropCm: 6 * INCH_CM,    // black paper below the sheet
     sheetWidthCm: 0, sheetDepthCm: 0,   // 0 = "as big as the panel's footprint" (sheetSizeCm below)
     fullScreen: true,
-    flipAxis: 'y',              // 'y' = the picture goes out upside down, which is what rigtest.html proved
+    // The picture must be mirrored once for the sheet; WHICH axis is not a free parameter and is not a
+    // user setting. rigCamera derives the parity from virtualScreen().mirrored, and the two axes differ
+    // only by a 180 degree roll that the matching CSS flip cancels exactly - so the hologram is identical
+    // either way and only the OVERLAY TEXT changes, for the worse. overlayFlip() derives the text's mirror
+    // from the optics instead. The real physical degree of freedom is rot180: the panel mounted the other
+    // way up, which is a different picture, not a different axis.
+    flipAxis: 'y',
+    rot180: false,              // the panel itself mounted upside down (it is not, on this rig)
     modelFitCm: 11,
   },
   pair: {
     baselineCm: 40 * INCH_CM,   // measured centre-to-centre
     heightCm: 0,                // sheet height: the rig frame's origin is the sheet, so this is 0
     depthCm: 0,                 // how far toward the viewer of the sheet centre the pair sits
-    toeInDeg: 14,               // each camera angled in toward the rig centre line
-    tiltUpDeg: 12,              // and tipped up at the face
+    // The toe-in and tilt are DERIVED, not measured: they are whatever points both lenses at the head
+    // spot below, which is the thing step 1 makes the user physically aim at. Storing them as independent
+    // constants is what let the shipped 14/12 contradict a 40-inch baseline and a head 45 cm away - the
+    // triangulator then decoded that head 159 cm too far away while the page reported healthy tracking.
+    // null = "work it out"; aimManual is set only when the user types an angle by hand.
+    toeInDeg: null, tiltUpDeg: null, aimManual: false,
     dfovDeg: 78,                // Logitech 1080p (C920-family) diagonal field of view
   },
   head: { positionCm: [0, 40, 45], sweepXCm: 30, sweepYCm: 12 },   // where a seated viewer's eye sits
@@ -75,6 +87,13 @@ export function mergeSetup(saved) {
   out.trimCm = Array.isArray(t) && t.length === 3 ? t.map(Number) : [0, 0, 0];
   if (!Array.isArray(out.head.positionCm) || out.head.positionCm.length !== 3)
     out.head.positionCm = DEFAULT_SETUP.head.positionCm.slice();
+  // Versions before 3 stored hand-picked pair angles that nothing kept in step with the baseline or the
+  // head spot. They are not evidence of anything the user chose, so they are dropped rather than carried
+  // forward as if they had been typed.
+  if (!(Number((saved || {}).version) >= 3)) {
+    out.pair.toeInDeg = null; out.pair.tiltUpDeg = null; out.pair.aimManual = false;
+  }
+  out.version = SETUP_VERSION;
   return out;
 }
 
@@ -100,7 +119,7 @@ function buildRig(setup, sheet) {
   return makeRig({
     monitor: { widthCm: m.widthCm, heightCm: m.heightCm, pixelW: r.pixelW, pixelH: r.pixelH,
                centre: [0, r.monitorDropCm, r.monitorForwardCm], tiltDeg: r.tiltDeg,
-               yawDeg: 0, rollDeg: 0, rot180: false, corners: null },
+               yawDeg: 0, rollDeg: 0, rot180: !!r.rot180, corners: null },
     sheet: { point: [0, 0, 0], normal: [0, 1, 0], widthCm: sheet.widthCm, depthCm: sheet.depthCm },
     // the model sits ON the base, not floating in the middle of nowhere: that is what the test scenes show
     model: { anchor: [0, baseY + r.modelFitCm / 2, 0], fitCm: r.modelFitCm, yawDeg: 0 },
@@ -146,11 +165,22 @@ export function minimumSheetCm(rig, eyes, marginCm = 1) {
 // face. The positions are in the TRACKER frame, whose origin is the midpoint between the two, so the pair's
 // height and depth live in eyeToRig() instead of being baked in here.
 export function pairCameras(setup) {
-  const half = setup.pair.baselineCm / 2, toe = setup.pair.toeInDeg, tilt = setup.pair.tiltUpDeg;
+  const half = setup.pair.baselineCm / 2, { toeInDeg: toe, tiltUpDeg: tilt } = pairAngles(setup);
   return [
     { side: 'left', posCm: [-half, 0, 0], rotDeg: [tilt, -toe, 180] },
     { side: 'right', posCm: [half, 0, 0], rotDeg: [tilt, toe, 180] },
   ];
+}
+
+// The angles actually used. They are aimPair()'s answer unless the user typed one by hand, so editing the
+// baseline or where the head sits re-aims the pair instead of quietly leaving stale angles behind. These
+// angles ARE the triangulation extrinsics (cameras.js -> stereo.viewsForCamera), not decoration.
+export function pairAngles(setup) {
+  const p = setup.pair, aimed = aimPair(setup);
+  const manual = !!p.aimManual;
+  const pick = (v, fallback) => (manual && Number.isFinite(v) ? v : fallback);
+  return { toeInDeg: pick(p.toeInDeg, aimed.toeInDeg), tiltUpDeg: pick(p.tiltUpDeg, aimed.tiltUpDeg),
+           aimed, manual };
 }
 // Where the pair's own origin sits in the rig frame.
 export const trackerOriginRig = (setup) => [0, setup.pair.heightCm, setup.pair.depthCm];
@@ -173,16 +203,67 @@ export function aimPair(setup, headRig = setup.head.positionCm) {
   const half = setup.pair.baselineCm / 2;
   const from = [half, setup.pair.heightCm, setup.pair.depthCm];       // the +X camera; the other is mirrored
   const d = sub(v3(headRig), from), flat = Math.hypot(d[0], d[2]);
-  if (flat < 1e-6) return { toeInDeg: setup.pair.toeInDeg, tiltUpDeg: setup.pair.tiltUpDeg };
+  // A head directly above the lens has no aim to work out; 0/90 is the only honest answer, and never the
+  // stored angle, which is what this function exists to replace.
+  if (flat < 1e-6) return { toeInDeg: 0, tiltUpDeg: d[1] >= 0 ? 90 : -90 };
   return { toeInDeg: round(Math.atan2(-d[0], d[2]) / DEG, 1),
            tiltUpDeg: round(Math.atan2(d[1], flat) / DEG, 1) };
+}
+
+// Where a pair set to these angles is actually LOOKING: both optical axes are mirror images about the
+// centre line, so they cross it at one point. Follow the +X camera's forward vector (Rz180*Ry(toe)*Rx(tilt)
+// on [0,0,1], the same convention stereo.js uses) until x reaches 0.
+export function convergeRig(setup, angles = pairAngles(setup)) {
+  const half = setup.pair.baselineCm / 2;
+  const toe = angles.toeInDeg * DEG, tilt = angles.tiltUpDeg * DEG;
+  const across = Math.sin(toe) * Math.cos(tilt);        // how fast the axis closes on the centre line
+  if (!(Math.abs(across) > 1e-9)) return null;          // parallel axes: they never meet
+  const t = half / across;
+  if (t < 0) return null;                               // toed OUT: they cross behind the cameras
+  return [0, setup.pair.heightCm + t * Math.sin(tilt), setup.pair.depthCm + t * Math.cos(toe) * Math.cos(tilt)];
+}
+
+// Do the angles in use agree with where the user says their head sits? Step 1 makes them physically aim
+// each camera at their own face, so a disagreement here means the software's extrinsics and the hardware's
+// aim are different pairs of cameras - and the triangulated head comes out somewhere else entirely, with
+// nothing on screen saying so. A tenth of a degree is aimPair's rounding (0.17 cm at this range) and one
+// degree of toe error is 1.7 cm of eye error, so two degrees is the most that can be called agreement.
+export const AIM_TOLERANCE_DEG = 2;
+export function aimCheck(setup) {
+  const used = pairAngles(setup), aimed = used.aimed;
+  const dToe = used.toeInDeg - aimed.toeInDeg, dTilt = used.tiltUpDeg - aimed.tiltUpDeg;
+  const ok = Math.abs(dToe) <= AIM_TOLERANCE_DEG && Math.abs(dTilt) <= AIM_TOLERANCE_DEG;
+  const at = convergeRig(setup, used), head = v3(setup.head.positionCm);
+  const missCm = at ? Math.hypot(at[0] - head[0], at[1] - head[1], at[2] - head[2]) : Infinity;
+  const say = (n) => n.toFixed(0);
+  const message = ok ? '' :
+    `The cameras are told they are toed in ${used.toeInDeg} deg and tipped up ${used.tiltUpDeg} deg, which aims `
+    + `them at a spot ${at ? say(Math.hypot(at[0], at[2])) + ' cm away' : 'they never both reach'} — but you said `
+    + `your head sits ${say(Math.hypot(head[0], head[2]))} cm away. Aiming at where your head sits needs `
+    + `${aimed.toeInDeg} / ${aimed.tiltUpDeg} deg. As it stands the tracker will report your head about `
+    + `${say(missCm)} cm from where it really is. Press "work the angles out" in step 2.`;
+  return { ok, used, aimed, dToe: round(dToe, 2), dTilt: round(dTilt, 2), convergeRig: at, missCm, message };
 }
 
 // ---------------------------------------------------------------- is the head really tracked?
 
 // The one gate between "two webcams agree about where your eye is" and "something made a number up".
 // cameras.js can fall back to one-camera depth-from-eye-spacing on its own; this is what refuses it.
-export function headSource({ cameras = 0, seeingHead = 0, eyeSource = 'none', chosen = 0 } = {}) {
+//
+// Two results, because they are two different questions:
+//   usable  may this frame read input.eye? Only a believed stereo fuse ever earns that.
+//   ok      should the page shout? A single dropped frame must not: MediaPipe misses faces all the time,
+//           and a full red panel thrown into the volume for 100 ms, blaming an aim that is fine, is worse
+//           than useless. So the refusal waits STEREO_GRACE_MS for stereo to come back, while the eye
+//           simply holds still. The grace never lets a guessed eye through - only silence.
+export const STEREO_GRACE_MS = 500;
+// How far from the seat the tracked eye may be before it stops being a head and starts being a decoding
+// error. The viewing arc is 60 cm wide, so this has to clear it comfortably.
+export const EYE_PLAUSIBLE_CM = 60;
+
+export function headSource({ cameras = 0, seeingHead = 0, eyeSource = 'none', chosen = 0,
+                             msSinceStereo = Infinity, residualCm = null, swapHint = false,
+                             eyeRig = null, headRig = null, plausibleCm = EYE_PLAUSIBLE_CM } = {}) {
   const no = (reason, message) => ({ ok: false, reason, message, usable: false });
   if (chosen < 2)
     return no('need-two', 'Pick TWO cameras in setup. One webcam cannot measure how far away your head is - '
@@ -191,15 +272,63 @@ export function headSource({ cameras = 0, seeingHead = 0, eyeSource = 'none', ch
     return no('one-camera', 'Only one camera is running. Head tracking needs both: one camera would have to '
       + 'guess your distance from the spacing of your eyes, and this page will not do that. '
       + 'Plug the second webcam back in, or press M for the mouse stand-in (development only).');
-  if (eyeSource === 'mono')
+  // These two are configuration errors the pair itself detected. They are reported before anything else,
+  // because every later message would send the user off to fix the wrong thing.
+  if (eyeSource === 'bad-extrinsics')
+    return no('same-place', 'Both cameras are configured in the SAME place, so there is no baseline to '
+      + 'triangulate from and the "tracked" eye would sit on one lens and never move. '
+      + 'Re-pick the two cameras in step 1 — if they are the same model they share a name, so mark them one at a time.');
+  if (eyeSource === 'bad-rays')
+    return no('rays-miss', `The two cameras disagree about where your head is${residualCm != null ? ` by ${residualCm.toFixed(1)} cm` : ''}`
+      + `, so their answer is not a measurement. `
+      + (swapHint ? 'They look marked the wrong way round: swap left and right in step 1.'
+                  : 'Check the baseline and the angles in step 2 against the real rig.'));
+  if (eyeSource === 'stereo' && eyeRig && headRig) {
+    const d = Math.hypot(eyeRig[0] - headRig[0], eyeRig[1] - headRig[1], eyeRig[2] - headRig[2]);
+    if (d > plausibleCm)
+      return no('implausible', `The pair says your head is ${d.toFixed(0)} cm from where you said you sit. `
+        + 'Two cameras cannot be that wrong about a face they can both see, so the numbers describing them '
+        + 'are wrong: check the baseline and the angles in step 2.');
+  }
+  // A mono fuse is only worth shouting about once the grace has run out; inside it, it is one dropped
+  // frame. `seeingHead` needs no grace of its own - it is already a 500 ms window over lastFaceAt.
+  if (eyeSource === 'mono' && msSinceStereo >= STEREO_GRACE_MS)
     return no('mono', 'The tracker fell back to one camera (the other one cannot see your face). '
       + 'That is a depth guess, so the head is not being used. Re-aim the cameras in setup.');
   if (seeingHead < 2)
     return no('one-sees', 'Only one camera can see your face. Both must, or there is nothing to triangulate. '
       + 'Move into the middle, or re-aim the cameras in setup.');
-  if (eyeSource !== 'stereo')
-    return no('waiting', 'Looking for your face in both cameras…');
-  return { ok: true, reason: 'stereo', message: '', usable: true };
+  if (eyeSource === 'stereo') return { ok: true, reason: 'stereo', message: '', usable: true };
+  // Stereo was believed a moment ago. Hold the last eye and say nothing: this is a blink, not a fault.
+  if (msSinceStereo < STEREO_GRACE_MS)
+    return { ok: true, reason: 'blink', message: '', usable: false };
+  return no('waiting', 'Looking for your face in both cameras…');
+}
+
+// ---------------------------------------------------------------- what the user is told
+
+// rigCheck warnings come in two kinds. These are the ones that mean the picture on the glass is not a
+// hologram at all, so they belong on the always-visible banner rather than in a readout that starts hidden.
+const HARD_WARNING = [/behind the virtual screen/i, /under the sheet/i, /No light path/i, /blocks the line of sight/i];
+export const hardWarnings = (warnings = []) => warnings.filter(w => HARD_WARNING.some(re => re.test(w)));
+
+// The one banner, chosen once, in the order a person would have to fix things. Pure so the choice can be
+// tested: getting this order wrong is how "make the sheet bigger" ends up on screen while the real fault is
+// two cameras pointed at a spot two metres away.
+export function bannerFor({ volume = null, warnings = [], aim = null, source = null, mouse = false } = {}) {
+  if (volume?.empty)
+    return { kind: 'bad', title: 'Nothing can be drawn here', text: volume.message };
+  const hard = hardWarnings(warnings);
+  if (hard.length)
+    return { kind: 'bad', title: 'The rig numbers do not describe a working rig', text: hard.join(' ') };
+  if (aim && !aim.ok)
+    return { kind: 'warn', title: 'The camera angles do not match where your head sits', text: aim.message };
+  if (mouse) return null;                       // the stand-in has its own flag; it is not a fault
+  if (source && !source.ok)
+    return { kind: source.reason === 'waiting' ? 'warn' : 'bad',
+             title: source.reason === 'waiting' ? 'Waiting for both cameras' : 'Head tracking is not running',
+             text: source.message };
+  return null;
 }
 
 // ---------------------------------------------------------------- the canvas as a window on the panel
@@ -260,6 +389,31 @@ export function predictedScreenPos(rig, eyeRig, pointRig, viewport, canvasW, can
 // ndcToMonitorUV() is not used here on purpose: it already knows about the flip, so using it would be
 // geometry.js checking geometry.js.
 export const flipTransform = (rc) => rc.flipX ? 'scaleX(-1)' : rc.flipY ? 'scaleY(-1)' : '';
+
+// The OTHER flip, and it is a different question. rigCamera's two mirrored branches differ by a 180 degree
+// roll of the camera basis AND by which flip they report, and those cancel exactly: flipX o R180 = flipY,
+// so the hologram is identical whichever axis is chosen (measured: the monitor uv agrees to 0). The text
+// on the glass is NOT identical - one of them leaves every word rotated 180 degrees - so which axis the
+// OVERLAY is mirrored in has to come from the optics, not from a key the user presses at the rig.
+//
+// Follow a line of text: CSS reading direction is +x on the panel (pixel u), glyph-up is -y (against pixel
+// v). Carry both through the sheet onto the virtual screen and compare with the seated viewer's own right
+// and up. Whichever axis comes back negative is the one to mirror. On this rig that is v, i.e. scaleY(-1);
+// on a folded or vertical-sheet rig it will honestly say something else.
+export function overlayFlip(rig, eyeRig) {
+  const V = virtualScreen(rig);
+  const uDir = unit(sub(V.tr, V.tl)), vDir = unit(sub(V.bl, V.tl));
+  const fwd = unit(sub(V.centre, v3(eyeRig)));
+  const up0 = [0, 1, 0];
+  const up = unit(sub(up0, scale(fwd, dot(fwd, up0))));     // the viewer's up, with the view direction taken out
+  const right = cross(fwd, up);
+  const readsRight = dot(uDir, right) > 0;                  // text already runs left to right
+  const readsUp = dot(scale(vDir, -1), up) > 0;             // and its glyphs already stand up
+  if (readsRight && readsUp) return '';
+  if (readsRight) return 'scaleY(-1)';
+  if (readsUp) return 'scaleX(-1)';
+  return 'rotate(180deg)';                                  // both axes reversed: a roll, not a mirror
+}
 export function screenPos(rc, pointRig, canvasW, canvasH) {
   const pr = projectPoint(rc, pointRig);
   let x = (pr.ndc[0] + 1) / 2 * canvasW;        // the framebuffer, before the canvas transform
@@ -293,7 +447,12 @@ export function viewingArc(setup, n = 5, spanCm = 60) {
 // `viewport` is the part of the panel the canvas actually covers (null when it covers all of it): a window
 // narrower than the panel really can draw less, and an outline that promised the whole panel would hang off
 // the edge of the picture on a desktop.
-export function usableVolume(rig, eyes, { marginCm = 1, steps = 16, viewport = null } = {}) {
+// An empty answer is a real answer and has to say so: a box smaller than this is nothing you could put a
+// model in, and returning 0 without a word is how the page ends up drawing a single stray line on black
+// while the readout reports 60 fps and no warnings.
+export const MIN_VOLUME_CM = 1;
+
+function volumeSearch(rig, eyes, marginCm, steps, viewport) {
   const baseY = rigBaseY(rig);
   const top = -marginCm;                                             // just under the sheet
   const cams = eyes.map(e => rigCamera(rig, e, { viewport }));
@@ -321,6 +480,33 @@ export function usableVolume(rig, eyes, { marginCm = 1, steps = 16, viewport = n
   // finish on a `grow(hx, 'z')` so the pair that comes out is a box that really fits
   for (let pass = 0; pass < 3; pass++) { hx = grow(hz, 'x'); hz = grow(hx, 'z'); }
   return { halfX: hx, halfZ: hz, baseY, topY: top, height: top - baseY };
+}
+
+export function usableVolume(rig, eyes, { marginCm = 1, steps = 16, viewport = null } = {}) {
+  const v = volumeSearch(rig, eyes, marginCm, steps, viewport);
+  v.empty = !(v.halfX >= MIN_VOLUME_CM && v.halfZ >= MIN_VOLUME_CM);
+  v.reason = null; v.message = '';
+  if (!v.empty) return v;
+  // Two very different faults land here and they want opposite advice, so ask which one it is: re-run the
+  // search with the whole panel. If THAT fits something, the rig is fine and this window is the wrong
+  // shape; if it does not, no window would help and the rig numbers are what is wrong.
+  const full = viewport ? volumeSearch(rig, eyes, marginCm, steps, null) : v;
+  const panelAspect = rig.monitor.widthCm / rig.monitor.heightCm;
+  if (viewport && full.halfX >= MIN_VOLUME_CM && full.halfZ >= MIN_VOLUME_CM) {
+    const w = (viewport.u1 - viewport.u0) * rig.monitor.widthCm;
+    const h = (viewport.v1 - viewport.v0) * rig.monitor.heightCm;
+    v.reason = 'window-shape';
+    v.message = `This window covers a ${(w / h).toFixed(1)}:1 strip of a ${panelAspect.toFixed(2)}:1 panel, and `
+      + 'nothing in the volume is visible from the whole viewing arc through a strip that shape. '
+      + 'Maximise the window (or press F for fullscreen), or undock the devtools. '
+      + `Fullscreen this rig has ${(full.halfX * 2).toFixed(0)} x ${(full.halfZ * 2).toFixed(0)} cm to draw in.`;
+  } else {
+    v.reason = 'rig-numbers';
+    v.message = 'These rig numbers leave nothing drawable from any window: at this tilt and panel size no '
+      + 'part of the space under the sheet is in the picture from the whole viewing arc. '
+      + 'Check the monitor diagonal and the tilt in step 3 (press S).';
+  }
+  return v;
 }
 // The base plane: the black paper, `baseDropCm` under the sheet. Stored on the rig only through the model
 // anchor, so it is read back the way rigFromSetup wrote it.
@@ -381,19 +567,27 @@ export function mouseEye(nx, ny, setup) {
 
 // ---------------------------------------------------------------- readout
 
-export function readoutLines({ setup, rig, eyeRig, source, status, fps, check, mouse }) {
+export function readoutLines({ setup, rig, eyeRig, source, status, fps, check, mouse, volume, aim }) {
   const f = (n, d = 1) => (n >= 0 ? ' ' : '') + n.toFixed(d);
   const s = status || {};
   const views = (s.sources || []).flatMap(c => c.views || []);
+  const ang = pairAngles(setup);
   const lines = [
     `eye  rig ${eyeRig.map(n => f(n).padStart(6)).join(' ')} cm${mouse ? '   MOUSE STAND-IN, not tracking' : ''}`,
     `trim     ${setup.trimCm.map(n => f(n).padStart(6)).join(' ')} cm  (tracker origin)`,
     `head from ${source?.reason || 'none'}  ·  cameras ${(s.sources || []).length}` +
       `  ·  seeing head ${(s.sources || []).filter(c => c.seesHead).length}` +
+      // the eye's own error bar: a stereo eye with no residual beside it is a number nobody has checked
+      (s.eyeResidualCm != null ? `  ·  rays miss ${s.eyeResidualCm.toFixed(2)} cm` : '') +
       (s.solver ? `  ·  ${s.solver}` : ''),
     views.length ? `views    ${views.map(v => `${v.fps} fps ${v.latencyMs} ms`).join('  ·  ')}` : 'views    none',
-    `render   ${fps.toFixed(0)} fps  ·  flip ${rig.flipAxis}  ·  pair ${round(setup.pair.baselineCm / INCH_CM, 1)}" apart`,
+    `pair     ${round(setup.pair.baselineCm / INCH_CM, 1)}" apart  ·  toe ${ang.toeInDeg} tilt ${ang.tiltUpDeg} deg`
+      + ` (${ang.manual ? 'typed' : 'aimed at the head spot'})`,
+    `render   ${fps.toFixed(0)} fps`
+      + (volume ? `  ·  volume ${(volume.halfX * 2).toFixed(1)} x ${(volume.halfZ * 2).toFixed(1)} cm` : ''),
   ];
+  if (volume?.empty) lines.push(`EMPTY    ${volume.message}`);
+  if (aim && !aim.ok) lines.push(`AIM      ${aim.message}`);
   for (const w of (check?.warnings || [])) lines.push(`WARN     ${w}`);
   return lines;
 }

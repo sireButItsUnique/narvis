@@ -21,12 +21,17 @@
 <style>
   html, body { margin:0; height:100%; background:#000; overflow:hidden; color:#cfe8ff;
     font:13px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; -webkit-user-select:none; user-select:none; }
-  /* The sheet reflects once, so ONE flip goes between what is rendered and what reaches the glass, and it
-     lives here: the stage carries it, and everything the user reads through the sheet lives on the stage.
+  /* The sheet reflects once, so ONE flip goes between what is rendered and what reaches the glass.
      (rigtest.html flipped its whole document; doing both would cancel and the hologram would come out
-     reversed with every line still in a plausible-looking place.) */
-  #stage { position:fixed; inset:0; transform-origin:50% 50%; }
-  canvas#view { display:block; position:absolute; inset:0; width:100%; height:100%; }
+     reversed with every line still in a plausible-looking place.)
+     TWO transforms, not one, because they answer different questions. The canvas carries the RENDER flip,
+     whose axis rigCamera picks and which cannot be chosen freely. The overlay carries the TEXT flip, which
+     RT.overlayFlip works out from the optics - the two rigCamera branches differ by a 180 degree roll that
+     the render flip cancels, so the hologram is identical either way but the words are not, and sharing one
+     transform between them is what left every message on the glass upside down. */
+  #stage { position:fixed; inset:0; }
+  #overlay { position:fixed; inset:0; transform-origin:50% 50%; }
+  canvas#view { display:block; position:absolute; inset:0; width:100%; height:100%; transform-origin:50% 50%; }
   .hidden { display:none !important; }
 
   /* The rig view starts with nothing on it but the test content: on plain acrylic every lit pixel becomes
@@ -86,10 +91,13 @@
 </style>
 </head>
 <body>
-<!-- Everything that is read through the sheet sits on the stage, which carries the one flip. Text included:
-     the monitor faces down at 45 degrees, so a message that is not flipped is a message nobody can read. -->
+<!-- The hologram and the words about it both reach the eye through the sheet, so both are mirrored on the
+     way - but not necessarily in the same axis, and the words are the ones that become unreadable if the
+     wrong one is picked. Hence two wrappers with two separately derived transforms. -->
 <div id="stage">
   <canvas id="view"></canvas>
+</div>
+<div id="overlay">
   <div id="banner" class="hidden"></div>
   <div id="mouseflag" class="hidden">MOUSE STAND-IN — this is not head tracking</div>
   <div id="trimflag" class="hidden"></div>
@@ -121,7 +129,11 @@
     <p class="note">Both webcams watch your head; the pair is the only head tracker. Press Start, then mark
       one camera <b>left</b> and the other <b>right</b> — left is the one on <i>your</i> left as you face the rig.
       Aim each one until the blue dots sit on your eyes in both pictures at once.
-      (A ZED on the base is for hands later; leave it off here.)</p>
+      <b class="warn">Two webcams of the same model report the same name</b>, so tell them apart by covering
+      one lens and watching which picture goes dark, not by the label. Getting them the wrong way round
+      halves the parallax; the page now measures how far the two cameras' answers miss each other and
+      refuses the eye rather than drawing a plausible wrong one, but it can only see that once you move off
+      the centre line. (A ZED on the base is for hands later; leave it off here.)</p>
     <div class="row" style="margin-top:0">
       <button id="startCams" class="primary">Start cameras</button>
       <button id="stopCams">Stop</button>
@@ -133,7 +145,11 @@
   <section class="panel" data-panel="2">
     <h2>Where the pair is</h2>
     <p class="note">Measured from the centre of the rig, which is the middle of the acrylic sheet. The two
-      cameras are symmetric about it. Height is measured from the sheet, so 0 means "level with the sheet".</p>
+      cameras are symmetric about it. Height is measured from the sheet, so 0 means "level with the sheet".
+      The <b>baseline, height, depth and where your head sits</b> are the measurements; the two angles are
+      worked out from them and follow them as you edit, because in step 1 you aimed the cameras at your own
+      face and these numbers have to describe that same aim. Type an angle only if you really measured it
+      with a protractor — after that they stop following, and the page will say so if they drift apart.</p>
     <div class="grid">
       <div>
         <label class="f"><span>units</span><select id="units"><option value="in">inches</option><option value="cm">cm</option></select></label>
@@ -176,7 +192,9 @@
         <label class="f"><span>model size in the volume</span><input type="number" id="fit" step="0.5"></label>
       </div>
       <div>
-        <label class="f"><span>flip axis</span><select id="flip"><option value="y">upside down (y)</option><option value="x">mirrored (x)</option></select></label>
+        <!-- Not a flip-axis picker. The mirror parity is forced by the optics and rigCamera derives it;
+             the only thing a person can actually change is which way up the panel is bolted. -->
+        <label class="f"><span>the panel is mounted upside down</span><input type="checkbox" id="rot180"></label>
         <label class="f"><span>fullscreen on the rig monitor</span><input type="checkbox" id="fullscreen"></label>
         <div class="mono" id="rigOut"></div>
       </div>
@@ -237,7 +255,7 @@ let droppedName = '';
 // ---------------------------------------------------------------- renderer
 // preserveDrawingBuffer so the headless test can read the framebuffer back and say where a known point
 // really landed, rather than trusting the same matrices twice.
-const canvas = $('view'), stage = $('stage');
+const canvas = $('view'), overlay = $('overlay');   // #stage only positions the canvas; the flip is on each
 const renderer = new THREE.WebGLRenderer({ antialias: true, canvas, preserveDrawingBuffer: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setClearColor(0x000000, 1);
@@ -381,6 +399,10 @@ function buildScene() {
   posts = RT.postLayout(vol);
   marks = RT.postMarks(posts, RT.viewingArc(setup, 3), vol.baseY);
   probeDot.position.set(...RT.probePoint(vol));
+  // An empty volume must LOOK empty. Drawing it anyway gives a degenerate outline collapsed to one stray
+  // line, or three posts stacked in a single column: a lit, plausible, meaningless picture, which is worse
+  // than a black screen because it looks like something. The banner says what is wrong instead.
+  if (vol.empty) { hint(); return; }
   if (sceneKind === 'cube') world.add(cubeScene(vol));
   else if (sceneKind === 'posts') world.add(postScene(vol, posts, marks));
   else if (sceneKind === 'teapot') {
@@ -396,54 +418,88 @@ function buildScene() {
 // ---------------------------------------------------------------- the eye
 
 // The two-webcam pair is the only head source. This never falls back to one camera: see headSource().
+// It also never takes the pair's word for it. A stereo fuse is a measurement only if the two rays actually
+// met (the residual) and the answer is somewhere a head could be; otherwise it is a pose error wearing a
+// measurement's clothes, and this rig's worst failure - a steady, plausible, completely wrong hologram.
 function updateEye() {
   const st = cams.running ? camerasStatus() : null;
   const chosen = (setup.cameras.left ? 1 : 0) + (setup.cameras.right ? 1 : 0);
+  const candidate = st ? RT.eyeToRig([input.eye.x, input.eye.y, input.eye.z], setup) : null;
   source = RT.headSource({
     cameras: st ? st.sources.length : 0,
     seeingHead: st ? st.sources.filter(c => c.seesHead).length : 0,
     eyeSource: st ? st.eyeSource : 'none',
+    msSinceStereo: st ? st.msSinceStereo : Infinity,
+    residualCm: st ? st.eyeResidualCm : null,
+    swapHint: st ? st.eyeSwapHint : false,
+    eyeRig: candidate, headRig: setup.head.positionCm,
     chosen,
   });
   if (pinnedEye) { eyeRig = pinnedEye.slice(); return; }
   if (mouseMode) { eyeRig = RT.mouseEye(mouseN.x, mouseN.y, setup); return; }
-  if (source.ok) eyeRig = RT.eyeToRig([input.eye.x, input.eye.y, input.eye.z], setup);
-  // not ok: keep the last eye. The picture freezing is honest; a made-up eye is not.
+  if (source.usable && candidate) eyeRig = candidate;
+  // not usable: keep the last eye. The picture freezing is honest; a made-up eye is not. During a blink
+  // (source.ok, source.usable false) it holds still and says nothing, which is what a blink deserves.
 }
 
 // ---------------------------------------------------------------- the frame
 
-function layout() {
+// The usable volume, the posts and the sight marks are all computed FROM the viewport, so a viewport that
+// changes without rebuilding them leaves the page drawing last window's geometry: press F and the hologram
+// stays 10% narrower than the panel can do, and coming back out of fullscreen hangs the volume outline off
+// the edge of the picture, which its own design note promises never happens.
+const sameViewport = (a, b) => (!a && !b)
+  || !!(a && b && a.u0 === b.u0 && a.v0 === b.v0 && a.u1 === b.u1 && a.v1 === b.v1);
+let rebuildTimer = 0;
+function layout(rebuildOnChange = true) {
   const w = innerWidth, h = innerHeight;
   renderer.setSize(w, h, false);
   // Fullscreen on the rig, the canvas IS the panel and rigCamera needs no viewport. Anywhere else the
   // canvas is a differently-shaped window ON the panel; say which part, rather than stretching a 16:9
   // frustum across it and tilting every line in the picture.
-  viewport = coversPanel() ? null : RT.letterboxViewport(rig.monitor.widthCm, rig.monitor.heightCm, w, h);
+  const next = coversPanel() ? null : RT.letterboxViewport(rig.monitor.widthCm, rig.monitor.heightCm, w, h);
+  const changed = !sameViewport(next, viewport);
+  viewport = next;
+  // Debounced: a drag-resize changes the aspect ratio on every frame, and buildScene reloads the .glb.
+  if (changed && rebuildOnChange) {
+    clearTimeout(rebuildTimer);
+    rebuildTimer = setTimeout(buildScene, 150);
+  }
 }
 function coversPanel() {
   if (!setup.rig.fullScreen) return false;
   if (document.fullscreenElement) return true;
   return Math.abs(innerWidth - screen.width) < 4 && Math.abs(innerHeight - screen.height) < 40;
 }
-addEventListener('resize', layout);
+addEventListener('resize', () => layout());
+// Entering fullscreen through the window manager can flip fullscreenElement without a resize, and leaving
+// it fires both; either way the viewport has moved and the geometry has to follow.
+addEventListener('fullscreenchange', () => layout());
 
 let frames = 0, fpsAt = performance.now(), fps = 0;
 function frame(now) {
   updateEye();
   rc = rigCamera(rig, eyeRig, { viewport });
   applyRigCamera(camera, rc);
-  // The sheet reflects once, so the picture is mirrored on its way to the panel and exactly ONE flip goes
-  // between the render and the monitor. It lives here, in the canvas transform. rigtest.html flipped the
-  // whole document instead; doing both would cancel and the hologram would come out reversed with every
-  // line still in a plausible place, which is the hardest kind of wrong to see.
-  const t = RT.flipTransform(rc);
-  if (stage.style.transform !== t) stage.style.transform = t;
-  renderer.render(scene, camera);
+  applyFlips();
+  // While the setup panel covers the screen there is nothing of the rig view to see (it is opaque and
+  // inset:0), so the whole frame budget goes to the camera previews the user is aiming by.
+  if (!setupVisible()) renderer.render(scene, camera);
   frames++;
   if (now - fpsAt > 500) { fps = frames * 1000 / (now - fpsAt); frames = 0; fpsAt = now; paintChrome(); }
   requestAnimationFrame(frame);
 }
+
+// The render flip (axis chosen by rigCamera) on the canvas; the text flip (axis worked out from the optics)
+// on the overlay. Sharing one transform is what made pressing X leave every word on the glass upside down
+// while changing nothing at all about the hologram.
+function applyFlips() {
+  const t = RT.flipTransform(rc);
+  if (canvas.style.transform !== t) canvas.style.transform = t;
+  const o = RT.overlayFlip(rig, eyeRig);
+  if (overlay.style.transform !== o) overlay.style.transform = o;
+}
+const setupVisible = () => !$('setup').classList.contains('hidden');
 
 // ---------------------------------------------------------------- chrome
 
@@ -452,30 +508,32 @@ const flash = m => { flashText = m; flashUntil = performance.now() + 5000; };
 
 function paintChrome() {
   const b = $('banner');
+  check = rigCheck(rig, eyeRig);
+  const aim = RT.aimCheck(setup);
+  // One banner, chosen in the order a person would have to fix things. The hard rigCheck warnings and an
+  // empty volume used to reach only #readout, which starts hidden - so the commonest way to see this page
+  // fail was a black screen with nothing on it and a readout nobody had pressed H for.
+  const msg = RT.bannerFor({ volume: vol, warnings: check.warnings, aim, source, mouse: mouseMode });
   if (performance.now() < flashUntil) {
     b.className = ''; b.innerHTML = `<b>${escapeHtml(flashText)}</b>`;
-  } else if (mouseMode) {
-    b.className = 'hidden';
-  } else if (!source.ok) {
-    b.className = source.reason === 'waiting' ? '' : 'bad';
-    b.innerHTML = `<b>${source.reason === 'waiting' ? 'Waiting for both cameras' : 'Head tracking is not running'}</b>${escapeHtml(source.message)}`;
+  } else if (msg) {
+    b.className = msg.kind === 'bad' ? 'bad' : '';
+    b.innerHTML = `<b>${escapeHtml(msg.title)}</b>${escapeHtml(msg.text)}`;
   } else b.className = 'hidden';
   $('mouseflag').classList.toggle('hidden', !mouseMode);
 
-  check = rigCheck(rig, eyeRig);
   const r = $('readout');
   if (!r.classList.contains('hidden'))
     r.textContent = RT.readoutLines({ setup, rig, eyeRig, source, status: cams.running ? camerasStatus() : null,
-                                      fps, check, mouse: mouseMode }).join('\n');
+                                      fps, check, mouse: mouseMode, volume: vol, aim }).join('\n');
   if (trimMode) paintTrim();
-  if (!$('setup').classList.contains('hidden')) paintCams();
 }
 const escapeHtml = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
 function hint() {
   $('hint').textContent = [
     `scene: ${sceneKind}${droppedName ? ' (' + droppedName + ')' : ''}   1 cube · 2 posts · 3 teapot · 4 dropped .glb`,
-    'S setup   H readout   M mouse stand-in   T trim   F fullscreen   X flip axis   V flip the setup page too',
+    'S setup   H readout   M mouse stand-in   T trim   F fullscreen   X panel mounted upside down   V flip the setup page too',
   ].join('\n');
 }
 
@@ -506,7 +564,12 @@ async function refreshDevices() {
   renderCamPicker();
 }
 
-const camKey = d => d.label || d.deviceId;
+// Keyed by deviceId, NEVER by label. The rig's head tracker is two webcams of the same model, and two
+// same-model cameras report the identical MediaDeviceInfo.label in Chromium (friendly name + vid:pid, no
+// uniquifier) - so keying by label collapses both cameras onto one entry, hands them both one camera's
+// extrinsics, and the "triangulated" eye sits on that lens for ever while the page reports healthy stereo
+// tracking at 60 fps. A key is an identity; the label is evidence, and it lives inside the entry.
+const camKey = d => d.deviceId;
 const pickedSide = d => setup.cameras.left?.deviceId === d.deviceId ? 'left'
   : setup.cameras.right?.deviceId === d.deviceId ? 'right' : null;
 
@@ -541,6 +604,18 @@ function pick(d, side) {
   if (cams.running) flash('Press Start cameras again to use the new choice');
 }
 
+// Step 1 is the one step that is done with the hands, by watching: the user physically swings each camera
+// until the blue dots land on their own eyes. That has to be drawn at frame rate. It used to ride on the
+// 500 ms banner tick, so the preview was up to half a second stale and moved twice a second, which reads as
+// a broken camera - while the rig view nobody could see rendered at 60.
+let camLoop = 0;
+function setCamLoop(on) {
+  if (on && !camLoop) {
+    const tick = () => { if (!camLoop) return; paintCams(); camLoop = requestAnimationFrame(tick); };
+    camLoop = requestAnimationFrame(tick);
+  } else if (!on && camLoop) { cancelAnimationFrame(camLoop); camLoop = 0; }
+}
+
 function paintCams() {
   for (const el of $('camGrid').children) {
     const id = el.dataset.deviceId, side = pickedSide({ deviceId: id });
@@ -555,6 +630,7 @@ function paintCams() {
   const st = cams.running ? camerasStatus() : null;
   $('camLine').textContent = st
     ? `mode ${st.mode} · head from ${st.eyeSource} · ${st.sources.filter(c => c.seesHead).length} of ${st.sources.length} see a face`
+      + (st.eyeResidualCm != null ? ` · rays miss ${st.eyeResidualCm.toFixed(2)} cm` : '')
     : 'not started';
 }
 
@@ -575,16 +651,26 @@ function drawFeed(cv, src) {
 
 async function start() {
   if (!setup.cameras.left || !setup.cameras.right) { flash('Mark one camera left and one right first'); return; }
+  if (setup.cameras.left.deviceId === setup.cameras.right.deviceId) {
+    flash('Left and right are the same camera — one camera cannot triangulate anything'); return;
+  }
   const pc = RT.pairCameras(setup);
-  const prefs = {}, ext = {};
+  const prefs = {}, ext = {}, extById = {};
   for (const d of devList) {
     const side = pickedSide(d), k = camKey(d);
+    if (prefs[k]) { flash('Two cameras came back with the same id; unplug one and press Start again'); return; }
     prefs[k] = { key: { deviceId: d.deviceId, label: d.label || '', groupId: d.groupId || '' },
                  role: side ? 'head' : 'off', dfovDeg: setup.pair.dfovDeg };
-    if (side) ext[k] = { posCm: pc[side === 'left' ? 0 : 1].posCm, rotDeg: pc[side === 'left' ? 0 : 1].rotDeg };
+    if (side) {
+      const e = { posCm: pc[side === 'left' ? 0 : 1].posCm, rotDeg: pc[side === 'left' ? 0 : 1].rotDeg };
+      ext[k] = e;
+      // extById is the one cameras.js reads first: a rig-frame pose belongs to a physical camera, and must
+      // not travel through a prefKey that anything upstream could ever match by label.
+      extById[d.deviceId] = e;
+    }
   }
   try {
-    await startCameras({ prefs, ext, status: m => { if (m) flash(m); },
+    await startCameras({ prefs, ext, extById, status: m => { if (m) flash(m); },
                          detector: params.get('detector') || 'auto', allowBlob: params.get('allowBlob') === '1' });
   } catch (e) { flash('Cameras failed: ' + (e?.message || e)); }
   paintCams();
@@ -608,7 +694,9 @@ navigator.mediaDevices?.addEventListener?.('devicechange', () => {
 // ---------------------------------------------------------------- setup form
 
 function save() { RT.saveSetup(setup); }
-function rebuild() { rig = RT.rigFromSetup(setup); layout(); buildScene(); paintForm(); }
+// layout(false): the rebuild is right here, so letting layout schedule a second one would build twice and
+// re-fetch the .glb for nothing.
+function rebuild() { rig = RT.rigFromSetup(setup); layout(false); buildScene(); paintForm(); }
 
 const U = () => setup.units;
 const setNum = (id, cm) => { $(id).value = RT.fromCm(cm, U()).toFixed(2).replace(/\.?0+$/, ''); };
@@ -618,20 +706,30 @@ function paintForm() {
   const p = setup.pair, r = setup.rig, h = setup.head;
   $('units').value = setup.units;
   setNum('baseline', p.baselineCm); setNum('camHeight', p.heightCm); setNum('camDepth', p.depthCm);
-  $('toeIn').value = p.toeInDeg; $('tiltUp').value = p.tiltUpDeg; $('dfov').value = p.dfovDeg;
+  const ang = RT.pairAngles(setup);
+  $('toeIn').value = ang.toeInDeg; $('tiltUp').value = ang.tiltUpDeg; $('dfov').value = p.dfovDeg;
   setNum('headX', h.positionCm[0]); setNum('headY', h.positionCm[1]); setNum('headZ', h.positionCm[2]);
   $('diag').value = r.monitorDiagIn; $('pixels').value = `${r.pixelW}x${r.pixelH}`;
   $('tilt').value = r.tiltDeg;
   setNum('mdrop', r.monitorDropCm); setNum('mfwd', r.monitorForwardCm); setNum('bdrop', r.baseDropCm);
   setNum('sheetW', r.sheetWidthCm); setNum('sheetD', r.sheetDepthCm); setNum('fit', r.modelFitCm);
-  $('flip').value = r.flipAxis; $('fullscreen').checked = !!r.fullScreen;
+  $('rot180').checked = !!r.rot180; $('fullscreen').checked = !!r.fullScreen;
 
   const pc = RT.pairCameras(setup), o = RT.trackerOriginRig(setup);
+  // These angles ARE the triangulation extrinsics, so a disagreement between them and where the user says
+  // they sit is not a note for later: it decides where the tracker thinks their head is. Both numbers are
+  // right here, so say it where they are being typed.
+  const aim = RT.aimCheck(setup), at = aim.convergeRig;
   $('pairOut').textContent = [
     `left  camera at rig ${pc[0].posCm.map((n, i) => (n + o[i]).toFixed(1).padStart(6)).join(' ')} cm`,
     `right camera at rig ${pc[1].posCm.map((n, i) => (n + o[i]).toFixed(1).padStart(6)).join(' ')} cm`,
     `tracker origin is rig ${o.map(n => n.toFixed(1)).join(', ')} cm`,
+    at ? `both lenses point at rig ${at.map(n => n.toFixed(1)).join(', ')} cm` : 'the two lenses never meet',
+    aim.ok ? (aim.used.manual ? 'angles: typed, and they agree with where your head sits'
+                              : 'angles: worked out from where your head sits')
+           : `\nWARNING — ${aim.message}`,
   ].join('\n');
+  $('pairOut').className = aim.ok ? 'mono' : 'mono warn';
 
   const m = RT.monitorSizeCm(r), need = RT.minimumSheetCm(rig, RT.viewingArc(setup, 7));
   const v = RT.usableVolume(rig, RT.viewingArc(setup, 5), { viewport });
@@ -652,8 +750,11 @@ function readForm() {
   p.baselineCm = getNum('baseline', p.baselineCm);
   p.heightCm = getNum('camHeight', p.heightCm);
   p.depthCm = getNum('camDepth', p.depthCm);
-  p.toeInDeg = parseFloat($('toeIn').value) || 0;
-  p.tiltUpDeg = parseFloat($('tiltUp').value) || 0;
+  // An angle only counts as the user's own if they TYPED it; otherwise it is whatever paintForm last
+  // showed, and treating that as a measurement is what let a stale 14/12 outlive the baseline it came from.
+  const toe = parseFloat($('toeIn').value), tilt = parseFloat($('tiltUp').value);
+  if (p.aimManual) { p.toeInDeg = Number.isFinite(toe) ? toe : p.toeInDeg;
+                     p.tiltUpDeg = Number.isFinite(tilt) ? tilt : p.tiltUpDeg; }
   p.dfovDeg = parseFloat($('dfov').value) || p.dfovDeg;
   setup.head.positionCm = [getNum('headX', 0), getNum('headY', 40), getNum('headZ', 45)];
   r.monitorDiagIn = parseFloat($('diag').value) || r.monitorDiagIn;
@@ -666,16 +767,24 @@ function readForm() {
   r.sheetWidthCm = getNum('sheetW', 0);
   r.sheetDepthCm = getNum('sheetD', 0);
   r.modelFitCm = getNum('fit', r.modelFitCm);
-  r.flipAxis = $('flip').value;
+  r.rot180 = $('rot180').checked;
   r.fullScreen = $('fullscreen').checked;
   save();
   rebuild();
 }
-for (const id of ['baseline', 'camHeight', 'camDepth', 'toeIn', 'tiltUp', 'dfov', 'headX', 'headY', 'headZ',
-                  'diag', 'pixels', 'tilt', 'mdrop', 'mfwd', 'bdrop', 'sheetW', 'sheetD', 'fit', 'flip', 'fullscreen'])
+for (const id of ['baseline', 'camHeight', 'camDepth', 'dfov', 'headX', 'headY', 'headZ',
+                  'diag', 'pixels', 'tilt', 'mdrop', 'mfwd', 'bdrop', 'sheetW', 'sheetD', 'fit', 'rot180', 'fullscreen'])
   $(id).addEventListener('change', readForm);
+// Typing an angle by hand is the only thing that makes the pair stop following the head spot. Until then
+// the baseline and the head position are the single source of truth and the angles are derived from them,
+// so editing either one re-aims the pair instead of leaving the old angles behind.
+for (const id of ['toeIn', 'tiltUp'])
+  $(id).addEventListener('change', () => { setup.pair.aimManual = true; readForm(); });
 $('units').onchange = () => { setup.units = $('units').value; save(); paintForm(); };
-$('aimBtn').onclick = () => { Object.assign(setup.pair, RT.aimPair(setup)); save(); paintForm(); };
+$('aimBtn').onclick = () => {
+  setup.pair.aimManual = false; setup.pair.toeInDeg = null; setup.pair.tiltUpDeg = null;
+  save(); rebuild();
+};
 $('trimZero').onclick = () => { setup.trimCm = [0, 0, 0]; save(); paintForm(); };
 $('trimBtn').onclick = () => { showSetup(false); setTrim(true); };
 $('startCams').onclick = start;
@@ -694,11 +803,13 @@ function showStep(n) {
   for (const b of document.querySelectorAll('.steps button[data-step]')) b.classList.toggle('on', b.dataset.step === n);
   for (const p of document.querySelectorAll('.panel')) p.classList.toggle('on', p.dataset.panel === n);
   if (n === '1') refreshDevices();
+  setCamLoop(n === '1' && setupVisible());     // only step 1 shows the feeds; nothing else needs the frames
 }
 function showSetup(on) {
   $('setup').classList.toggle('hidden', !on);
   // (the rig view is simply what is behind the setup panel; nothing else changes)
   if (on) { paintForm(); showStep(document.querySelector('.steps button.on')?.dataset.step || '1'); }
+  else { setCamLoop(false); renderNow(); }     // one fresh frame, so the rig view is not a stale one
 }
 
 // ---------------------------------------------------------------- trim
@@ -751,7 +862,14 @@ addEventListener('keydown', e => {
   else if (k === 'h') { const on = $('readout').classList.toggle('hidden'); $('hint').classList.toggle('hidden', on); }
   else if (k === 'm') { mouseMode = !mouseMode; pinnedEye = null; flash(mouseMode ? 'Mouse stand-in ON — not head tracking' : 'Mouse stand-in off'); }
   else if (k === 't') setTrim(!trimMode);
-  else if (k === 'x') { setup.rig.flipAxis = setup.rig.flipAxis === 'x' ? 'y' : 'x'; save(); rebuild(); }
+  // NOT a flip-axis toggle. The mirror parity is forced by the optics and rigCamera derives it, and the
+  // two axes differ only by a roll the flip cancels - so the old X key changed nothing about the hologram
+  // and left every word on the glass upside down. What a person at the rig can actually be wrong about is
+  // which way up the panel is bolted, and that IS a different picture.
+  else if (k === 'x') {
+    setup.rig.rot180 = !setup.rig.rot180; save(); rebuild();
+    flash(setup.rig.rot180 ? 'Panel treated as mounted upside down' : 'Panel treated as mounted the right way up');
+  }
   // the rig view is always flipped for the sheet; the setup page is not, because it is normally read on a
   // desk. Once the monitor is mounted face-down this is the only way to read it, so it is one key away.
   else if (k === 'v') document.body.classList.toggle('mirror-setup');
@@ -805,10 +923,14 @@ window.rigtest2 = {
       camera: RT.screenPos(rc, p, w, h),                              // the matrices the GPU used, then the flip
       trace: RT.predictedScreenPos(rig, eyeRig, p, viewport, w, h),   // an independent ray trace
       pixels: readProbePixel(),                                       // what is actually lit on the canvas
-      canvas: { w, h }, transform: stage.style.transform,
+      canvas: { w, h }, transform: canvas.style.transform, overlayTransform: overlay.style.transform,
     };
   },
   status: () => ({ source, mouseMode, sceneKind, fps, flip: RT.flipTransform(rc),
+                   overlayFlip: RT.overlayFlip(rig, eyeRig), aim: RT.aimCheck(setup),
+                   volume: vol && { halfX: vol.halfX, halfZ: vol.halfZ, empty: vol.empty, reason: vol.reason },
+                   banner: RT.bannerFor({ volume: vol, warnings: rigCheck(rig, eyeRig).warnings,
+                                          aim: RT.aimCheck(setup), source, mouse: mouseMode }),
                    warnings: rigCheck(rig, eyeRig).warnings, cams: cams.running ? camerasStatus() : null }),
 };
 
@@ -816,8 +938,7 @@ window.rigtest2 = {
 function renderNow() {
   rc = rigCamera(rig, eyeRig, { viewport });
   applyRigCamera(camera, rc);
-  const t = RT.flipTransform(rc);
-  if (stage.style.transform !== t) stage.style.transform = t;
+  applyFlips();
   renderer.render(scene, camera);
 }
 
@@ -837,14 +958,16 @@ function readProbePixel() {
   }
   if (!n) return null;
   const dpr = w / innerWidth;
-  let cx = (sx / n) / dpr, cy = (h - sy / n) / dpr;      // device px, bottom-up  ->  CSS px, top-down
+  // Pixel INDICES, so the centre of pixel i is i + 0.5; without that the two flip branches disagree by a
+  // pixel and the test helper looks like the renderer is off by one.
+  let cx = (sx / n + 0.5) / dpr, cy = (h - sy / n - 0.5) / dpr;   // device px, bottom-up -> CSS px, top-down
   if (rc.flipX) cx = innerWidth - cx;                    // the canvas transform, undone
   if (rc.flipY) cy = innerHeight - cy;
   return { x: cx, y: cy, lit: n };
 }
 
 // ---------------------------------------------------------------- go
-layout();
+layout(false);            // the buildScene on the next line is the one this first layout would schedule
 buildScene();
 paintForm();
 showStep('1');

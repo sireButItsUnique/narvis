@@ -108,6 +108,35 @@ test('preferences attach to the right camera', () => {
   assert.equal(merged[1].pref, null);
 });
 
+test('two cameras can never be handed the same preference entry', () => {
+  // The rig's head tracker is two webcams of the SAME model, and Chromium gives them the identical label
+  // (friendly name + vid:pid, no uniquifier). If both resolve to one entry they get one camera's pose, the
+  // two stereo rays start from the same point, and the triangulated head sits on that lens for ever while
+  // everything reports healthy stereo tracking. So matching has to be injective, not just plausible.
+  const label = 'HD Pro Webcam C920 (046d:082d)';
+  const twins = [dev(label, 'id-A', 'g-A'), dev(label, 'id-B', 'g-B')];
+
+  // an exact deviceId match must beat an EARLIER entry's label match, whatever the iteration order
+  const both = { 'cam-A': { key: { deviceId: 'id-A', label }, role: 'head' },
+                 'cam-B': { key: { deviceId: 'id-B', label }, role: 'head' } };
+  const m = mergePrefs(both, twins);
+  assert.equal(m[0].prefKey, 'cam-A');
+  assert.equal(m[1].prefKey, 'cam-B', 'the label fallback must not swallow the second camera');
+
+  // and with only ONE entry to go round, exactly one device gets it and the other gets its own identity
+  const one = mergePrefs({ 'cam-A': { key: { deviceId: 'id-B', label }, role: 'head' } }, twins);
+  assert.notEqual(one[0].prefKey, one[1].prefKey);
+  assert.equal(one.filter(d => d.pref).length, 1, 'claimed once');
+  assert.equal(one[1].prefKey, 'cam-A', 'by exact deviceId, not by whichever came first');
+  assert.equal(one[0].pref, null);
+  assert.equal(one[0].prefKey, 'id-A', 'a device with no entry is keyed by its own id, not its shared label');
+
+  // the replug fallbacks still work when there is nothing better: a changed deviceId still finds its entry
+  const replugged = mergePrefs({ mine: { key: { deviceId: 'old', label: 'Integrated Camera' }, role: 'hands' } },
+                               [dev('Integrated Camera', 'brand-new')]);
+  assert.equal(replugged[0].pref.role, 'hands');
+});
+
 test('preferences survive a store that throws (private browsing)', () => {
   const store = { getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); } };
   assert.deepEqual(loadPrefs(store), {});

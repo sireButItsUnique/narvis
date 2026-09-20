@@ -15,15 +15,18 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_SETUP, mergeSetup, loadSetup, saveSetup, SETUP_KEY, INCH_CM, toCm, fromCm,
   rigFromSetup, monitorSizeCm, minimumSheetCm, baseYCm, rigBaseY,
-  pairCameras, trackerOriginRig, eyeToRig, rigToTracker, aimPair,
-  headSource, letterboxViewport, monitorUVToCanvas, predictMonitorUV, predictedScreenPos,
-  screenPos, flipTransform, viewingArc, usableVolume, postLayout, postMarks, sightMark, probePoint,
-  mouseEye, readoutLines,
+  pairCameras, pairAngles, trackerOriginRig, eyeToRig, rigToTracker, aimPair, aimCheck, convergeRig,
+  AIM_TOLERANCE_DEG, headSource, STEREO_GRACE_MS, letterboxViewport, monitorUVToCanvas,
+  predictMonitorUV, predictedScreenPos, screenPos, flipTransform, overlayFlip, viewingArc, usableVolume,
+  postLayout, postMarks, sightMark, probePoint, mouseEye, readoutLines, bannerFor, hardWarnings,
 } from '../public/js/rig/rigtest2.js';
 import {
   rigCamera, virtualScreen, panelRect, rectUV, rectPoint, plane, rayPlane, reflectPoint,
-  add, sub, scale, unit, dist, projectToMonitor, rigCheck,
+  add, sub, scale, unit, dot, cross, dist, projectToMonitor, rigCheck,
 } from '../public/js/rig/geometry.js';
+import { mergePrefs } from '../public/js/input/devices.js';
+import { viewsForCamera, triangulate, residualCm } from '../public/js/input/stereo.js';
+import { focalPxFromDiagFov } from '../public/js/input/devices.js';
 
 const setup = () => mergeSetup(null);
 const near = (a, b, tol, what) => assert.ok(Math.abs(a - b) <= tol, `${what}: ${a} vs ${b} (tol ${tol})`);
@@ -420,4 +423,300 @@ test('the readout says where the eye is, where the trim is and what is wrong', (
   assert.match(text, /30 fps 42 ms/, 'per-camera fps and latency');
   assert.match(text, /59 fps/, 'render fps');
   assert.match(text, /track\/solve\.js/, 'and which triangulator the pair is actually going through');
+});
+
+// ---------------------------------------------------------------- the defaults have to agree with THEMSELVES
+
+// A forward projection written out here rather than imported, so this does not check stereo.js with
+// stereo.js. world = Rz*Ry*Rx * cam + posCm, so cam = R^T (world - posCm); then a pinhole.
+function rotRows([rx, ry, rz]) {
+  const [a, b, c] = [rx, ry, rz].map(d => d * Math.PI / 180);
+  const cx = Math.cos(a), sx = Math.sin(a), cy = Math.cos(b), sy = Math.sin(b), cz = Math.cos(c), sz = Math.sin(c);
+  return [[cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+          [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+          [-sy, cy * sx, cy * cx]];
+}
+function projectInto(cam, pointTracker, W, H, f) {
+  const M = rotRows(cam.rotDeg), d = sub(pointTracker, cam.posCm);
+  const z = M[0][2] * d[0] + M[1][2] * d[1] + M[2][2] * d[2];
+  if (z <= 0) return null;                       // behind the lens
+  const x = M[0][0] * d[0] + M[1][0] * d[1] + M[2][0] * d[2];
+  const y = M[0][1] * d[0] + M[1][1] * d[1] + M[2][1] * d[2];
+  return [(f * x / z + W / 2) / W, (f * y / z + H / 2) / H];
+}
+// The pair as cameras.js really builds it, so the extrinsics under test are the ones that ship.
+function pairViews(s, cameras = pairCameras(s)) {
+  const W = 1280, H = 720, f = focalPxFromDiagFov(W, H, s.pair.dfovDeg);
+  const intr = { fx: f, fy: f, cx: W / 2, cy: H / 2, k1: 0, k2: 0, k3: 0, p1: 0, p2: 0 };
+  return cameras.map(c => ({ cam: c, W, H, f, intr,
+    view: viewsForCamera({ width: W, height: H, sbs: false, calib: null, intr,
+                           ext: { posCm: c.posCm, rotDeg: c.rotDeg }, label: c.side })[0] }));
+}
+
+test('the shipped pair angles aim at the shipped head spot, and go on doing it when the rig is remeasured', () => {
+  // The defaults used to ship 14 / 12 with a 40-inch baseline and a head 45 cm away: three numbers that
+  // cannot all be true. Nothing compared them, and the tracker decoded that head 159 cm too far away.
+  const s = setup();
+  const used = pairAngles(s), aimed = aimPair(s);
+  near(used.toeInDeg, aimed.toeInDeg, 0.1, 'the toe-in in use aims at the head spot');
+  near(used.tiltUpDeg, aimed.tiltUpDeg, 0.1, 'and so does the tilt');
+  assert.equal(aimCheck(s).ok, true, 'and the page agrees with itself about it');
+  assert.equal(used.manual, false, 'nobody typed these: they are derived');
+
+  // the angles really do point at the head: both optical axes cross the centre line there
+  const at = convergeRig(s);
+  for (let i = 0; i < 3; i++) near(at[i], s.head.positionCm[i], 0.5, `the lenses meet at the head (axis ${i})`);
+
+  // and they FOLLOW the measurements, which is the part that was missing: editing the baseline or the seat
+  // used to leave the old angles behind, and the page shipped in exactly that state.
+  for (const patch of [{ pair: { baselineCm: 60 } }, { head: { positionCm: [0, 30, 70] } },
+                       { pair: { depthCm: 15 } }, { pair: { heightCm: -8 } }]) {
+    const t = mergeSetup({ ...s, pair: { ...s.pair, ...(patch.pair || {}) },
+                           head: { ...s.head, ...(patch.head || {}) } });
+    assert.equal(aimCheck(t).ok, true, `re-aimed after ${JSON.stringify(patch)}`);
+    const met = convergeRig(t);
+    for (let i = 0; i < 3; i++) near(met[i], t.head.positionCm[i], 0.6, 'still meeting at the head');
+  }
+
+  // a saved setup from before the angles were derived does not drag its stale pair forward
+  const old = mergeSetup({ version: 2, pair: { toeInDeg: 14, tiltUpDeg: 12 } });
+  assert.equal(aimCheck(old).ok, true, 'version 2 angles are dropped, not inherited');
+  // but an angle the user really typed is kept, and the disagreement is reported rather than silently fixed
+  const typed = mergeSetup({ version: 3, pair: { toeInDeg: 14, tiltUpDeg: 12, aimManual: true } });
+  const bad = aimCheck(typed);
+  assert.equal(bad.ok, false, 'a typed 14/12 on this baseline is still wrong');
+  assert.ok(bad.missCm > 100, `and it says how wrong: ${bad.missCm.toFixed(0)} cm`);
+  assert.match(bad.message, /48\.5|work the angles out/i, 'and what the right answer is');
+  assert.ok(Math.abs(bad.dToe) > AIM_TOLERANCE_DEG, 'beyond the tolerance a degree of toe error earns');
+});
+
+test('a head at the seat lands in the middle of both pictures, and decodes back to where it started', () => {
+  const s = setup();
+  const vs = pairViews(s);
+  // step 1 has the user aim each camera at their own face, so the face must actually be near frame centre
+  for (const { cam, W, H, f } of vs) {
+    const uv = projectInto(cam, s.head.positionCm, W, H, f);
+    assert.ok(uv, 'the head is in front of the lens at all');
+    near(uv[0], 0.5, 0.02, `${cam.side} sees the head across the middle`);
+    near(uv[1], 0.5, 0.02, `${cam.side} sees the head up the middle`);
+  }
+  // and the round trip: pixels in, the same head out, for heads all over the viewing arc
+  for (const head of [...viewingArc(s, 5, 60), [12, 40, 45], [-10, 46, 52], [0, 34, 60]]) {
+    const rays = vs.map(({ cam, view, W, H, f }) => {
+      const uv = projectInto(cam, head, W, H, f);
+      return uv && view.ray(uv[0], uv[1]);
+    });
+    assert.ok(rays.every(Boolean), `both cameras see a head at ${head}`);
+    const p = triangulate(rays);
+    for (let i = 0; i < 3; i++) near(p[i], head[i], 0.05, `decoded head axis ${i} from ${head}`);
+    assert.ok(residualCm(p, rays) < 0.05, 'and the two rays really met');
+  }
+});
+
+// ---------------------------------------------------------------- two cameras with the same name
+
+test('two webcams of the same model get two poses, and the eye still moves', () => {
+  // Chromium builds MediaDeviceInfo.label from the driver's friendly name plus vid:pid, with no
+  // uniquifier, so the rig's two Logitechs are the SAME string. Keying anything by label collapses them
+  // onto one entry; both cameras then get one camera's pose, both view origins coincide, and the normal
+  // equations return that origin for any pair of pixels - a rock-steady eye sitting on a lens, reported
+  // as healthy stereo tracking. That is the exact failure rigtest2 exists to detect.
+  const label = 'HD Pro Webcam C920 (046d:082d)';
+  const devList = [{ deviceId: 'id-A', groupId: 'g-A', label }, { deviceId: 'id-B', groupId: 'g-B', label }];
+  const s = setup();
+  const pc = pairCameras(s);
+  const camKey = d => d.deviceId;                       // what the page does now
+  const prefs = {}, ext = {};
+  devList.forEach((d, i) => {
+    prefs[camKey(d)] = { key: { deviceId: d.deviceId, label: d.label, groupId: d.groupId },
+                         role: 'head', dfovDeg: s.pair.dfovDeg };
+    ext[camKey(d)] = { posCm: pc[i].posCm, rotDeg: pc[i].rotDeg };
+  });
+  assert.equal(Object.keys(prefs).length, 2, 'two cameras, two pref entries');
+
+  const merged = mergePrefs(prefs, devList);
+  assert.notEqual(merged[0].prefKey, merged[1].prefKey, 'and two prefKeys, whatever the labels say');
+  const W = 1280, H = 720, f = focalPxFromDiagFov(W, H, s.pair.dfovDeg);
+  const intr = { fx: f, fy: f, cx: W / 2, cy: H / 2, k1: 0, k2: 0, k3: 0, p1: 0, p2: 0 };
+  const views = merged.map(d => viewsForCamera({ width: W, height: H, sbs: false, calib: null, intr,
+                                                 ext: ext[d.prefKey], label: d.label })[0]);
+  const gap = dist(views[0].origin, views[1].origin);
+  near(gap, s.pair.baselineCm, 1e-6, 'the two lenses are a whole baseline apart, not zero');
+
+  // the eye has to MOVE when the head does, which is the thing the collapse silently killed
+  const seen = [];
+  for (const head of [[-20, 40, 45], [0, 40, 45], [20, 40, 45]]) {
+    const rays = pc.map((cam, i) => {
+      const uv = projectInto(cam, head, W, H, f);
+      return uv && views[i].ray(uv[0], uv[1]);
+    });
+    const p = triangulate(rays);
+    for (let k = 0; k < 3; k++) near(p[k], head[k], 0.05, 'decoded head');
+    seen.push(p);
+  }
+  assert.ok(dist(seen[0], seen[2]) > 35, `the eye travels with the head, got ${dist(seen[0], seen[2]).toFixed(1)} cm`);
+
+  // the old label key really did collapse them: two cameras, ONE entry, and whichever was written last
+  const collapsed = {};
+  for (const d of devList) collapsed[d.label] = prefs[d.deviceId];
+  assert.equal(Object.keys(collapsed).length, 1, 'keyed by label the two cameras are one entry');
+  // and even handed that, matching now refuses to give both devices the same entry - which is the second
+  // half of the fix, because the page alone could not have closed it: matchSaved's label fallback used to
+  // let the first entry win before any later entry's exact deviceId match was tried.
+  const sameMerged = mergePrefs(collapsed, devList);
+  assert.notEqual(sameMerged[0].prefKey, sameMerged[1].prefKey, 'no two devices share one entry, ever');
+  assert.ok(sameMerged.filter(d => d.pref).length <= 1, 'the single entry is claimed once, not twice');
+});
+
+test('a pair configured in one place, or whose rays miss, is refused instead of believed', () => {
+  const live = { chosen: 2, cameras: 2, seeingHead: 2, msSinceStereo: 0 };
+  const same = headSource({ ...live, eyeSource: 'bad-extrinsics' });
+  assert.equal(same.ok, false); assert.equal(same.usable, false);
+  assert.equal(same.reason, 'same-place');
+  assert.match(same.message, /same place/i);
+  assert.match(same.message, /same model|share a name|one at a time/i, 'and says why the names lie');
+
+  const miss = headSource({ ...live, eyeSource: 'bad-rays', residualCm: 7.9, swapHint: true });
+  assert.equal(miss.reason, 'rays-miss');
+  assert.match(miss.message, /7\.9 cm/, 'with the number on it');
+  assert.match(miss.message, /wrong way round/i, 'and the likeliest cause named');
+  assert.match(headSource({ ...live, eyeSource: 'bad-rays', residualCm: 5, swapHint: false }).message,
+    /baseline|angles/i, 'or the next likeliest, when a swap is not it');
+
+  // an eye nowhere near the seat is not a head, whatever the rays did
+  const far = headSource({ ...live, eyeSource: 'stereo', eyeRig: [0, 45, 204], headRig: [0, 40, 45] });
+  assert.equal(far.ok, false);
+  assert.equal(far.reason, 'implausible');
+  assert.match(far.message, /159 cm/, 'and says how far off it is');
+  assert.equal(headSource({ ...live, eyeSource: 'stereo', eyeRig: [18, 44, 52], headRig: [0, 40, 45] }).ok, true,
+    'a head that has simply moved along the arc is still a head');
+});
+
+test('one dropped frame holds the eye still; it does not throw the red panel into the volume', () => {
+  const live = { chosen: 2, cameras: 2, seeingHead: 2 };
+  const blink = headSource({ ...live, eyeSource: 'mono', msSinceStereo: 120 });
+  assert.equal(blink.ok, true, 'no banner for a blink');
+  assert.equal(blink.usable, false, 'but the guessed eye is still not used');
+  assert.equal(blink.reason, 'blink');
+  assert.equal(blink.message, '', 'and nothing is said');
+
+  const gone = headSource({ ...live, eyeSource: 'mono', msSinceStereo: STEREO_GRACE_MS + 1 });
+  assert.equal(gone.ok, false, 'a real loss is still refused');
+  assert.equal(gone.reason, 'mono');
+  assert.ok(STEREO_GRACE_MS >= 300 && STEREO_GRACE_MS <= 1000, 'a grace a person would not notice');
+  // the grace never lets a guess through: usable is true for stereo and nothing else
+  for (const src of ['mono', 'legacy', 'none', 'bad-rays', 'bad-extrinsics'])
+    assert.equal(headSource({ ...live, eyeSource: src, msSinceStereo: 0 }).usable, false, src);
+});
+
+// ---------------------------------------------------------------- the words on the glass
+
+test('the flip axis cannot change the hologram, so the text flip is worked out from the optics instead', () => {
+  const s = setup();
+  const rig = rigFromSetup(s);
+  const vol = usableVolume(rig, viewingArc(s, 5));
+  // 1. the two axes draw the SAME picture: they differ by a 180 degree roll that the matching flip cancels
+  for (const eye of viewingArc(s, 5, 60)) {
+    for (const p of [probePoint(vol), [0, vol.baseY + 1, 0], rig.model.anchor]) {
+      const x = screenPos(rigCamera(rig, eye, { flipAxis: 'x' }), p, 1280, 720);
+      const y = screenPos(rigCamera(rig, eye, { flipAxis: 'y' }), p, 1280, 720);
+      near(x.x, y.x, 1e-6, 'x on the glass is the same either way');
+      near(x.y, y.y, 1e-6, 'and so is y');
+    }
+  }
+
+  // 2. so which way the TEXT is mirrored has to come from the rig. Read a line of text through the sheet:
+  //    CSS reading direction is +u on the panel, glyph-up is -v.
+  const readable = (transform, eye) => {
+    const V = virtualScreen(rig);
+    const U = unit(sub(V.tr, V.tl)), Vd = unit(sub(V.bl, V.tl));
+    let read = [1, 0], up = [0, -1];                       // (u, v) components
+    if (transform === 'scaleX(-1)') { read = [-read[0], read[1]]; up = [-up[0], up[1]]; }
+    if (transform === 'scaleY(-1)') { read = [read[0], -read[1]]; up = [up[0], -up[1]]; }
+    const world = ([a, b]) => unit(add(scale(U, a), scale(Vd, b)));
+    const fwd = unit(sub(V.centre, eye));
+    const vUp = unit(sub([0, 1, 0], scale(fwd, dot(fwd, [0, 1, 0]))));
+    return { reads: dot(world(read), cross(fwd, vUp)), stands: dot(world(up), vUp) };
+  };
+  // A viewer at the end of the arc reads the glass at an angle, so "upright" is a sign question, not a
+  // question of being within a few degrees of perfect: 0.5 is comfortably past 60 degrees of lean.
+  const READS = 0.5;
+  for (const eye of viewingArc(s, 3, 60)) {
+    const chosen = overlayFlip(rig, eye);
+    const r = readable(chosen, eye);
+    assert.ok(r.reads > READS && r.stands > READS,
+      `overlayFlip picked ${chosen || '(none)'}, which reads ${r.reads.toFixed(2)} / stands ${r.stands.toFixed(2)}`);
+    // and it is the ONLY choice that reads: the axis is not a free parameter here
+    for (const other of ['', 'scaleX(-1)', 'scaleY(-1)'].filter(t => t !== chosen)) {
+      const o = readable(other, eye);
+      assert.ok(!(o.reads > READS && o.stands > READS), `${other || '(none)'} must not also be readable`);
+    }
+  }
+  assert.equal(overlayFlip(rig, s.head.positionCm), 'scaleY(-1)', 'on THIS rig the inverted axis is v');
+
+  // 3. the panel mounted the other way up IS a different picture, unlike the flip axis: that is the real
+  //    thing a person at the rig can be wrong about, and it is what X now toggles.
+  const upside = rigFromSetup(mergeSetup({ rig: { ...s.rig, rot180: true } }));
+  const a = predictMonitorUV(rig, s.head.positionCm, probePoint(vol));
+  const b = predictMonitorUV(upside, s.head.positionCm, probePoint(vol));
+  assert.ok(Math.hypot(a.u - b.u, a.v - b.v) > 0.05, 'rot180 really moves the picture');
+});
+
+// ---------------------------------------------------------------- an empty answer says so
+
+test('a volume with nothing in it says which of the two faults it is', () => {
+  const s = setup();
+  const rig = rigFromSetup(s);
+  const eyes = viewingArc(s, 5);
+  const full = usableVolume(rig, eyes);
+  assert.equal(full.empty, false, 'the real rig, full screen, is not empty');
+  assert.equal(full.reason, null);
+  assert.equal(full.message, '');
+
+  // a short wide window (devtools docked at the bottom, or an ultrawide) collapses it
+  const vp = letterboxViewport(rig.monitor.widthCm, rig.monitor.heightCm, 1400, 400);
+  const thin = usableVolume(rig, eyes, { viewport: vp });
+  assert.equal(thin.empty, true, 'and it really does collapse: that is the reported behaviour');
+  assert.equal(thin.reason, 'window-shape', 'the RIG is fine; this window cannot show it');
+  assert.match(thin.message, /fullscreen|maximise/i, 'so it says what to do about the window');
+  assert.ok(thin.message.length > 40, 'in words, not just a zero');
+
+  // rig numbers that leave nothing drawable are a different fault and get different advice
+  for (const patch of [{ tiltDeg: 0 }, { monitorDiagIn: 10 }]) {
+    const broken = rigFromSetup(mergeSetup({ rig: { ...s.rig, ...patch } }));
+    const v = usableVolume(broken, eyes);
+    assert.equal(v.empty, true, JSON.stringify(patch));
+    assert.equal(v.reason, 'rig-numbers', 'no window would help');
+    assert.match(v.message, /tilt|diagonal|step 3/i, 'so it points at the numbers, not the window');
+  }
+});
+
+test('the banner says the thing that has to be fixed first', () => {
+  const s = setup();
+  const rig = rigFromSetup(s);
+  const empty = usableVolume(rig, viewingArc(s, 5),
+    { viewport: letterboxViewport(rig.monitor.widthCm, rig.monitor.heightCm, 1400, 400) });
+  const ok = usableVolume(rig, viewingArc(s, 5));
+  const refused = headSource({ chosen: 2, cameras: 2, seeingHead: 2, eyeSource: 'mono' });
+  const badAim = aimCheck(mergeSetup({ version: 3, pair: { toeInDeg: 14, tiltUpDeg: 12, aimManual: true } }));
+
+  // nothing drawn at all outranks everything: no other message can be acted on through a black screen
+  assert.match(bannerFor({ volume: empty, source: refused, aim: badAim }).title, /Nothing can be drawn/);
+  // the hard rigCheck warnings used to reach only the readout, which starts hidden
+  const hard = bannerFor({ volume: ok, warnings: ['The eye is under the sheet.',
+    '2 of 4 image corners reflect off the edge of the sheet; make the sheet bigger or move the monitor.'] });
+  assert.equal(hard.kind, 'bad');
+  assert.match(hard.text, /under the sheet/);
+  assert.ok(!/sheet bigger/.test(hard.text), 'and only the hard ones: the soft advice stays in the readout');
+  assert.equal(hardWarnings(['make the sheet bigger']).length, 0);
+
+  // the aim mismatch beats the head-source refusal, because it CAUSES it
+  assert.match(bannerFor({ volume: ok, aim: badAim, source: refused }).title, /camera angles/i);
+  assert.match(bannerFor({ volume: ok, aim: aimCheck(s), source: refused }).title, /Head tracking is not running/);
+  assert.equal(bannerFor({ volume: ok, aim: aimCheck(s),
+    source: headSource({ chosen: 2, cameras: 2, seeingHead: 2, eyeSource: 'stereo' }) }), null,
+    'and a working rig says nothing at all: every lit pixel is a ghost in the volume');
+  // the mouse stand-in is not a fault, but it does not hide a broken rig either
+  assert.equal(bannerFor({ volume: ok, aim: aimCheck(s), source: refused, mouse: true }), null);
+  assert.match(bannerFor({ volume: empty, aim: aimCheck(s), source: refused, mouse: true }).title, /Nothing can be drawn/);
 });

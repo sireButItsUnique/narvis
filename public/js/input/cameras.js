@@ -156,7 +156,13 @@ export const cams = {
   legacy: null,                 // webcam.js when it is driving
   plan: null,
   handSource: 'none',           // 'bridge' | 'stereo' | 'mono' | 'legacy' | 'none'
-  eyeSource: 'none',            // 'stereo' | 'mono' | 'legacy' | 'none'
+  // 'bad-extrinsics' and 'bad-rays' are refusals, not sources: the pair answered, and the answer cannot be
+  // true. They exist so the page can say WHICH kind of wrong it is instead of showing a confident hologram.
+  eyeSource: 'none',            // 'stereo' | 'mono' | 'legacy' | 'bad-extrinsics' | 'bad-rays' | 'none'
+  eyeResidualCm: null,          // how far the two eye rays missed each other: the honest error bar
+  eyeSwapHint: false,           // the rays meet far better with the two cameras exchanged (marked the wrong way round)
+  eyeOriginGapCm: null,         // distance between the two head views' lenses, as CONFIGURED
+  lastStereoAt: -1e9,           // performance.now() of the last stereo fuse that was actually believed
   notes: [],
   solver: 'local midpoint',
   running: false,
@@ -246,7 +252,10 @@ async function openSource(dev, opts) {
   if (cls.kind === 'zed' && !sbs) note(`${dev.label || 'ZED'} opened at ${width}x${height}, which is not side-by-side: treating it as one camera`);
   const layout = sbs ? stereo.splitLayout(width, height) : stereo.wholeLayout(width, height);
   const g = await geometry();
-  const ext = opts.ext?.[dev.prefKey] || dev.pref?.ext || { posCm: g.camPos(), rotDeg: [0, 0, 180] };
+  // extById first: rig-frame extrinsics are per PHYSICAL camera, and prefKeys can be shared by two devices
+  // of the same model if anything upstream ever matches by label again. A pose is not a preference.
+  const ext = opts.extById?.[dev.deviceId] || opts.ext?.[dev.prefKey] || dev.pref?.ext
+    || { posCm: g.camPos(), rotDeg: [0, 0, 180] };
   const calib = sbs ? stereo.calibFor(await loadZedConf(), width, height) : null;
   const intr = sbs ? null : (() => {
     const f = dev.pref?.dfovDeg ? devices.focalPxFromDiagFov(width, height, dev.pref.dfovDeg) : g.focalPx(width);
@@ -422,31 +431,96 @@ function publishHands(handsWorld, now, source) {
   });
 }
 
+// Two lenses closer together than this cannot be a real stereo pair on this rig; it is a pose that got
+// copied onto both cameras. With both origins equal to o the normal equations give A p = A o, so p = o
+// EXACTLY, for any pair of pixels: a perfectly steady "measurement" sitting on a lens.
+export const MIN_BASELINE_CM = 1;
+// How far the two eye rays may miss each other before the answer stops being a measurement. Correct
+// extrinsics give ~0; a pair marked the wrong way round crosses 2 cm about 4 cm off centre.
+export const EYE_RESIDUAL_MAX_CM = 2;
+// Two free-running webcams are never in phase. 25 ms was under one frame period at 15 fps, so a normal
+// phase offset read as a lost camera and took the mono path.
+export const EYE_SKEW_MS = 70;
+
+// The newest sample from this view that actually HAS a face. MediaPipe posts a result with face:null when
+// it finds nothing, and that lands in the same 6-deep ring, so looking only at ring[last] drops a whole
+// camera for one missed frame - and dropping a camera means the one-webcam depth guess.
+function newestFace(ring, now, maxAgeMs = 250) {
+  for (let i = ring.length - 1; i >= 0; i--)
+    if (ring[i]?.face?.eyes && now - ring[i].at < maxAgeMs) return ring[i];
+  return null;
+}
+const gapCm = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+
+// The whole question "is this pair's answer a measurement, or just an answer?", pure so it can be checked
+// without two webcams on a desk. Three ways it is not:
+//   bad-extrinsics  the two views start from the same place, so p = o for any pixels at all;
+//   no-solution     the rays are parallel;
+//   bad-rays        the rays do not meet, which is a pose error and not noise. The commonest one is the
+//                   pair marked the wrong way round, so try that and say so if it fits much better.
+// None of them may fall back to a one-camera depth guess: the user dropped that, and a guess here is what
+// draws a steady, plausible, completely wrong hologram.
+export function stereoEye(viewA, viewB, pa, pb,
+                          { minBaselineCm = MIN_BASELINE_CM, maxResidualCm = EYE_RESIDUAL_MAX_CM } = {}) {
+  const gap = gapCm(viewA.origin, viewB.origin);
+  if (gap < minBaselineCm) return { ok: false, kind: 'bad-extrinsics', gapCm: gap };
+  const rays = [viewA.ray(pa[0], pa[1]), viewB.ray(pb[0], pb[1])];
+  const p = stereo.triangulate(rays);
+  if (!p || !p.every(Number.isFinite)) return { ok: false, kind: 'no-solution', gapCm: gap };
+  const res = stereo.residualCm(p, rays);
+  if (res > maxResidualCm) {
+    const swapped = [viewB.ray(pa[0], pa[1]), viewA.ray(pb[0], pb[1])];
+    const q = stereo.triangulate(swapped);
+    return { ok: false, kind: 'bad-rays', residualCm: res, gapCm: gap,
+             swapHint: !!q && stereo.residualCm(q, swapped) < res / 3 };
+  }
+  return { ok: true, point: p, residualCm: res, gapCm: gap };
+}
+
+function refuseEye(kind, message) {
+  cams.eyeSource = kind;
+  if (cams.notes[cams.notes.length - 1] !== message) note(message);
+}
+
 function fuseEye(now) {
   const heads = [];
   for (const src of cams.sources) {
     if (!src.live || !src.tasks.face) continue;
     src.views.forEach((v, i) => {
-      const s = newest(src.samples[i]);
-      if (s?.face?.eyes && now - s.at < 300) heads.push({ src, view: v, i, sample: s });
+      const s = newestFace(src.samples[i], now);
+      if (s) heads.push({ src, view: v, i, sample: s });
     });
   }
   if (!heads.length) return;
   const tSec = now / 1000;
-  let p = null, source = 'mono';
+  let p = null, source = 'mono', residual = null;
   if (heads.length >= 2) {
+    cams.eyeOriginGapCm = gapCm(heads[0].view.origin, heads[1].view.origin);
     const t = Math.min(heads[0].sample.at, heads[1].sample.at);   // the instant both cameras can speak for
-    const eyesAt = h => interpolateLm(h.src.samples[h.i].filter(s => s.face?.eyes).map(s => ({ at: s.at, lm: s.face.eyes })), t, 25);
+    const eyesAt = h => interpolateLm(h.src.samples[h.i].filter(s => s.face?.eyes).map(s => ({ at: s.at, lm: s.face.eyes })), t, EYE_SKEW_MS);
     const a = eyesAt(heads[0]), b = eyesAt(heads[1]);
     if (a && b) {
-      const pa = pickEye(a.lm, S.eye), pb = pickEye(b.lm, S.eye);
-      const q = stereo.triangulate([heads[0].view.ray(pa[0], pa[1]), heads[1].view.ray(pb[0], pb[1])]);
-      if (q && q.every(Number.isFinite)) { p = q; source = 'stereo'; }
+      const v = stereoEye(heads[0].view, heads[1].view, pickEye(a.lm, S.eye), pickEye(b.lm, S.eye));
+      if (v.ok) { p = v.point; source = 'stereo'; residual = v.residualCm; }
+      else if (v.kind === 'bad-extrinsics') {
+        cams.eyeResidualCm = null;
+        refuseEye('bad-extrinsics', `${heads[0].src.label} and ${heads[1].src.label} are configured at the same `
+          + `place (${v.gapCm.toFixed(2)} cm apart), so nothing can be triangulated. Re-pick the two cameras in setup.`);
+        return;
+      } else if (v.kind === 'bad-rays') {
+        cams.eyeSwapHint = v.swapHint;
+        cams.eyeResidualCm = v.residualCm;
+        refuseEye('bad-rays', `The two cameras disagree about where your head is by ${v.residualCm.toFixed(1)} cm`
+          + (v.swapHint ? ': they look marked the wrong way round.' : '; check the pair geometry in setup.'));
+        return;
+      }
     }
   }
   if (!p) p = eyeFromMono(heads[0].sample.face.eyes, heads[0].view, S.ipdMm / 10, S.eye);
   if (!p) return;
   cams.eyeSource = source;
+  cams.eyeResidualCm = residual;
+  if (source === 'stereo') { cams.lastStereoAt = now; cams.eyeSwapHint = false; }
   input.eye.set(eyeFilt[0].filter(p[0], tSec), eyeFilt[1].filter(p[1] + S.eyeYNudgeCm, tSec), eyeFilt[2].filter(p[2], tSec));
   input.faceSeenAt = now;
 }
@@ -463,6 +537,10 @@ export async function startCameras(opts = {}) {
   if (cams.running) stopCameras();   // restart cleanly rather than opening a second copy of everything
   cams.opts = opts;
   cams.running = true;
+  // A restart must not inherit the last run's verdict: a stale lastStereoAt would let the grace period
+  // vouch for cameras that have not said anything yet.
+  cams.eyeSource = 'none'; cams.eyeResidualCm = null; cams.eyeSwapHint = false;
+  cams.eyeOriginGapCm = null; cams.lastStereoAt = -1e9;
   cams.solver = (await stereo.loadSolver()).name;
   status('Looking for cameras…');
 
@@ -594,6 +672,11 @@ export function camerasStatus() {
   const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
   return {
     mode: cams.mode, handSource: cams.handSource, eyeSource: cams.eyeSource, solver: cams.solver,
+    // The eye's own error bar and how long since a stereo fuse was last believed. A page that only reads
+    // eyeSource sees a latch and throws a full refusal at one dropped frame; msSinceStereo is what lets it
+    // wait out a blink without ever accepting a guess.
+    eyeResidualCm: cams.eyeResidualCm, eyeSwapHint: cams.eyeSwapHint, eyeOriginGapCm: cams.eyeOriginGapCm,
+    msSinceStereo: now - cams.lastStereoAt,
     inputMode: input.mode, notes: [...cams.notes],
     sources: cams.sources.map(s => ({
       label: s.label, deviceId: s.deviceId, kind: s.cls.kind, model: s.cls.model, why: s.cls.why,

@@ -69,13 +69,37 @@ export function matchSaved(saved, devices) {
     || null;
 }
 
-// prefs: { [key]: { role, dfovDeg, ... } } keyed by label (stable across replug) — merged onto the live list.
+// prefs: { [key]: { key: {deviceId,label,groupId}, role, dfovDeg, ... } } — merged onto the live list.
+//
+// Two webcams of the same model report the IDENTICAL MediaDeviceInfo.label (Chromium builds it from the
+// driver's friendly name plus vid:pid, with no uniquifier), so the rig's two Logitechs are indistinguishable
+// by label. Matching therefore has to be done in two passes and has to be INJECTIVE:
+//   pass 1  every exact deviceId match, over the whole list, before any weaker evidence is heard;
+//   pass 2  the replug fallbacks (label, then groupId), each pref entry claimed at most once.
+// A single `find` per device instead lets the first entry's label match beat a later entry's exact deviceId
+// match, and lets two devices land on ONE entry. On this rig that hands both head cameras the same
+// extrinsics, and two rays from the same origin triangulate to that origin for any pair of pixels: a
+// rock-steady "stereo" eye sitting on a lens, never moving. That is the one failure rigtest2 exists to rule
+// out, so it must be impossible here rather than merely unlikely.
 export function mergePrefs(prefs = {}, devices = []) {
   const entries = Object.entries(prefs);
-  return devices.map(d => {
-    const hit = entries.find(([, p]) => matchSaved(p.key || {}, [d]));
-    return { ...d, prefKey: hit ? hit[0] : (d.label || d.deviceId), pref: hit ? hit[1] : null };
+  const used = new Set();
+  const hits = new Array(devices.length).fill(null);
+  const claim = (i, e) => { if (e) { hits[i] = e; used.add(e[0]); } };
+  const free = ([k]) => !used.has(k);
+  devices.forEach((d, i) => {
+    if (!d.deviceId) return;
+    claim(i, entries.find(e => free(e) && e[1]?.key?.deviceId === d.deviceId));
   });
+  devices.forEach((d, i) => {
+    if (hits[i]) return;
+    claim(i, entries.find(e => free(e) && e[1]?.key?.label && e[1].key.label === d.label)
+          || entries.find(e => free(e) && e[1]?.key?.groupId && e[1].key.groupId === d.groupId));
+  });
+  // The fallback key is the deviceId, not the label: the key is an IDENTITY, and two same-model cameras
+  // share a label. The evidence that survives a replug lives in the entry's own `key` record above.
+  return devices.map((d, i) => ({ ...d, prefKey: hits[i] ? hits[i][0] : (d.deviceId || d.label),
+                                  pref: hits[i] ? hits[i][1] : null }));
 }
 
 // Who watches what. The rig wants the ZED on the hand volume under the sheet and the webcams on the head;

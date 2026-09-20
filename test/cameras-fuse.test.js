@@ -143,3 +143,90 @@ test('a world point survives the round trip through a camera placed in the rig',
   const want = camToWorld(pCam, ext);
   assert.ok(Math.hypot(got[0] - want[0], got[1] - want[1], got[2] - want[2]) < 1e-9);
 });
+
+// ---------------------------------------------------------------- a stereo answer is not always a measurement
+
+import { stereoEye, MIN_BASELINE_CM, EYE_RESIDUAL_MAX_CM } from '../public/js/input/cameras.js';
+import { viewsForCamera } from '../public/js/input/stereo.js';
+import { focalPxFromDiagFov } from '../public/js/input/devices.js';
+import { DEFAULT_SETUP, mergeSetup, pairCameras } from '../public/js/rig/rigtest2.js';
+
+const W2 = 1280, H2 = 720;
+const F2 = focalPxFromDiagFov(W2, H2, DEFAULT_SETUP.pair.dfovDeg);
+const INTR2 = { fx: F2, fy: F2, cx: W2 / 2, cy: H2 / 2, k1: 0, k2: 0, k3: 0, p1: 0, p2: 0 };
+const viewFor = (cam) => viewsForCamera({ width: W2, height: H2, sbs: false, calib: null, intr: INTR2,
+                                          ext: { posCm: cam.posCm, rotDeg: cam.rotDeg }, label: cam.side })[0];
+// world = Rz*Ry*Rx * cam + posCm, so cam = R^T (world - posCm); written out rather than imported.
+function shoot(cam, point) {
+  const [a, b, c] = cam.rotDeg.map(d => d * Math.PI / 180);
+  const cx = Math.cos(a), sx = Math.sin(a), cy = Math.cos(b), sy = Math.sin(b), cz = Math.cos(c), sz = Math.sin(c);
+  const M = [[cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+             [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+             [-sy, cy * sx, cy * cx]];
+  const d = [point[0] - cam.posCm[0], point[1] - cam.posCm[1], point[2] - cam.posCm[2]];
+  const z = M[0][2] * d[0] + M[1][2] * d[1] + M[2][2] * d[2];
+  if (z <= 0) return null;
+  const x = M[0][0] * d[0] + M[1][0] * d[1] + M[2][0] * d[2];
+  const y = M[0][1] * d[0] + M[1][1] * d[1] + M[2][1] * d[2];
+  return [(F2 * x / z + W2 / 2) / W2, (F2 * y / z + H2 / 2) / H2];
+}
+
+test('two cameras configured in the same place are refused, not triangulated', () => {
+  // With both origins at o the normal equations are A p = A o, so p = o EXACTLY, whatever the pixels say.
+  // The eye then sits on a lens and never moves, while everything downstream reports healthy stereo
+  // tracking at full frame rate - the one failure the rig test exists to detect, dressed as success.
+  const s = mergeSetup(null);
+  const [L, R] = pairCameras(s);
+  const both = viewFor(R);                              // the same pose handed to both cameras
+  const seen = [];
+  for (const head of [[-20, 40, 45], [0, 40, 45], [20, 40, 45]]) {
+    const pa = shoot(L, head), pb = shoot(R, head);
+    const bad = stereoEye(both, both, pa, pb);
+    assert.equal(bad.ok, false, 'a zero baseline cannot measure anything');
+    assert.equal(bad.kind, 'bad-extrinsics');
+    assert.ok(bad.gapCm < MIN_BASELINE_CM);
+    assert.equal(bad.point, undefined, 'and it does not hand back a point at all');
+    // the same pixels through the CORRECT pair are a real measurement that tracks the head
+    const good = stereoEye(viewFor(L), viewFor(R), pa, pb);
+    assert.equal(good.ok, true);
+    assert.ok(good.residualCm < 0.05, `rays met: ${good.residualCm}`);
+    for (let i = 0; i < 3; i++)
+      assert.ok(Math.abs(good.point[i] - head[i]) < 0.05, `axis ${i}: ${good.point[i]} vs ${head[i]}`);
+    seen.push(good.point);
+  }
+  assert.ok(Math.hypot(seen[2][0] - seen[0][0], seen[2][1] - seen[0][1], seen[2][2] - seen[0][2]) > 35,
+    'and it moves 40 cm when the head moves 40 cm');
+});
+
+test('a pair marked the wrong way round is caught by the residual, and named', () => {
+  const s = mergeSetup(null);
+  const [L, R] = pairCameras(s);
+  const vL = viewFor(L), vR = viewFor(R);
+  // dead centre the swap is invisible: the two rays still meet, on the centre line. That is a real limit
+  // and it is why this is a runtime guard, not a setup check - it fires as soon as the head moves.
+  const centre = stereoEye(vR, vL, shoot(L, [0, 40, 45]), shoot(R, [0, 40, 45]));
+  assert.equal(centre.ok, true, 'sitting dead centre, a swapped pair looks fine');
+  assert.ok(centre.residualCm < 0.05);
+
+  // off to one side it does not, and the residual says so with a number
+  let caught = 0;
+  for (const x of [8, 12, 20, -15]) {
+    const head = [x, 40, 45];
+    const swapped = stereoEye(vR, vL, shoot(L, head), shoot(R, head));
+    if (swapped.ok) continue;
+    caught++;
+    assert.equal(swapped.kind, 'bad-rays');
+    assert.ok(swapped.residualCm > EYE_RESIDUAL_MAX_CM, `${swapped.residualCm} cm at x=${x}`);
+    assert.equal(swapped.swapHint, true, 'and it works out that swapping them would fix it');
+  }
+  assert.ok(caught >= 3, `the swap is caught once the head moves off centre, got ${caught} of 4`);
+
+  // the correctly-marked pair is never refused anywhere along the arc
+  for (const x of [-24, -12, 0, 12, 24]) {
+    const head = [x, 40, 45];
+    const ok = stereoEye(vL, vR, shoot(L, head), shoot(R, head));
+    assert.equal(ok.ok, true, `x=${x} must not be refused`);
+    assert.ok(ok.residualCm < 0.05, 'the right pair leaves no residual worth reporting');
+  }
+  assert.ok(EYE_RESIDUAL_MAX_CM >= 1 && EYE_RESIDUAL_MAX_CM <= 4, 'a threshold with room on both sides');
+});
