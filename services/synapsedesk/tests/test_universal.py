@@ -1,4 +1,6 @@
 """Universal tiers: TS/JS + C/C++ full parse, heuristic fallback, streaming budgets."""
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -135,6 +137,34 @@ class GoTests(unittest.TestCase):
         # lone() stays an explicit external.
         self.assertTrue(any(n["label"] == "lone" and n["kind"] == "external" for n in graph["nodes"]))
         self.assertIn("example.com/poly", graph["meta"].get("go_modules", []))
+
+
+
+class NativeParserTests(unittest.TestCase):
+    """tree-sitter is C. A bad core/grammar pairing does not raise — it kills the process.
+
+    tree-sitter 0.26.0 bus-errors while collecting node objects, which took the whole
+    service down mid-analysis. The parse has to run in a child process to be observable
+    at all, so this asserts on the child's exit status rather than catching an exception.
+    """
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def test_repository_javascript_parses_without_killing_the_process(self):
+        if ".js" not in _GRAMMARS:
+            self.skipTest("pip install .[ts] for the JavaScript grammar")
+        target = self.ROOT/"web_ar_canvas"/"public"/"app.js"
+        probe = ("from pathlib import Path;"
+                 "from repo_triage_agent.tsplugins import TreePluginFacts;"
+                 f"f=TreePluginFacts('app.js', Path(r'{target}').read_text(encoding='utf-8'), '.js');"
+                 "print(len(f.defs))")
+        result = subprocess.run([sys.executable, "-c", probe], cwd=str(self.ROOT),
+                                capture_output=True, text=True, timeout=120)
+        if result.returncode < 0 or result.returncode > 128:
+            signal = -result.returncode if result.returncode < 0 else result.returncode - 128
+            self.fail(f"parsing app.js killed the interpreter with signal {signal}; "
+                      f"check the installed tree-sitter core version against pyproject.toml")
+        self.assertEqual(result.returncode, 0, result.stderr[-400:])
+        self.assertGreater(int(result.stdout.strip()), 0)
 
 
 if __name__ == "__main__":
