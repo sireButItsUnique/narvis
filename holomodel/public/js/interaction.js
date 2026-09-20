@@ -83,6 +83,21 @@ const spatial = () => input.spatial === true && input.mode === 'camera';
 const REACH_CM = 4;             // fingers this near the model's box have hold of it, wherever the eye is
 const MIN_RADIUS_CM = 3;        // nearer the model's axis than this, 'round it' and 'away from it' are noise
 const modelCentre = () => new THREE.Box3().setFromObject(model.group).getCenter(new THREE.Vector3());
+// Where a brush lands when the hand is really there: the model's surface on the hand's side, along the line
+// from the model's middle out through the fingers. (Cast from far outside inward, so it finds the outer
+// surface whether the fingers are just off it or have pushed through it.) Null when the fingers are more
+// than NEAR_SURFACE_CM from that point - then the hand is pointing from a distance, and the sightline rules.
+const NEAR_SURFACE_CM = 6;
+function surfaceNearHand(grip, meshes, eye) {
+  const c = modelCentre(), out = grip.clone().sub(c);
+  if (out.lengthSq() < 1e-6) return null;
+  out.normalize();
+  raycaster.set(c.clone().addScaledVector(out, 200), out.clone().negate());
+  const hit = raycaster.intersectObjects(meshes, false)[0];
+  if (!hit || hit.point.distanceTo(grip) > NEAR_SURFACE_CM) return null;
+  hit.distance = eye.distanceTo(hit.point);      // consumers read this as distance from the EYE
+  return hit;
+}
 const headingAbout = (grip, c) => (Math.hypot(grip.x - c.x, grip.z - c.z) >= MIN_RADIUS_CM ? Math.atan2(-(grip.z - c.z), grip.x - c.x) : null);
 
 function readPointers() {
@@ -334,6 +349,9 @@ export function updateInteraction() {
       if (now - st.castAt >= HOVER_MS || !st.hit || !meshes.includes(st.hit.object)) {
         raycaster.set(eye, p.dir);
         st.hit = raycaster.intersectObjects(meshes, false)[0] || null;
+        // A brush in a hand that is AT the model works where the fingers are, not where the line from the eye
+        // through them happens to land - which is the front of the model, however far round it you reached.
+        if (spatial() && SCULPT_TOOLS.has(tool.mode) && p.grip) st.hit = surfaceNearHand(p.grip, meshes, eye) || st.hit;
         st.castAt = now;
         if (st.hit) st.hitNormal = worldNormal(st.hit);
       }

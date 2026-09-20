@@ -108,5 +108,24 @@ export function quipFor(cmd, rand = Math.random) {
   return byType[cmd.type] ? quip(byType[cmd.type], rand) : '';
 }
 
+/**
+ * What Narvis says the moment it has understood a command that TAKES TIME: what it is doing, in the present
+ * tense, with the thing named. A quip here was charming for the third cube and useless for the first: with a
+ * hologram and no screen to read, "Did you really need to wake me up for this?" does not say whether it heard
+ * "cube" or "tube", or whether it has started - and "Deleted. No notes." arrived while the delete was still
+ * running. The jokes keep their place at the END of the work (quip('done'), quip('delete')), when there is
+ * something to be wry about. Quick commands keep their quip: nothing is pending to be told about.
+ */
+export function ackFor(cmd, rand = Math.random) {
+  if (!cmd) return '';
+  const thing = String(cmd.prompt || '').trim().replace(/[.!?]+$/, '');
+  if (cmd.type === 'make') return thing ? `Building ${thing} now.` : 'Building it now.';
+  if (cmd.type === 'add') return `Building a ${cmd.word || cmd.shape || 'shape'} now.`;      // "make a cube": a plain shape
+  if (cmd.type === 'change' || cmd.type === 'color') return 'Changing it now.';
+  if (cmd.type === 'delete') return cmd.target ? `Deleting the ${cmd.target} now.` : 'Deleting it now.';
+  if (cmd.type === 'detail') return 'Adding detail now.';
+  return quipFor(cmd, rand);
+}
+
 export const KINDS = Object.keys(LINES);
-export default { quip, quipFor, KINDS };
+export default { quip, quipFor, ackFor, KINDS };

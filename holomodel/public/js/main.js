@@ -20,7 +20,7 @@ import { initBuild, build, cancelBuild, work, toggleLog } from './scene/build.js
 import { initVersions, refreshVersions, noteCurrent, restoreVersion, saveVersion, showVersions } from './scene/versions.js';
 import { highlighted } from './scene/highlight.js';
 import { parseCommand, parseTyped, heardCommand, WAKE } from './commands.js';
-import { quip, quipFor } from './narvis.js';
+import { quip, quipFor, ackFor } from './narvis.js';
 import { createVoice, createCloudVoice } from './voice.js';
 import { createSpeaker } from './speak.js';
 import { downloadScene, downloadBlend } from './export.js';
@@ -198,7 +198,9 @@ const voiceHandlers = {
     // rig, "why did it do that" is answered by seeing which words it acted on.
     showHeard(h.rest ? `“${h.said}” · ignored “${h.rest}”` : `“${h.said}”`, 'hint');
     // The screen says what happened; the voice has a personality. Never both saying the same thing.
-    say(quipFor(h.cmd));
+    // ...except while something is being MADE: then the voice says what it has started, by name, because on
+    // the rig there is no screen to read and a joke does not say whether it heard you (narvis.js ackFor).
+    say(ackFor(h.cmd));
     runCommand(h.cmd);
   },
 };
@@ -484,6 +486,7 @@ async function deleteObject(target) {
     if (!res.ok) return flash(r.message || `Could not delete (${res.status})`, 5000);
     if (!r.changed) return flash(`${part.name} was not in Blender any more`, 4000);
     await refreshScene();
+    say(quip('delete'));                 // "Gone." - said once it IS gone
     return flash(`Deleted ${part.name} · ${parts.size} part${parts.size === 1 ? '' : 's'} left`, 3500);
   } catch (err) {
     return flash(`Could not delete: ${err.message}`, 5000);
