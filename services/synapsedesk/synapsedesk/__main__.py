@@ -7,13 +7,15 @@ from .server import Server
 from .state import State, atomic_json
 
 ROOT = Path(__file__).resolve().parent.parent
+# 8765 belongs to the HoloModel server in this repository; keep this service clear of it.
+DEFAULT_PORT = 8770
 
 
-def main():
+def build_parser():
     parser=argparse.ArgumentParser(description="SynapseDesk Windows laptop subsystem")
     commands=parser.add_subparsers(dest="command",required=True)
     serve=commands.add_parser("serve",help="start the local projection + triage service")
-    serve.add_argument("--port",type=int,default=8765)
+    serve.add_argument("--port",type=int,default=DEFAULT_PORT)
     serve.add_argument("--demo",action="store_true")
     serve.add_argument("--repo",help="optional repository to analyze at startup")
     serve.add_argument("--runtime",type=Path,default=ROOT/".runtime")
@@ -24,11 +26,16 @@ def main():
     track.add_argument("--camera",type=int,default=0)
     track.add_argument("--backend",choices=("dshow","msmf","auto"),default="dshow")
     track.add_argument("--model",type=Path,default=ROOT/"models"/"hand_landmarker.task")
-    track.add_argument("--port",type=int,default=8765)
+    track.add_argument("--port",type=int,default=DEFAULT_PORT)
     track.add_argument("--mirror",action="store_true")
     analyze=commands.add_parser("analyze",help="write evidence graph without running the server")
     analyze.add_argument("source")
     analyze.add_argument("--out",type=Path,default=ROOT/".runtime"/"graph.json")
+    return parser
+
+
+def main():
+    parser=build_parser()
     args=parser.parse_args()
     try:
         if args.command=="analyze":

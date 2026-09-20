@@ -1,6 +1,6 @@
 # Local service protocol, version 1
 
-All traffic stays on `127.0.0.1:8765`. No static IP, Cat6, UDP listener, firewall exception, or remote controller is needed. `--port` changes the loopback port. The service checks Host/Origin, refuses cross-site browser requests, does not enable CORS, and requires an `X-Synapse-Token` on mutations. A same-origin client obtains its per-process token from `GET /api/session`. The token is a browser request boundary, not isolation from other processes running as your Windows user.
+All traffic stays on `127.0.0.1:8770`. The port is 8770 rather than 8765 so this service can run beside the HoloModel server, which owns 8765 in this repository. No static IP, Cat6, UDP listener, firewall exception, or remote controller is needed. `--port` changes the loopback port. The service checks Host/Origin, refuses cross-site browser requests, does not enable CORS, and requires an `X-Synapse-Token` on mutations. A same-origin client obtains its per-process token from `GET /api/session`. The token is a browser request boundary, not isolation from other processes running as your Windows user.
 
 | Endpoint | Method | Contract |
 |---|---|---|

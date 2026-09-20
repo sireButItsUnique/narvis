@@ -1,4 +1,4 @@
-param([int]$Camera = 0, [ValidateSet("dshow","msmf","auto")][string]$Backend = "dshow", [switch]$Mirror, [int]$Port = 8765)
+param([int]$Camera = 0, [ValidateSet("dshow","msmf","auto")][string]$Backend = "dshow", [switch]$Mirror, [int]$Port = 8770)
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 $Python = Join-Path (Get-Location) ".venv\Scripts\python.exe"

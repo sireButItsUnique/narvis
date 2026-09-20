@@ -11,7 +11,7 @@ Install 64-bit Python 3.12 with its `py` launcher. Open PowerShell in this direc
 .\scripts\Start-SynapseDesk.ps1 -Demo
 ```
 
-Open [the local workbench](http://127.0.0.1:8765) in Edge or Chrome. No Node.js, camera, model download, or cloud account is needed for the demo. It analyzes the included contradictory repository and displays a **SIMULATED HAND**. Ctrl+C stops the service. If organizational PowerShell policy prevents scripts, use the equivalent commands below; no execution-policy change is necessary:
+Open [the local workbench](http://127.0.0.1:8770) in Edge or Chrome. No Node.js, camera, model download, or cloud account is needed for the demo. It analyzes the included contradictory repository and displays a **SIMULATED HAND**. Ctrl+C stops the service. If organizational PowerShell policy prevents scripts, use the equivalent commands below; no execution-policy change is necessary:
 
 ```powershell
 py -3.12 -m venv .venv
@@ -76,7 +76,7 @@ Three accepted frames are needed before gestures activate. A missing hand, out-o
 4. Pinch over a node to drag it; release to place it. Mouse dragging also works for rehearsal. **W** switches to wiring: pinch/click the source, release, then select a different destination.
 
 Node placements are saved to the service, so they survive a refresh, a restart, and the browser. Open
-[`/display`](http://127.0.0.1:8765/display) on the projector for a chrome-free view of the same graph: it
+[`/display`](http://127.0.0.1:8770/display) on the projector for a chrome-free view of the same graph: it
 follows the editor's placements and graph revisions and never writes back. Press **H** there to bring the
 controls back.
 

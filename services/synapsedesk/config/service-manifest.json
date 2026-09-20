@@ -24,7 +24,7 @@
     "--backend",
     "dshow"
   ],
-  "listen": "127.0.0.1:8765",
+  "listen": "127.0.0.1:8770",
   "health": "/api/health",
   "transport": "HTTP JSON + latest-state SSE",
   "optional_reasoner": "http://127.0.0.1:11434/api/chat",

@@ -9,6 +9,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from repo_triage_agent import workingcopy
 from repo_triage_agent.provider import ChatCompletionsProvider, ProviderError, StubProvider, from_config
+from synapsedesk.__main__ import DEFAULT_PORT, build_parser
 from synapsedesk.server import Server
 from synapsedesk.state import State
 from synapsedesk.store import Store
@@ -325,6 +326,29 @@ class AgentTaskTests(unittest.TestCase):
                 return task
             deadline.wait(.05)
         self.fail(f"task {task_id} never reached {statuses}: {state.store.get_task(task_id)}")
+
+
+class ManifestTests(unittest.TestCase):
+    """The CLI, the launchers and the docs must agree on the port they advertise."""
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def test_default_port_is_consistent_and_clear_of_holomodel(self):
+        parser = build_parser()
+        self.assertEqual(parser.parse_args(['serve']).port, DEFAULT_PORT)
+        self.assertEqual(parser.parse_args(['track']).port, DEFAULT_PORT)
+        # 8765 belongs to the HoloModel server in this repository.
+        self.assertNotEqual(DEFAULT_PORT, 8765)
+        manifest = json.loads((self.ROOT/'config'/'service-manifest.json').read_text(encoding='utf-8'))
+        self.assertEqual(manifest['listen'], f'127.0.0.1:{DEFAULT_PORT}')
+        for doc in ('README.md', 'docs/PROTOCOL.md'):
+            self.assertIn(f'127.0.0.1:{DEFAULT_PORT}', (self.ROOT/doc).read_text(encoding='utf-8'), doc)
+        for script in ('scripts/Start-SynapseDesk.ps1', 'scripts/Start-Tracking.ps1'):
+            self.assertIn(f'$Port = {DEFAULT_PORT}', (self.ROOT/script).read_text(encoding='utf-8'), script)
+        self.assertIn(f'127.0.0.1:{DEFAULT_PORT}',
+                      (self.ROOT/'frontend'/'vite.config.ts').read_text(encoding='utf-8'))
+
+    def test_port_override_is_still_honoured(self):
+        self.assertEqual(build_parser().parse_args(['serve', '--port', '9111']).port, 9111)
 
 
 class AgentHTTPTests(unittest.TestCase):

@@ -1,4 +1,4 @@
-param([switch]$Demo, [string]$Repo = "", [string]$Model = "", [int]$Port = 8765,
+param([switch]$Demo, [string]$Repo = "", [string]$Model = "", [int]$Port = 8770,
       [string]$ModelEndpoint = "", [string]$ModelName = "", [string]$Runtime = "")
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
