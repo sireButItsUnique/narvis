@@ -14,9 +14,15 @@
 //   - inverted smoothing is Enhance Details: the direction is taken once at stroke start and then
 //     pushed the other way, which sharpens instead of blurring.
 
-/** floor(4s) full passes plus one partial pass; matches Blender's iteration_strengths. */
-export function iterationStrengths(strength) {
-  const maxIterations = 4;
+/**
+ * floor(4s) full passes plus one partial pass; matches Blender's iteration_strengths.
+ *
+ * `maxIterations` is 4 in Blender and stays 4 for parity. It is a parameter because a hand in the
+ * air is not a pen on glass: an artist smooths by scrubbing the same spot twenty times, and a hand
+ * held out in front of a hologram gets one slow pass, so the hand profile (presets.js
+ * HAND_OVERRIDES) buys those passes back inside a single dab.
+ */
+export function iterationStrengths(strength, maxIterations = 4) {
   const s = Math.min(Math.max(strength, 0), 1);
   const count = Math.trunc(s * maxIterations);
   const last = maxIterations * (s - count / maxIterations);
@@ -99,7 +105,7 @@ export function smoothDab(proxy, verts, o) {
     ? o.factors.subarray(0, verts.length) : new Float32Array(verts.length);
   const newPositions = o.newPositions && o.newPositions.length >= verts.length * 3
     ? o.newPositions.subarray(0, verts.length * 3) : new Float32Array(verts.length * 3);
-  const strengths = iterationStrengths(o.strength);
+  const strengths = iterationStrengths(o.strength, o.passes || 4);
 
   if (o.frozenBase) {
     let total = 0;

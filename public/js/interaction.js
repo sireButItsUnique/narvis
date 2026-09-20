@@ -1,24 +1,35 @@
 // Hands (or the mouse) -> what you're pointing at, and what a pinch does in the current tool:
-//   move    pinch the model and drag it; push toward the screen to send it deeper
-//   part    the same, but only the part you pinched (in this view only until sync arrives in M4)
-//   sculpt / smooth: the Blender brush engine (js/sculpt, through js/sculpting.js) - pinch and drag to brush
+//   move     pinch the model and drag it; push toward the screen to send it deeper
+//   rotate   pinch anywhere on it and drag across to turn it on its own axis
+//   extrude  build clay up out of the surface (Clay Strips)
+//   smooth   melt what you built back into the form
+// The last two are the Blender brush engine (js/sculpt, through js/sculpting.js): pinch and drag to brush.
 // Pinching with both hands (in any tool) turns, resizes and moves the whole model.
 // Pointing uses the ray from your eye through your index fingertip; a pinch holds the point between thumb and index.
 import * as THREE from 'three';
 import { canvas, rect, boxDepth } from './view.js';
 import { input } from './input/state.js';
-import { model, parts, beginEdit, cancelEdit, discardEdit, endGrab, commitPartPosition, clampPosition,
+import { model, parts, beginEdit, cancelEdit, discardEdit, endGrab, clampPosition,
          setTransform, setGestureFlush } from './model.js';
 import { highlight } from './scene/highlight.js';
 import { updateViz } from './handviz.js';
 import * as sculpt from './sculpting.js';
 
-export const TOOLS = ['move', 'sculpt', 'smooth', 'part'];
-export const tool = { mode: 'move', brush: 2.5, mirror: false };   // brush: radius in cm as seen on screen
+// Four tools, in the order they sit on the keys 1-4: move it, turn it, add clay, smooth it.
+// 'extrude' is the word people bring with them from box modelling for "pull material out of the
+// surface", and it brushes with Clay Strips (js/sculpting.js) because that is what building a form
+// up with your hand actually feels like. Per-part moves were the fifth and are gone: it was the
+// same pinch aimed at a smaller thing, and a demo has room for four.
+export const TOOLS = ['move', 'rotate', 'extrude', 'smooth'];
+export const SCULPT_TOOLS = new Set(['extrude', 'smooth']);
+export const tool = { mode: 'move', brush: 4, mirror: false };   // brush: radius in cm. 4 cm is about a sixth
+                                                                // of a model fitted to this box: small enough to shape a
+                                                                // feature, big enough that one hand pass is visible.
 export const setBrush = r => (tool.brush = THREE.MathUtils.clamp(r, 0.5, 12));
 
 const PUSH_GAIN = 2.0;          // hand toward the screen -> object deeper (move, part)
 const TURN_GAIN = 1.5;          // two-hand turn
+const TURN_PER_CM = 6 * Math.PI / 180;   // one hand: turn per centimetre of hand travel across the model
 const MIN_TURN_CM = 6;          // hands closer than this side to side (one above the other) can't steer a turn
 const HOVER_MS = 33;            // how often a pointer re-picks: hands arrive at about 30 Hz, and a pick over a
                                 // 200-400k-tri model costs 4.5-14 ms of the frame (a BVH lands with the M2 proxy)
@@ -63,7 +74,7 @@ function worldNormal(hit) {
 // ---------- one-hand gestures ----------
 function startAction(p, target, now) {
   const root = model.group, base = { pid: p.id, root, dist: target.dist, handZ0: p.handZ, t0: now };
-  if (tool.mode === 'sculpt' || tool.mode === 'smooth') {
+  if (SCULPT_TOOLS.has(tool.mode)) {
     // The brush is locked to the part the pinch landed on, the way Blender locks a stroke to the
     // active object: a stroke that wandered onto a neighbouring part halfway through would leave
     // two half-edits and one undo step that cannot put either of them back.
@@ -71,22 +82,27 @@ function startAction(p, target, now) {
     sculpt.setMode(tool.mode);
     sculpt.setRadiusCm(tool.brush);
     sculpt.setMirror(tool.mirror);
-    if (!sculpt.begin(input.eye, p.dir, { part, point3D: p.grip, timeMs: now })) {
+    // The pinch point is where your fingers are, which is in the AIR in front of the surface. Every
+    // brush but the grab family wants the point under the ray instead, and handing the grab family
+    // a point that starts off the model anchors the pull to thin air, so the surface hit is what
+    // goes in: the hand's travel from there is still the hand's travel.
+    if (!sculpt.begin(input.eye, p.dir, { part, point3D: target.point, timeMs: now })) {
       notify(part?.bindError ? `That part cannot be sculpted: ${part.bindError}` : 'Point at the model, then pinch to sculpt');
       return false;
     }
-    action = { ...base, kind: 'stroke', mesh: target.mesh, mode: tool.mode };
+    action = { ...base, kind: 'stroke', mesh: target.mesh, mode: tool.mode, grip0: p.grip?.clone() || null,
+               point0: target.point.clone() };
     return true;
   }
-  if (tool.mode === 'move') {
+  if (tool.mode === 'rotate') {
+    // Turn the model on its own axis, one hand: drag across to spin the turntable, up and down to
+    // tip it toward you. Two hands still turn it as well - this is the one-handed way, and the way
+    // a mouse can do it at all.
+    beginEdit();
+    action = { ...base, kind: 'turn', rot0: model.rotY, aim0: rayPoint(p, target.dist).clone() };
+  } else {
     beginEdit();
     action = { ...base, kind: 'grab', startPos: root.position.clone(), offset: root.position.clone().sub(rayPoint(p, target.dist)) };
-  } else {
-    // parts sit directly under the glTF root, so their position is root-relative (metres)
-    const mesh = target.mesh, frame = mesh.parent;
-    beginEdit(mesh);
-    action = { ...base, kind: 'part', mesh, frame, startPos: mesh.position.clone(),
-               offset: mesh.position.clone().sub(frame.worldToLocal(rayPoint(p, target.dist))) };
   }
   return true;
 }
@@ -96,18 +112,28 @@ function updateAction(p) {
   if (action.kind === 'stroke') {
     // Every frame, not every hand sample: the engine does its own spacing along the stroke, so a
     // fast drag lays down as many dabs as the distance calls for and a still hand lays down none.
-    if (sculpt.sample(input.eye, p.dir, { point3D: p.grip, timeMs: performance.now() })) action.moved = true;
+    // The brush point walks with your HAND, from where the stroke landed on the surface. Sending
+    // the raw pinch point instead would start the brush wherever your fingers happen to be - in the
+    // air, a hand-width in front of the clay - and a pull brush anchored there drags nothing.
+    const p3 = action.grip0 && p.grip ? action.point0.clone().add(p.grip.clone().sub(action.grip0)) : null;
+    if (sculpt.sample(input.eye, p.dir, { point3D: p3, timeMs: performance.now() })) action.moved = true;
     p.end = p.hit ? p.hit.point.clone() : p.end;
+    return;
+  }
+  if (action.kind === 'turn') {
+    // A turntable: how far your hand travels across the model is how far it turns. TURN_PER_CM is
+    // set so a comfortable 20 cm sweep is most of a half turn, which is as much as anyone wants to
+    // do without letting go.
+    const at = rayPoint(p, action.dist);
+    setTransform({ rotY: action.rot0 + (at.x - action.aim0.x) * TURN_PER_CM,
+                   userScale: model.userScale, position: root.position.clone() });
+    p.end = at;
     return;
   }
   if (action.kind === 'grab') {
     const t = action.dist + (action.handZ0 - p.handZ) * PUSH_GAIN;
     root.position.lerp(clampPosition(rayPoint(p, t).add(action.offset)), 0.5);
     p.end = root.position.clone().sub(action.offset);
-  } else if (action.kind === 'part') {
-    const t = action.dist + (action.handZ0 - p.handZ) * PUSH_GAIN, frame = action.frame;
-    action.mesh.position.lerp(frame.worldToLocal(rayPoint(p, t)).add(action.offset), 0.5);
-    p.end = frame.localToWorld(action.mesh.position.clone().sub(action.offset));
   }
 }
 
@@ -116,7 +142,7 @@ function changed(a) {
   const moved = (p, q, eps) => p.distanceTo(q) > eps;
   if (a.kind === 'stroke') return !!a.moved;
   if (a.kind === 'grab') return moved(a.root.position, a.startPos, 0.01);
-  if (a.kind === 'part') return moved(a.mesh.position, a.startPos, 1e-4);   // metres
+  if (a.kind === 'turn') return Math.abs(model.rotY - a.rot0) > 1e-3;
   return moved(a.root.position, a.pos0, 0.01) || Math.abs(model.rotY - a.rot0) > 1e-3 || Math.abs(model.userScale - a.scale0) > 1e-3;
 }
 
@@ -133,7 +159,6 @@ function endAction() {
     return;
   }
   if (!changed(a)) discardEdit();
-  else if (a.kind === 'part') commitPartPosition(a.mesh);
   else endGrab();
 }
 
@@ -149,7 +174,6 @@ function cancelAction() {
   // A stroke cannot be thrown away as if it never happened - the clay has already moved - so it is
   // banked like any other stroke and stays undoable.
   if (a.kind === 'stroke') { sculpt.end({ timeMs: performance.now() }); return; }
-  if (a.kind === 'part') a.mesh.position.copy(a.startPos);
   cancelEdit();
 }
 
@@ -258,7 +282,7 @@ export function updateInteraction() {
   // The brush ring: where the clay will move, and how much of it. It stays up DURING a stroke as
   // well - that is when you most need to see whether the brush is still on the model - which is why
   // the hover raycast above skips the busy hand but this reads the stroke's own hit instead.
-  if (tool.mode === 'sculpt' || tool.mode === 'smooth') {
+  if (SCULPT_TOOLS.has(tool.mode)) {
     const p = ps.find(q => q.hit) || (action?.kind === 'stroke' ? ps[action.pid] : null);
     const hit = p?.hit || (action?.kind === 'stroke' ? sculpt.overPart(eye, p?.dir || ps[0].dir) : null);
     if (p && hit) {

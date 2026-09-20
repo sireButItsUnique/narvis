@@ -23,10 +23,15 @@ const CM_PER_M = 100;
 
 export const engine = createSculptEngine({ worldUnitsPerMetre: CM_PER_M });
 
-// What the two tool modes brush with. 'sculpt' is a pick (voice can change it); 'smooth' is always
-// Smooth, because it is a mode in its own right on the badge and in the grammar.
-const DEFAULT_SCULPT_PRESET = 'Clay Strips';
-export const brushes = { sculpt: DEFAULT_SCULPT_PRESET, smooth: 'Smooth' };
+// What the two brush tools brush with. 'extrude' is a pick - the word people use for building a form
+// up out of a surface, and Clay Strips is the brush that does it - while 'smooth' is always Smooth,
+// because it is a mode in its own right on the badge and in the grammar.
+// Measured on the rig's own model, 4 cm brush, one hand pass of 8 cm: Grab pulls the surface 68 mm,
+// Snake Hook 3.8 mm, Clay Strips 0.2 mm. Clay Strips is the right brush for BUILDING a form over
+// many strokes with a pen; Grab is the one that does what a hand means by 'pull this out', because
+// the clay simply follows your fingers. Say 'clay strips brush' to build up instead.
+const DEFAULT_EXTRUDE_PRESET = 'Grab';
+export const brushes = { extrude: DEFAULT_EXTRUDE_PRESET, smooth: 'Smooth' };
 
 let presetsPromise = null;
 let presetsReady = false;
@@ -35,7 +40,7 @@ let presetsReady = false;
 export function ready() {
   if (!presetsPromise) {
     presetsPromise = loadPresets()
-      .then(() => { presetsReady = true; setPreset(brushes.sculpt); return true; })
+      .then(() => { presetsReady = true; setPreset(brushes.extrude); return true; })
       .catch((e) => { console.warn('sculpt presets did not load; using fallback settings', e); return false; });
   }
   return presetsPromise;
@@ -86,14 +91,14 @@ export function syncParts() {
 export function setPreset(name) {
   const kernel = getBrushForPreset(name);
   if (!kernel) return null;
-  brushes.sculpt = name;
+  brushes.extrude = name;
   if (mode !== 'smooth') applyBrush();
   return name;
 }
 
-let mode = 'sculpt';
+let mode = 'extrude';
 function applyBrush() {
-  const name = mode === 'smooth' ? brushes.smooth : brushes.sculpt;
+  const name = mode === 'smooth' ? brushes.smooth : brushes.extrude;
   const kernel = getBrushForPreset(name);
   engine.setBrush(kernel ? kernel.key : 'draw');
   return name;
@@ -101,7 +106,7 @@ function applyBrush() {
 
 /** Called when the tool mode changes; 'move' and 'part' leave the engine alone. */
 export function setMode(next) {
-  if (next !== 'sculpt' && next !== 'smooth') return mode;
+  if (next !== 'extrude' && next !== 'smooth') return mode;
   mode = next;
   applyBrush();
   return mode;
@@ -199,7 +204,7 @@ export function abort() {
 // what the HUD says when it is undone.
 function undoStep(records, kind) {
   return {
-    label: kind === 'smooth' ? 'smooth' : 'sculpt',
+    label: kind === 'smooth' ? 'smooth' : 'extrude',
     undo() {
       for (let i = records.length - 1; i >= 0; i--) engine.applyHistory(records[i], 'undo');
       markDirty();

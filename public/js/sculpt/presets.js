@@ -11,7 +11,15 @@
 
 let PRESETS = null;
 
-/** The hand-input deviations, with the reason each one exists. */
+/**
+ * The hand-input deviations, with the reason each one exists.
+ *
+ * The theme: Blender's numbers assume a pen, a screen you are six inches from, and as many strokes
+ * as you like. A hand in the air in front of a hologram gets ONE slow pass, at arm's length, with
+ * no pressure and a centimetre of tracking jitter - so a preset tuned for the pen reads as "the
+ * brush does nothing". Every strength below is the same brush doing the same thing, turned up to
+ * where one pass of a hand is worth one pass of a pen at the artist's own pace.
+ */
 export const HAND_OVERRIDES = {
   // Essentials Grab is 0.4, so the grabbed point only follows 40% of the hand and feels like lag.
   Grab: { strength: 1.0 },
@@ -22,6 +30,35 @@ export const HAND_OVERRIDES = {
   // Layer's height is absolute object units in Blender (0.05 m); relative to the radius is what
   // the artist means by "a layer this thick" when the radius is set by voice.
   Layer: { height_is_radius_fraction: 0.15 },
+
+  // Smooth at Blender's 0.7 is two and a bit averaging passes per dab, which is a polish - you are
+  // meant to scrub. Here it is a verb ("smooth it out") that has to land in one pass, so it gets
+  // full strength and three times the passes: twelve averages of a neighbourhood visibly melts a
+  // ridge into the form around it, which is exactly what the word promises.
+  Smooth: { strength: 1.0, smooth_passes: 12 },
+
+  // Pulling material OUT is the move people mean by "extrude", and Snake Hook is Blender's brush
+  // for it. Its 10% spacing leaves gaps when a hand moves fast, and a hand pulls a long way in one
+  // gesture, so the dabs are packed closer to keep the pulled shape continuous.
+  'Snake Hook': { strength: 1.0, spacing: 5 },
+  'Elastic Snake Hook': { strength: 1.0, spacing: 5 },
+  Pull: { strength: 1.0 },
+
+  // The clay family: 0.5 is a pen's "build it up over ten strokes". One hand pass should read as
+  // one handful of clay.
+  //
+  // plane_offset is how far above the surface the brush lays its clay, as a fraction of the radius,
+  // and Blender's 0.15 is a thin strip you go over again and again. A hand gets one pass, so it
+  // lays a thick one: at a 4 cm brush that is 2 cm of clay instead of 6 mm, which is the difference
+  // between "did that do anything?" and watching a shape grow out of the surface.
+  'Clay Strips': { strength: 1.0, plane_offset: 0.5 },
+  Clay: { strength: 1.0 },
+  'Clay Thumb': { strength: 1.0 },
+  Draw: { strength: 1.0 },
+  'Draw Sharp': { strength: 0.9 },
+  Blob: { strength: 1.0 },
+  'Inflate/Deflate': { strength: 0.9 },
+  'Crease Sharp': { strength: 0.9 },
 };
 
 /** Radius is world-locked in the box, not a pixel size. */

@@ -42,13 +42,14 @@ function colorFor(words) {
     .toString(16).padStart(2, '0')).join('');
 }
 
-// tool modes: what a pinch does
+// The four tool modes: what a pinch does. Four, because a hand has one gesture and a person at a
+// demo table can hold four ideas - move it, turn it, add clay, smooth it - and because the two that
+// were dropped (per-part moves, Blender's edit mode) were both "the same pinch, on a smaller thing".
 const MODES = [
-  [/^(?:sculpt|sculpting|sculpt mode|clay|clay mode|start sculpting)$/, 'sculpt'],
-  [/^(?:smooth|smoothing|smooth mode|smooth it(?: out)?)$/, 'smooth'],
-  [/^(?:part|parts|part mode|parts mode|select parts?|move parts?|pick parts?)$/, 'part'],
-  [/^(?:move|move mode|grab mode|normal mode|object mode|done|done sculpting|stop sculpting|stop smoothing|exit (?:sculpt|smooth|part|edit)(?: mode)?)$/, 'move'],
-  [/^(?:edit|edit mode)$/, 'edit'],   // Blender's edit mode (in the browser it acts like part mode)
+  [/^(?:extrude|extruding|extrude mode|sculpt|sculpting|sculpt mode|clay|clay mode|start sculpting|add clay|build(?: it)? up)$/, 'extrude'],
+  [/^(?:smooth|smoothing|smooth mode|smooth it(?: out)?|polish|melt)$/, 'smooth'],
+  [/^(?:rotate|rotating|rotate mode|turn mode|spin mode|turntable)$/, 'rotate'],
+  [/^(?:move|move mode|grab mode|normal mode|object mode|done|done sculpting|stop sculpting|stop smoothing|exit (?:extrude|sculpt|smooth|rotate)(?: mode)?)$/, 'move'],
 ];
 
 // Blender sculpt brushes by what people call them -> the brush's name in Blender's built-in library
@@ -58,6 +59,13 @@ export const BRUSHES = {
   deflate: 'Inflate/Deflate', crease: 'Crease Sharp', flatten: 'Flatten/Contrast', scrape: 'Scrape/Fill', fill: 'Fill/Deepen',
   pinch: 'Pinch/Magnify', layer: 'Layer', mask: 'Mask', blob: 'Blob', pose: 'Pose', thumb: 'Thumb', nudge: 'Nudge',
   pull: 'Pull', twist: 'Twist', boundary: 'Boundary', plateau: 'Plateau', trim: 'Trim',
+  // What people actually ask for. Blender has no "extrude" in sculpt mode - the brush that pulls
+  // material out of a surface and drags it along with your hand is Snake Hook - so the word people
+  // bring with them from box modelling lands on the brush that does what they mean.
+  extrude: 'Snake Hook', 'pull out': 'Snake Hook', stretch: 'Snake Hook', spike: 'Snake Hook',
+  hook: 'Snake Hook', 'snake': 'Snake Hook',
+  'push in': 'Draw', dent: 'Draw', bump: 'Draw', add: 'Clay Strips', build: 'Clay Strips',
+  polish: 'Smooth', melt: 'Smooth', round: 'Smooth', blend: 'Smooth', soften: 'Smooth',
 };
 
 const FILLER = /^(?:(?:hey|ok|okay|so|um+|uh+|and|now|then|please|can you|could you|would you|will you|let's|lets|go ahead and|i want you to)\s+)+/;
@@ -161,6 +169,16 @@ export function parseCommand(text) {
   // "clay brush", "use the grab brush", "switch to smooth brush"
   if ((m = t.match(/^(?:(?:use|switch to|change to|give me|pick) )?(?:the |a )?([a-z ]+?) brush$/)) && BRUSHES[m[1]]) {
     return { type: 'brush_pick', name: BRUSHES[m[1]] };
+  }
+  // The action words people say instead of naming a brush - "extrude", "pull it out", "melt it".
+  // They name a brush AND mean "start sculpting with it", which is what brush_pick does. Nobody
+  // learning this in thirty seconds at a demo table says "use the snake hook brush".
+  // "extrude" is NOT in this list: it is the name of a TOOL now (the MODES table below), and the
+  // tool brushes with Clay Strips. Matching it here would quietly load Snake Hook instead, which is
+  // the same word meaning two different brushes depending on which line of this file runs first.
+  if ((m = t.match(/^(?:(?:let'?s|now|i want to|can you) )?(stretch|spike|hook|melt|polish|soften|blend|dent|bump|pull(?: it)? out|push(?: it)? in)(?: it| that| this| out| more)?$/))) {
+    const key = m[1].replace(/\bit\s+/, '').replace(/^build up$/, 'build');
+    if (BRUSHES[key]) return { type: 'brush_pick', name: BRUSHES[key] };
   }
   if (/^(?:(?:stop|quit) listening|mute(?: the)?(?: mic)?|mic off)$/.test(t)) return { type: 'mic', on: false };
   // "switch to sculpt mode", "go back to move mode", "use smooth"

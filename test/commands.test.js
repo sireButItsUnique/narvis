@@ -30,10 +30,12 @@ const cases = [
   ['stop listening', { type: 'mic', on: false }],
   ['never mind', { type: 'cancel' }],
   // v2: tools, brush, mirror, pointing at parts, turning
-  ['sculpt', { type: 'mode', mode: 'sculpt' }],
-  ['clay mode', { type: 'mode', mode: 'sculpt' }],
+  ['sculpt', { type: 'mode', mode: 'extrude' }],
+  ['extrude', { type: 'mode', mode: 'extrude' }],
+  ['clay mode', { type: 'mode', mode: 'extrude' }],
   ['smooth it out', { type: 'mode', mode: 'smooth' }],
-  ['part mode', { type: 'mode', mode: 'part' }],
+  ['rotate', { type: 'mode', mode: 'rotate' }],
+  ['turntable', { type: 'mode', mode: 'rotate' }],
   ['stop sculpting', { type: 'mode', mode: 'move' }],
   ['done', { type: 'mode', mode: 'move' }],
   ['mirror on', { type: 'mirror', on: true }],
@@ -56,15 +58,14 @@ const cases = [
   ['mirror mode off', { type: 'mirror', on: false }],
   ['turn the mirror off', { type: 'mirror', on: false }],
   ['mirror mode', { type: 'mirror', on: true }],
-  ['switch to sculpt mode', { type: 'mode', mode: 'sculpt' }],
+  ['switch to sculpt mode', { type: 'mode', mode: 'extrude' }],
   ['go back to move mode', { type: 'mode', mode: 'move' }],
-  ['change to part mode', { type: 'mode', mode: 'part' }],
+  ['switch to rotate mode', { type: 'mode', mode: 'rotate' }],
   ['make the brush a bit bigger', { type: 'brush', factor: 1.15 }],
   ['brush size smaller', { type: 'brush', factor: 1 / 1.35 }],
   ['turn it', { type: 'spin', on: true }],
   ['change the colour to blue', { type: 'change', prompt: 'change the colour to blue' }],
   // Blender words: modes, brushes, redo, focus
-  ['edit mode', { type: 'mode', mode: 'edit' }],
   ['object mode', { type: 'mode', mode: 'move' }],
   ['clay strips brush', { type: 'brush_pick', name: 'Clay Strips' }],
   ['use the grab brush', { type: 'brush_pick', name: 'Grab' }],
@@ -143,7 +144,7 @@ test('clay view, and "quick <colour>" for an instant local recolour', () => {
   };
   for (const [s, expected] of Object.entries(said)) assert.deepEqual(parseCommand(s), expected, s);
   // "clay" on its own is still the sculpt tool, "clay brush" still picks the brush, and plain colour talk goes to Fable
-  assert.deepEqual(parseCommand('clay'), { type: 'mode', mode: 'sculpt' });
+  assert.deepEqual(parseCommand('clay'), { type: 'mode', mode: 'extrude' });
   assert.deepEqual(parseCommand('clay brush'), { type: 'brush_pick', name: 'Clay' });
   assert.deepEqual(parseTyped('quick banana'), { type: 'quick_unknown', word: 'banana' }, 'never a build');
 });
@@ -167,5 +168,5 @@ test('version history commands', () => {
   // the older meanings of the same words still work
   assert.deepEqual(parseCommand('go back'), { type: 'undo' });
   assert.deepEqual(parseCommand('save it'), { type: 'export' });
-  assert.deepEqual(parseCommand('go back to sculpt mode'), { type: 'mode', mode: 'sculpt' });
+  assert.deepEqual(parseCommand('go back to sculpt mode'), { type: 'mode', mode: 'extrude' });
 });

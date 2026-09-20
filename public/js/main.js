@@ -5,7 +5,7 @@ import { S, saveSettings } from './settings.js';
 import { renderer, scene, camera, rect, buildRoom, applyOffAxis, renderViews, clayMaterial } from './view.js';
 import { input } from './input/state.js';
 import { startCamera, track, drawDebug, eyeFilt, cam } from './input/webcam.js';
-import { updateInteraction, pointedPart, tool, TOOLS, setBrush, setNotify } from './interaction.js';
+import { updateInteraction, pointedPart, tool, TOOLS, SCULPT_TOOLS, setBrush, setNotify } from './interaction.js';
 import * as sculpt from './sculpting.js';
 import { model, parts, showScene, clearScene, scaleBy, setSpin, turnBy, undo, resetPlacement, focusPart,
          deletePart, duplicatePart, quickColor, quickFinish, layout, update as updateModel } from './model.js';
@@ -72,13 +72,13 @@ function begin() {
 // ---------- tool badge: what a pinch does right now ----------
 const TOOL_HINT = {
   move: 'pinch to move it · two hands: turn and resize',
-  sculpt: 'pinch on the model and drag to shape it',
-  smooth: 'pinch on the model and drag to smooth it out',
-  part: 'pinch a part to move just that part (this view only for now)',
+  rotate: 'pinch anywhere on it and drag across to turn it',
+  extrude: 'pinch on the model and drag to build clay out of it',
+  smooth: 'pinch on the model and drag to melt it smooth',
 };
 function showTool() {
-  const brush = tool.mode === 'sculpt' || tool.mode === 'smooth';
-  const name = tool.mode === 'smooth' ? 'Smooth' : sculpt.brushes.sculpt;
+  const brush = SCULPT_TOOLS.has(tool.mode);
+  const name = tool.mode === 'smooth' ? 'Smooth' : sculpt.brushes.extrude;
   $('tool-name').textContent = tool.mode.toUpperCase() +
     (brush ? ` · ${name} ${tool.brush.toFixed(1)} cm${tool.mirror ? ' · mirror' : ''}` : '') +
     (clayOn ? ' · clay view' : '');
@@ -89,14 +89,14 @@ function setTool(mode) {
   // The engine is told the brush, the radius and the mirror on every switch rather than only when
   // they change: the tool badge and the engine disagreeing about which brush is loaded is the one
   // bug nobody can see until the clay moves the wrong way.
-  if (mode === 'sculpt' || mode === 'smooth') {
+  if (SCULPT_TOOLS.has(mode)) {
     sculpt.setMode(mode);
     sculpt.setRadiusCm(tool.brush);
     sculpt.setMirror(tool.mirror);
   }
   showTool();
-  if (mode === 'sculpt' || mode === 'smooth') {
-    const name = mode === 'smooth' ? 'Smooth' : sculpt.brushes.sculpt;
+  if (SCULPT_TOOLS.has(mode)) {
+    const name = mode === 'smooth' ? 'Smooth' : sculpt.brushes.extrude;
     flash(`${name} brush, ${tool.brush.toFixed(1)} cm. Pinch on the model and drag.`, 3500);
   } else flash(`${mode[0].toUpperCase()}${mode.slice(1)} mode`, 3500);
 }
@@ -368,10 +368,14 @@ function runCommand(cmd) {
     }
     case 'unfocus': return flash(model.focusId && focusPart(null) ? 'Whole model' : 'Already showing the whole model');
     case 'clay':   return setClay(cmd.on);
-    case 'mode':   return setTool(cmd.mode === 'edit' ? 'part' : cmd.mode);
+    case 'mode':   return setTool(cmd.mode);
     case 'brush_pick': {
+      // Smooth is a mode of its own on the badge, so asking for it by name ("polish", "melt it")
+      // goes there rather than loading Smooth into the sculpt slot and leaving two ways to be in
+      // the same state.
+      if (cmd.name === 'Smooth') return setTool('smooth');
       if (!sculpt.setPreset(cmd.name)) return flash(`No brush called "${cmd.name}" here yet`, 3500);
-      if (tool.mode !== 'sculpt') setTool('sculpt'); else { showTool(); flash(`${cmd.name} brush`, 3000); }
+      if (tool.mode !== 'extrude') setTool('extrude'); else { showTool(); flash(`${cmd.name} brush`, 3000); }
       return;
     }
     case 'redo':   return flash('Redo arrives in the next build', 3500);

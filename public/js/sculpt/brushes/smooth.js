@@ -30,6 +30,8 @@ export const smooth = {
     }
     smoothDab(proxy, verts, {
       strength: Math.min(Math.max(cache.bstrength, 0), 1),
+      // Blender's four passes, unless the hand profile asks for more (presets.js HAND_OVERRIDES).
+      passes: ctx.settings.smooth_passes || 4,
       // Only the first brush action of a stroke gets the frozen base; see smooth.js.
       frozenBase: ctx.firstBrushAction,
       computeFactors: (out) => ctx.computeFactors(out),
