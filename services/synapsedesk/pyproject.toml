@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synapsedesk"
+version = "0.1.0"
+description = "Windows laptop service for repository triage and projected hand interaction"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+tracking = ["mediapipe>=0.10.21,<0.11", "opencv-contrib-python>=4.10,<5"]
+rust = ["tree-sitter>=0.24,<0.27", "tree-sitter-rust>=0.23,<0.25"]
+ts = ["tree-sitter>=0.24,<0.27", "tree-sitter-javascript>=0.24,<0.26", "tree-sitter-typescript>=0.23,<0.24"]
+cfamily = ["tree-sitter>=0.24,<0.27", "tree-sitter-c>=0.23,<0.25", "tree-sitter-cpp>=0.23,<0.24"]
+jvm = ["tree-sitter>=0.24,<0.27", "tree-sitter-java>=0.23,<0.24", "tree-sitter-kotlin>=1.0,<2"]
+go = ["tree-sitter>=0.24,<0.27", "tree-sitter-go>=0.24,<0.26"]
+polyglot = ["tree-sitter>=0.24,<0.27", "tree-sitter-rust>=0.23,<0.25", "tree-sitter-javascript>=0.24,<0.26", "tree-sitter-typescript>=0.23,<0.24", "tree-sitter-c>=0.23,<0.25", "tree-sitter-cpp>=0.23,<0.24", "tree-sitter-java>=0.23,<0.24", "tree-sitter-kotlin>=1.0,<2", "tree-sitter-go>=0.24,<0.26"]
+
+[project.scripts]
+synapsedesk = "synapsedesk.__main__:main"
+
+[tool.setuptools]
+packages = ["synapsedesk", "repo_triage_agent", "laptop_hand_tracking"]
+# Run from the source checkout: web assets and example repositories stay beside packages.

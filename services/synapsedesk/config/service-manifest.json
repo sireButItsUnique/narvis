@@ -1,0 +1,17 @@
+{
+  "name": "synapsedesk",
+  "version": "0.1.0",
+  "target": "Windows 10/11 x64, Python 3.12, Edge/Chrome",
+  "working_directory": "services/synapsedesk",
+  "launch": [".venv\\Scripts\\python.exe", "-m", "synapsedesk", "serve"],
+  "demo": [".venv\\Scripts\\python.exe", "-m", "synapsedesk", "serve", "--demo"],
+  "camera_worker": [".venv\\Scripts\\python.exe", "-m", "synapsedesk", "track", "--backend", "dshow"],
+  "listen": "127.0.0.1:8765",
+  "health": "/api/health",
+  "transport": "HTTP JSON + latest-state SSE",
+  "optional_reasoner": "http://127.0.0.1:11434/api/chat",
+  "model_file": "models/hand_landmarker.task",
+  "artifacts": ".runtime/",
+  "shutdown": "Ctrl+C; stop camera worker separately",
+  "notes": "Descriptive manifest. CLI arguments configure the service; this JSON is not loaded at runtime."
+}

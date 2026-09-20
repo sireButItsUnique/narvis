@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SynapseDesk · Engineering workbench</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<canvas id="desk" aria-label="Projected architecture graph and hand skeleton"></canvas>
+<header class="chrome">
+ <div class="identity"><span class="mark">S</span><div><h1>SynapseDesk</h1><span class="subtitle">SPATIAL ENGINEERING WORKBENCH</span></div></div>
+ <div class="live"><span id="indicator"></span><span id="tracking">CONNECTING</span><span id="mode">LOCAL SERVICE</span></div>
+</header>
+<aside id="panel" class="chrome">
+ <div class="eyebrow">01 / REPOSITORY INTELLIGENCE</div>
+ <form id="analyze"><label for="source">Repository folder or HTTPS git URL</label><div class="row"><input id="source" placeholder="C:\projects\your-repo" required autocomplete="off"><button type="submit">Analyze →</button></div></form>
+  <p id="job">Choose a repository to begin.</p>
+  <div id="counts">No graph loaded</div>
+  <div class="row"><input id="search" placeholder="Search all components" autocomplete="off"><button id="searchGo">Find</button></div>
+  <div id="searchResults" class="muted"></div>
+  <div class="tools"><button id="calibrate">Calibrate · C</button><button id="wire">Wire · W</button><button id="fullscreen">Fullscreen · F</button><button id="projector">Projection · H</button></div>
+  <div class="row"><a href="/display" style="color:inherit">Open display route →</a><span id="rev" class="muted"></span></div>
+ <details><summary>Interaction workspace</summary><p>Normalized camera coordinates. These limits disable gestures outside the rectangle.</p><form id="bounds"><div class="bounds"><label>X min<input name="xmin" type="number" value="0" min="0" max="1" step=".01"></label><label>X max<input name="xmax" type="number" value="1" min="0" max="1" step=".01"></label><label>Y min<input name="ymin" type="number" value="0" min="0" max="1" step=".01"></label><label>Y max<input name="ymax" type="number" value="1" min="0" max="1" step=".01"></label></div><button>Apply workspace</button></form><button id="resetCalibration">Reset calibration</button></details>
+ <div id="demo" hidden><label for="fault">Simulated tracking fault</label><select id="fault"><option value="none">Healthy hand</option><option value="lost">Hand lost</option><option value="stale">Stale camera frame</option><option value="boundary">Outside workspace</option></select></div>
+  <div class="section-title">EVIDENCE & CONFLICTS <span id="findingCount">0</span></div>
+  <div id="findings"><p class="muted">Analysis results will appear here.</p></div>
+  <div class="section-title">AGENT <span id="providerState" class="muted">stub</span></div>
+  <div class="row"><input id="agentDesc" placeholder="Scoped change description" autocomplete="off"><button id="agentRun">Implement</button></div>
+  <div class="row"><button id="agentExplain">Explain selection</button><button id="agentTasks">Tasks</button></div>
+  <div id="agentOut" class="muted"></div>
+</aside>
+<div id="notice" role="status"></div>
+<footer class="chrome"><span id="selection">Pinch to pick up a node. Release to place it.</span><span>LOCAL CAMERA → GRAPH → PROJECTOR</span></footer>
+<script type="module" src="/app.js"></script>
+</body></html>
