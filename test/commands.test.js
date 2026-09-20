@@ -193,12 +193,13 @@ test('and stays asleep for everything else in the room', () => {
   }
 });
 
-test('its name on its own is an answerable thing, not a command', () => {
-  // '' means the name and nothing after it: the page says "Narvis?" rather than doing nothing,
-  // which is how you find out the microphone is working before you commit to a sentence.
+test('the name alone is not a command, and does not arm one either', () => {
+  // '' is the name with nothing after it. The page says so and stops there: no window afterwards
+  // where the next thing anybody says is taken as an order, which is how an always-on microphone
+  // ends up acting on the conversation around it. The name and the command are one sentence.
   assert.equal(afterWake('narvis'), '');
   assert.equal(afterWake('hey narvis'), '');
-  assert.notEqual(afterWake('narvis'), null);
+  assert.equal(parseCommand(afterWake('narvis')), null, 'nothing to run');
 });
 
 test('the wake word gates VOICE, and typing is still typing', () => {
