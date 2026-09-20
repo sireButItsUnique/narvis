@@ -7,7 +7,7 @@ import { input } from './input/state.js';
 import { startCamera, track, drawDebug, eyeFilt, cam } from './input/webcam.js';
 import { updateInteraction, pointedPart, tool, TOOLS, SCULPT_TOOLS, setBrush, setNotify, zoomState } from './interaction.js';
 import * as sculpt from './sculpting.js';
-import { model, parts, showScene, clearScene, scaleBy, setSpin, turnBy, undo, resetPlacement, focusPart,
+import { model, parts, showScene, clearScene, scaleBy, setSpin, turnBy, undo, undoDepth, resetPlacement, focusPart,
          deletePart, duplicatePart, quickColor, quickFinish, layout, update as updateModel } from './model.js';
 import { fetchScene } from './scene/load.js';
 import { initBuild, build, cancelBuild, work, toggleLog } from './scene/build.js';
@@ -412,7 +412,13 @@ function runCommand(cmd) {
                    return flash(`Brush ${tool.brush.toFixed(1)} cm`);
     case 'turn':   return flash(turnBy(cmd.deg) ? `Turned ${cmd.deg === 180 ? 'around' : cmd.deg < 0 ? 'left' : 'right'}` : 'Nothing to turn');
     case 'clear':  return flash('Say "make ___" to start a new model, or "go back a version"', 4000);
-    case 'undo':   return flash(undo() ? 'Undone' : 'Nothing to undo here. "Go back a version" undoes a build.', 3500);
+    case 'undo': {
+      // Say what is left. The stack is ten deep and holds only real edits, so "3 left" is a
+      // number somebody can act on: keep going, or say "go back a version" for the build itself.
+      if (!undo()) return flash('Nothing to undo here. "Go back a version" undoes a build.', 3500);
+      const n = undoDepth();
+      return flash(n ? `Undone · ${n} more to undo` : 'Undone · nothing left to undo', 3000);
+    }
     case 'scale':  return flash(scaleBy(cmd.factor) ? (cmd.factor > 1 ? 'Bigger' : 'Smaller') : 'Nothing to resize');
     case 'spin':   setSpin(cmd.on); return flash(cmd.on ? 'Spinning' : 'Stopped spinning');
     case 'export': return doExport();
@@ -588,6 +594,7 @@ window.htw = {
   pointed: () => pointedPart()?.name ?? null,
   highlighted: () => [...highlighted().keys()].map(m => parts.ofMesh(m)?.name ?? m.name),
   tick: now => tick(now ?? performance.now()),
+  undoDepth,
   // Say something without a microphone: the same handler the recogniser calls, wake word and all.
   say: text => voiceHandlers.onFinal(text),
 };

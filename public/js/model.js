@@ -8,7 +8,12 @@ import { createParts } from './scene/parts.js';
 
 const HOME = { fx: 0, fy: 0, fz: 0.5 };   // centre of the floor, halfway back
 const SPIN_SPEED = 0.4;                    // rad/s
-const MAX_UNDO = 50;
+// How many edits are kept. Ten, not fifty, because of what a step now holds: a sculpt stroke's step
+// carries the before and after positions of every vertex it touched, so the stack is the one part of
+// this page whose memory grows with how hard you work. Ten is a demo's worth of regret, the oldest
+// is dropped (and its drop() hook frees what it was holding), and nothing here is a save file -
+// versions are the server's job and survive a reload; this does not.
+const MAX_UNDO = 10;
 const DEG = Math.PI / 180;
 const CM_PER_M = 100;                      // glTF is metres, the box is centimetres
 
@@ -256,6 +261,15 @@ export function quickFinish(part, finish) {
 // Start of any gesture: one undo step. The turntable holds still by itself while `editing` (see update), and it's
 // only really stopped when the gesture commits, so a tap that moves nothing leaves the spin as it found it.
 export function beginEdit(mesh = null) { remember(mesh); editSnap = history.at(-1); editing = true; }
+
+// Carrying the model about, and the zoom that lives on the same pinch, change where it IS - not what
+// it is. They take no undo step: a stack that fills up with "you moved it 4 cm" is one where the
+// thing you actually want back has already been pushed off the end. It still stops the turntable and
+// still counts as a gesture, so anything that changes the parts commits it first.
+export function beginMove() { editing = true; }
+
+// What undo would take back, for the HUD and for the voice: a count, so "undo" can say what is left.
+export const undoDepth = () => history.length;
 
 // A gesture being abandoned: drop the step that beginEdit pushed and put things back as they were.
 // A voice command that landed mid-gesture (turn, resize) pushed its own step on top; that one is kept.

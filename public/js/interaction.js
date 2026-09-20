@@ -10,7 +10,7 @@ import * as THREE from 'three';
 import { canvas, rect, boxDepth } from './view.js';
 import { input } from './input/state.js';
 import { S } from './settings.js';
-import { model, parts, beginEdit, cancelEdit, discardEdit, endGrab, clampPosition,
+import { model, parts, beginEdit, beginMove, cancelEdit, discardEdit, endGrab, clampPosition,
          setTransform, setGestureFlush } from './model.js';
 import { highlight } from './scene/highlight.js';
 import { updateViz } from './handviz.js';
@@ -117,7 +117,8 @@ function startAction(p, target, now) {
     action = { ...base, kind: 'turn', rot0: model.rotY, scale0: model.userScale,
                aim0: rayPoint(p, target.dist).clone() };
   } else {
-    beginEdit();
+    // No undo step for a move: see model.beginMove(). Where it stands is not what it is.
+    beginMove();
     action = { ...base, kind: 'grab', startPos: root.position.clone(), offset: root.position.clone().sub(rayPoint(p, target.dist)) };
   }
   return true;
@@ -177,7 +178,9 @@ function changed(a) {
   const moved = (p, q, eps) => p.distanceTo(q) > eps;
   if (a.kind === 'stroke') return !!a.moved;
   if (a.kind === 'grab') return moved(a.root.position, a.startPos, 0.01);
-  if (a.kind === 'turn') return Math.abs(model.rotY - a.rot0) > 1e-3;
+  // Turn AND scale live on this one gesture, so asking only about the rotation threw away the
+  // undo step for every resize done with one hand - the edit happened, the way back did not.
+  if (a.kind === 'turn') return Math.abs(model.rotY - a.rot0) > 1e-3 || Math.abs(model.userScale - a.scale0) > 1e-4;
   return moved(a.root.position, a.pos0, 0.01) || Math.abs(model.rotY - a.rot0) > 1e-3 || Math.abs(model.userScale - a.scale0) > 1e-3;
 }
 
