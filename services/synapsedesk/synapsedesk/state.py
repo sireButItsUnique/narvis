@@ -12,7 +12,7 @@ from repo_triage_agent.reasoner import reason
 from repo_triage_agent.provider import from_config, ProviderError
 from repo_triage_agent import workingcopy
 from repo_triage_agent.adapters import adapter_for
-from .contracts import validate_graph
+from .contracts import validate_graph, validate_view
 from .store import Store
 
 
@@ -45,6 +45,7 @@ class State:
         self.provider = from_config(self.endpoint, self.model_name)
         self.stop = threading.Event()
         self.analysis = None
+        self.view = []
         self.tasks = {}
         self.cancel_flags = set()
         # SQLite is authoritative; legacy JSON stays as export. Restore on restart.
@@ -58,7 +59,7 @@ class State:
     def snapshot(self):
         with self.lock:
             return dict(tracking=self.gate.snapshot(),spatial=self.spatial.snapshot(),revision=self.revision,
-                        job=dict(self.job),demo=self.demo,demo_fault=self.demo_fault)
+                        job=dict(self.job),demo=self.demo,demo_fault=self.demo_fault,view=list(self.view))
 
     def graph_snapshot(self):
         with self.lock:
@@ -119,6 +120,12 @@ class State:
             self.revision = self.store.save_revision(graph, self.job, event="graph.wire",
                 payload={"edge": edge["id"], "source": source, "target": target})
             self.graph = graph
+
+    def set_view(self, trail):
+        """Which level the desk is showing. Not persisted: it is where you are looking, not state."""
+        with self.lock:
+            self.view = validate_view(trail)
+            return {"view": list(self.view)}
 
     def set_bounds(self,bounds):
         with self.lock:

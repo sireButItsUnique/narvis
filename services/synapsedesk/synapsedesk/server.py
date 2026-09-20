@@ -207,6 +207,9 @@ class Handler(BaseHTTPRequestHandler):
                 state.wire(data["source"],data["target"],data.get("revision"))
             elif path=="/api/bounds":
                 state.set_bounds(data)
+            elif path=="/api/view":
+                self.json(state.set_view(data.get("trail")))
+                return
             elif path=="/api/positions":
                 if not isinstance(data.get("positions"),dict):
                     raise ValueError("positions must be an object")

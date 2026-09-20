@@ -11,6 +11,8 @@
  <div class="eyebrow">01 / REPOSITORY INTELLIGENCE</div>
  <form id="analyze"><label for="source">Repository folder or HTTPS git URL</label><div class="row"><input id="source" placeholder="C:\projects\your-repo" required autocomplete="off"><button type="submit">Analyze →</button></div></form>
   <p id="job">Choose a repository to begin.</p>
+  <nav id="breadcrumb" aria-label="Drill-down level"></nav>
+  <div class="row"><button id="up">↑ Up a level · Esc</button><span id="focusKind" class="muted">SYSTEM</span></div>
   <div id="counts">No graph loaded</div>
   <div class="row"><input id="search" placeholder="Search all components" autocomplete="off"><button id="searchGo">Find</button></div>
   <div id="searchResults" class="muted"></div>
@@ -26,6 +28,6 @@
   <div id="agentOut" class="muted"></div>
 </aside>
 <div id="notice" role="status"></div>
-<footer class="chrome"><span id="selection">Pinch to pick up a node. Release to place it.</span><span>LOCAL CAMERA → GRAPH → PROJECTOR</span></footer>
+<footer class="chrome"><span id="selection">Pinch and release without moving to open a node. Pinch and drag to move it.</span><span>LOCAL CAMERA → GRAPH → PROJECTOR</span></footer>
 <script type="module" src="/app.js"></script>
 </body></html>

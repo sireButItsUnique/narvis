@@ -70,6 +70,16 @@ def validate_tracking(packet):
     return packet
 
 
+def validate_view(trail):
+    """A drill-down path: directories, then a file, then a symbol id. At most 8 deep."""
+    if not isinstance(trail, list) or len(trail) > 8:
+        raise ValueError("view trail must be a list of at most 8 entries")
+    for entry in trail:
+        if not isinstance(entry, str) or not 0 < len(entry) <= 300 or "\x00" in entry:
+            raise ValueError("invalid view trail entry")
+    return list(trail)
+
+
 def validate_bounds(bounds):
     if not isinstance(bounds, dict) or set(bounds) != {"xmin", "xmax", "ymin", "ymax"}:
         raise ValueError("bounds require xmin, xmax, ymin, ymax")
