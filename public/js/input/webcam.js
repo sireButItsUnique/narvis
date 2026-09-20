@@ -28,6 +28,7 @@ const gripFilt = [makeFilter3(1.6, 0.08), makeFilter3(1.6, 0.08)];
 export const cam = { video: null, faceLm: null, handLm: null, lastVideoTime: -1, lastFace: null, lastHands: [], ipdHistory: [] };
 
 export async function startCamera(status) {
+  stopCamera();            // idempotent: Start twice must not open a second camera and a second MediaPipe
   status('Opening webcam…');
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 60 }, facingMode: 'user' }, audio: false });
@@ -46,9 +47,36 @@ export async function startCamera(status) {
     try { return await Cls.createFromOptions(fileset, { ...opts, baseOptions: { ...opts.baseOptions, delegate: 'GPU' } }); }
     catch (e) { console.warn('GPU delegate failed, using CPU', e); return Cls.createFromOptions(fileset, { ...opts, baseOptions: { ...opts.baseOptions, delegate: 'CPU' } }); }
   };
-  cam.faceLm = await make(FaceLandmarker, { baseOptions: { modelAssetPath: faceModel }, runningMode: 'VIDEO', numFaces: 1 });
-  cam.handLm = await make(HandLandmarker, { baseOptions: { modelAssetPath: handModel }, runningMode: 'VIDEO', numHands: 2 });
+  try {
+    cam.faceLm = await make(FaceLandmarker, { baseOptions: { modelAssetPath: faceModel }, runningMode: 'VIDEO', numFaces: 1 });
+    cam.handLm = await make(HandLandmarker, { baseOptions: { modelAssetPath: handModel }, runningMode: 'VIDEO', numHands: 2 });
+  } catch (e) {
+    // The caller falls through to the multi-camera path on a failure here; without this the stream and the
+    // hidden <video> stay open for the life of the page and the camera light never goes out.
+    stopCamera();
+    throw e;
+  }
   input.mode = 'camera';
+}
+
+/**
+ * Give everything back: the camera stream, the hidden <video>, and both MediaPipe landmarkers (each of
+ * which holds ~25 MB of model and its own WebGL2 context). Without this, Stop then Start — which is one
+ * click on cameras.html, and is also what startCameras() does to itself on a restart — left the previous
+ * camera busy and the previous pair of landmarkers alive, every time.
+ */
+export function stopCamera() {
+  try { cam.video?.srcObject?.getTracks?.().forEach(t => t.stop()); } catch {}
+  try { cam.video?.pause?.(); } catch {}
+  try { cam.video?.remove?.(); } catch {}
+  try { cam.faceLm?.close?.(); } catch {}
+  try { cam.handLm?.close?.(); } catch {}
+  cam.video = cam.faceLm = cam.handLm = null;
+  cam.lastVideoTime = -1; cam.lastFace = null; cam.lastHands = []; cam.ipdHistory = [];
+  // Reset the smoothing too, or a restart eases in from wherever the head was when it stopped.
+  eyeFilt.forEach(f => f.reset());
+  tipFilt.forEach(t => t.forEach(f => f.reset()));
+  gripFilt.forEach(g => g.forEach(f => f.reset()));
 }
 
 const d3 = (p, q) => Math.hypot(p.x - q.x, p.y - q.y, p.z - q.z);

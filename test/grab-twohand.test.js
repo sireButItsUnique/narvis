@@ -16,15 +16,21 @@ const at = (x, y, z) => ({ x, y, z });
 const CENTRE = at(0, 0.12, 0);
 
 // grab with both hands at ±half the span along x, then interpolate both to `to` over `ms` and hold
+// The segments are CONTIGUOUS (each starts one frame after the last one ended) and the helper reports
+// where it finished, so a caller that continues the timeline does not leave a dead stretch in which the
+// hands were unseen. A hold-through window measured from the last sighting counts that stretch, and
+// rightly: the hand really had not been seen.
+const STEP = 1000 / 60;
 function twoHandRun({ config, body, from, to, ms = 1200, settle = 600, grab = null }) {
   const g = grab || createGrab({ config });
   // hand 0 takes it, then hand 1 joins
   run({ grab: g, bodies: [body], durationMs: 300, hands: now => [handFrame(0, from[0], 0.012, now)] });
+  const t1 = 300 + STEP;
   run({
-    grab: g, bodies: [body], durationMs: 300, t0: 400,
+    grab: g, bodies: [body], durationMs: 300, t0: t1,
     hands: now => [handFrame(0, from[0], 0.012, now), handFrame(1, from[1], 0.012, now)],
   });
-  const t0 = 750;
+  const t0 = t1 + 300 + STEP;
   run({
     grab: g, bodies: [body], durationMs: ms + settle, t0,
     hands: now => {
@@ -33,6 +39,7 @@ function twoHandRun({ config, body, from, to, ms = 1200, settle = 600, grab = nu
               handFrame(1, vmix(from[1], to[1], u), 0.012, now)];
     },
   });
+  g.endAt = t0 + ms + settle;
   return g;
 }
 
@@ -159,8 +166,9 @@ test('one of the two hands blinking out does not jerk the model', () => {
   const beforeQ = { ...body.pose.quaternion };
   let worst = 0;
   // hand 1 disappears for 150 ms while hand 0 keeps reporting, then comes back
+  const blinkAt = grab.endAt + STEP;
   run({
-    grab, bodies: [body], durationMs: 150, t0: 2800,
+    grab, bodies: [body], durationMs: 150, t0: blinkAt,
     hands: now => [handFrame(0, at(0, 0.12, -0.06), 0.012, now)],
     onFrame: () => { worst = Math.max(worst, vdist(body.pose.position, before)); },
   });
@@ -168,7 +176,7 @@ test('one of the two hands blinking out does not jerk the model', () => {
   assert.ok(worst < 0.001, `moved ${(worst * 1000).toFixed(2)} mm while one hand was missing`);
   assert.ok(qangle(body.pose.quaternion, beforeQ) < 0.005);
   run({
-    grab, bodies: [body], durationMs: 300, t0: 2970,
+    grab, bodies: [body], durationMs: 300, t0: blinkAt + 150 + STEP,
     hands: now => [handFrame(0, at(0, 0.12, -0.06), 0.012, now), handFrame(1, at(0, 0.12, 0.06), 0.012, now)],
     onFrame: () => { worst = Math.max(worst, vdist(body.pose.position, before)); },
   });

@@ -50,19 +50,31 @@ const intr = (s, fallback) => ({
   k1: s?.k1 ?? 0, k2: s?.k2 ?? 0, k3: s?.k3 ?? 0, p1: s?.p1 ?? 0, p2: s?.p2 ?? 0,
 });
 
-// No .conf yet? A ZED's published fov gets us close enough to grab something; the calibration file only
-// refines it. 110 deg horizontal is the ZED/ZED 2i wide setting, 90 deg is a safe middle for unknown units.
-export function defaultCalib(width, height, hfovDeg = 102) {
+// What a real ZED's factory calibration says, as the reference for a guess. The published "110 degrees"
+// is the maximum DISTORTED horizontal field, not a pinhole one, so deriving a focal length from it (the
+// old hfovDeg = 102 guess gave fx = 518 at a 1280 px eye) lands about 26% short of the hardware — two
+// independent SN.conf files and this repo's own sample all carry LEFT_CAM_HD fx ~= 700. A 26% focal error
+// is 26% of DEPTH: a fingertip really at 380 mm came out at 284 mm, which is not a refinement.
+export const ZED_REF = { eyeW: 1280, fx: 700 };
+// Per-model baseline, because a Mini is 63 mm and a 2/2i is 120 mm and getting it wrong doubles the error.
+const ZED_BASELINE_CM = { 'ZED Mini': 6.3, 'ZED 2': 12.0, 'ZED 2i': 12.0 };
+
+// No .conf yet? These numbers are good enough to reach out and grab something and NOT good enough to
+// trust the millimetres, which is what `metric: false` says. Drop in calib.stereolabs.com/?SN=<serial>
+// and it becomes a measurement.
+export function defaultCalib(width, height, model = null) {
   const L = splitLayout(width, height);
-  const fx = (L.eyeW / 2) / Math.tan(hfovDeg * Math.PI / 360);
+  const fx = ZED_REF.fx * (L.eyeW / ZED_REF.eyeW);
   const base = { fx, fy: fx, cx: L.eyeW / 2, cy: L.eyeH / 2 };
-  return { left: intr(null, base), right: intr(null, base), baselineCm: 12, rot: [0, 0, 0], eyeW: L.eyeW, eyeH: L.eyeH, source: 'fov guess' };
+  return { left: intr(null, base), right: intr(null, base),
+           baselineCm: ZED_BASELINE_CM[model] ?? 12, rot: [0, 0, 0],
+           eyeW: L.eyeW, eyeH: L.eyeH, source: 'typical ZED (no .conf)', metric: false };
 }
 
 // conf + the resolution we opened -> the numbers the triangulator needs, in cm.
-export function calibFor(conf, width, height) {
+export function calibFor(conf, width, height, model = null) {
   const mode = zedModeFor(width, height) || ZED_MODES.find(m => m.width === width) || null;
-  const d = defaultCalib(width, height);
+  const d = defaultCalib(width, height, model);
   if (!conf || !mode) return d;
   const suffix = mode.name;
   const L = conf[`LEFT_CAM_${suffix}`], R = conf[`RIGHT_CAM_${suffix}`], S = conf.STEREO || {};
@@ -73,7 +85,8 @@ export function calibFor(conf, width, height) {
   return {
     left: intr(L, d.left), right: intr(R, d.right),
     baselineCm: baseMm / 10, rot, eyeW: d.eyeW, eyeH: d.eyeH,
-    source: L ? `SN.conf ${suffix}` : 'fov guess',
+    source: L ? `SN.conf ${suffix}` : d.source,
+    metric: !!L,            // only a real factory file makes the published millimetres a measurement
   };
 }
 
@@ -100,19 +113,42 @@ export function rayFromPixel(px, py, k) {
   return norm([x, y, 1]);
 }
 
-// Small-angle rotation of the right eye into the left eye's frame (rx, ry=CV, rz, radians).
-export function rotateVec(v, [rx, ry, rz]) {
+// Rz * Ry * Rx as a flat row-major 3x3. One function so the ray path and the PinholeCamera path
+// (input/solver.js) cannot end up with different ideas of where a camera is pointing.
+export function rotMatrix([rx, ry, rz]) {
   const cx = Math.cos(rx), sx = Math.sin(rx), cy = Math.cos(ry), sy = Math.sin(ry), cz = Math.cos(rz), sz = Math.sin(rz);
-  // Rz * Ry * Rx
-  const m = [
-    [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
-    [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
-    [-sy, cy * sx, cy * cx],
-  ];
-  return [m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-          m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-          m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2]];
+  return [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx,
+          sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx,
+          -sy, cy * sx, cy * cx];
 }
+
+export function matMul3(a, b) {
+  const m = new Array(9);
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+    m[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+  return m;
+}
+
+export const transpose3 = m => [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]];
+
+export const matVec3 = (m, v) => [m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+                                  m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+                                  m[6] * v[0] + m[7] * v[1] + m[8] * v[2]];
+
+export function rotateVec(v, rot) { return matVec3(rotMatrix(rot), v); }
+
+/**
+ * The ZED's factory stereo rotation, as a matrix that takes a direction in the RIGHT eye's frame into the
+ * LEFT eye's frame — which is the TRANSPOSE of rotMatrix([RX, CV, RZ]).
+ *
+ * Stereolabs' own OpenCV recipe feeds [RX, CV, RZ] through cv2.Rodrigues into cv2.stereoRectify, whose R
+ * is cam1 -> cam2, i.e. LEFT -> RIGHT; track/calibrate.js camerasFromZedConf() already follows that. This
+ * file used to apply it the other way round, so the two descriptions of the same camera differed by
+ * 2 * |rot| (4.6 mrad on the sample .conf) and the depth of a fingertip came out 5.7 mm long at 380 mm —
+ * systematic, in the same direction every frame, about 3x the 1 px noise floor. One convention, stated
+ * once, and test/cameras-stereo.test.js round-trips a point through both files to keep it that way.
+ */
+export const stereoRotMatrix = rot => transpose3(rotMatrix(rot));
 
 // The two views of one landmark, as rays in the LEFT camera's frame (the reference frame of a ZED).
 export function stereoViews(uvLeft, uvRight, calib, weightL = 1, weightR = 1) {
@@ -120,7 +156,8 @@ export function stereoViews(uvLeft, uvRight, calib, weightL = 1, weightR = 1) {
   const pxR = [uvRight[0] * calib.eyeW, uvRight[1] * calib.eyeH];
   return [
     { origin: [0, 0, 0], dir: rayFromPixel(pxL[0], pxL[1], calib.left), weight: weightL },
-    { origin: [calib.baselineCm, 0, 0], dir: rotateVec(rayFromPixel(pxR[0], pxR[1], calib.right), calib.rot), weight: weightR },
+    { origin: [calib.baselineCm, 0, 0],
+      dir: matVec3(stereoRotMatrix(calib.rot), rayFromPixel(pxR[0], pxR[1], calib.right)), weight: weightR },
   ];
 }
 
@@ -169,9 +206,14 @@ export function residualCm(point, views) {
   return worst;
 }
 
-// ---------- thin adapter onto ../track/solve.js ----------
-// Another agent owns the solver; we do not know its export names yet, so try the plausible ones, check the
-// candidate against a known answer, and keep the local midpoint if it is missing or disagrees.
+// ---------- adapter onto ../track/triangulate.js ----------
+//
+// This is the RAY-level seam. The real pipeline (input/solver.js -> track/solve.js Tracker) works from
+// posed PinholeCameras and pixels and never comes through here; what is left needing a ray API is the
+// no-Tracker fallback and the setup page's per-view arithmetic. Rather than keep a second implementation
+// of the same normal equations, wrap each ray in the smallest thing triangulateRays() actually asks of a
+// camera — a .ray() — so both paths run the SAME estimator. The local midpoint stays as the answer when
+// track/ is absent, and the known-answer check still gates whatever is adopted.
 
 let solverFn = null, solverName = 'local midpoint', tried = false;
 
@@ -183,19 +225,29 @@ const CHECK = [ // two rays that meet at (3, 0, 30) cm
   { origin: [12, 0, 0], dir: norm([-9, 0, 30]) },
 ];
 
-export async function loadSolver(importer = () => import('../track/solve.js')) {
+// A ray dressed as the camera triangulateRays() wants. It only ever calls camera.ray(u, v), so this is the
+// whole contract; anything that needs project() or RT belongs on the PinholeCamera path instead.
+const rayCamera = v => {
+  const o = v.origin || [0, 0, 0], d = norm(v.dir);
+  return { id: v.label || 'ray', noisePx: 1, ray: () => ({ o, d }) };
+};
+const asViews = views => views.map(v => ({ camera: rayCamera(v), u: 0, v: 0, weight: v.weight ?? 1 }));
+
+export async function loadSolver(importer = () => import('../track/triangulate.js')) {
   if (tried) return solverInfo();
   tried = true;
   try {
     const mod = await importer();
-    const names = ['triangulate', 'triangulateViews', 'triangulateRays', 'triangulateDLT', 'solveTriangulation'];
-    for (const n of names) {
-      const fn = mod?.[n];
-      if (typeof fn !== 'function') continue;
-      const p = toXyz(fn(CHECK.map(v => ({ ...v, o: v.origin, d: v.dir, weight: 1 }))));
-      if (p && Math.hypot(p[0] - 3, p[1], p[2] - 30) < 0.05) { solverFn = v => toXyz(fn(v)); solverName = `track/solve.js ${n}`; break; }
+    const fn = mod?.triangulateRays;
+    if (typeof fn === 'function') {
+      const p = toXyz(fn(asViews(CHECK)));
+      // Never adopt a solver on the strength of its name: it has to get a known answer right first.
+      if (p && Math.hypot(p[0] - 3, p[1], p[2] - 30) < 0.05) {
+        solverFn = v => toXyz(fn(asViews(v)));
+        solverName = 'track/triangulate.js triangulateRays';
+      }
     }
-  } catch { /* solver not landed yet: the local midpoint is a correct, if plainer, answer */ }
+  } catch { /* track/ missing: the local midpoint is a correct, if plainer, answer */ }
   return solverInfo();
 }
 
@@ -233,21 +285,36 @@ export function camDirToWorld(d, ext = FACING_USER) {
   return rotateVec(d, (ext.rotDeg || [0, 0, 0]).map(a => a * Math.PI / 180));
 }
 
+// Where one eye sits and which way it looks, in the app's world frame (cm).
+//
+//   R_camToWorld = R(ext.rotDeg) * stereoRotMatrix(extraRot)
+//
+// and a calibration file's convention is the other way round, so `R` here is WORLD -> CAMERA, which is what
+// track/camera.js PinholeCamera wants. Deriving it from the same ext/offsetCam/extraRot the ray path uses
+// is the point: one description of the rig, two consumers.
+export function cameraPose({ ext = FACING_USER, offsetCam = [0, 0, 0], extraRot = [0, 0, 0] } = {}) {
+  const Rext = rotMatrix((ext.rotDeg || [0, 0, 0]).map(a => a * Math.PI / 180));
+  const R = matMul3(Rext, stereoRotMatrix(extraRot));
+  return { positionCm: camToWorld(offsetCam, ext), R: transpose3(R), RCamToWorld: R };
+}
+
 // One camera (or one eye of a ZED) as the triangulator sees it: normalised image point -> a world-space ray.
 // offsetCam/extraRot place this eye inside its camera rig (the right eye of a ZED sits one baseline over).
 export function makeView({ intr, eyeW, eyeH, ext = FACING_USER, offsetCam = [0, 0, 0], extraRot = [0, 0, 0], label = '' }) {
   const origin = camToWorld(offsetCam, ext);
+  const pose = cameraPose({ ext, offsetCam, extraRot });
+  const Rrel = stereoRotMatrix(extraRot);   // this eye's frame -> the reference (left) eye's frame
   return {
-    label, intr, eyeW, eyeH, ext, origin,
+    label, intr, eyeW, eyeH, ext, origin, pose, offsetCam, extraRot,
     // normalised image point -> world ray
     ray(u, v, weight = 1) {
       const d = rayFromPixel(u * eyeW, v * eyeH, intr);
-      return { origin, dir: camDirToWorld(rotateVec(d, extraRot), ext), weight };
+      return { origin, dir: camDirToWorld(matVec3(Rrel, d), ext), weight };
     },
     // normalised image point + a depth along this camera's optical axis -> world point (the one-view guess)
     point(u, v, depthCm) {
       const [x, y] = undistort((u * eyeW - intr.cx) / intr.fx, (v * eyeH - intr.cy) / intr.fy, intr);
-      const p = rotateVec([x * depthCm, y * depthCm, depthCm], extraRot);
+      const p = matVec3(Rrel, [x * depthCm, y * depthCm, depthCm]);
       return camToWorld([p[0] + offsetCam[0], p[1] + offsetCam[1], p[2] + offsetCam[2]], ext);
     },
   };

@@ -19,7 +19,7 @@
 import { GRAB_CONFIG, cloneConfig } from './config.js';
 import {
   v3, vcopy, vadd, vsub, vmul, vmix, vlen, vdist, vnorm, clamp,
-  q1, qcopy, qmul, qapply, qFromUnitVectors, OneEuro3, PoseTrail, deadband, springStep,
+  q1, qcopy, qconj, qmul, qapply, qFromUnitVectors, OneEuro3, PoseTrail, deadband, springStep,
 } from './math.js';
 
 const clonePose = p => ({ position: vcopy(p.position), quaternion: qcopy(p.quaternion || q1()), scale: p.scale ?? 1 });
@@ -66,7 +66,7 @@ export function createGrab({ config = cloneConfig(GRAB_CONFIG) } = {}) {
     if (!h) {
       h = {
         id,
-        live: false, lostAt: null, seenEver: false, resumed: false,
+        live: false, lostAt: null, seenAt: null, seenEver: false, resumed: false,
         point: null, raw: null,
         filter: new OneEuro3(cfg.point),
         trail: new PoseTrail(Math.max(400, cfg.releaseLagMs + cfg.velocityWindowMs + 100)),
@@ -87,6 +87,11 @@ export function createGrab({ config = cloneConfig(GRAB_CONFIG) } = {}) {
   function readHand(raw, now) {
     const h = handState(raw.id);
     h.justClosed = h.justOpened = h.resumed = false;
+    // Remember WHEN the sensor last actually saw this hand. The hold-through window is measured from
+    // that, not from the frame we first decided the hand was gone — otherwise the upstream staleness
+    // grace and this one run in series and the model stays glued to a dead hand for twice as long as
+    // dropoutMs says (450 ms through the real solver, against the 200 ms this file documents).
+    if (raw.seenAt != null) h.seenAt = raw.seenAt;
     const live = raw.active !== false && (raw.seenAt == null || now - raw.seenAt <= cfg.dropoutMs);
     if (!live) {
       if (h.live) h.lostAt = now;      // keep the last point; the hold is ended later, once dropoutMs is up
@@ -105,7 +110,14 @@ export function createGrab({ config = cloneConfig(GRAB_CONFIG) } = {}) {
     // Coming back from a dropout, seed the filter with the last FILTERED point, not the first raw sample: one
     // raw sample carries the tracker's full 8 mm of noise, and anything we anchor to it keeps that error for
     // good. Seeded this way the hand converges over ~100 ms with no step, and a held body simply follows.
-    if (h.resumed) h.filter.reset(h.point || grip, now / 1000);
+    //
+    // EXCEPT in a two-hand hold, where update() is about to re-take the basis from this very point: seeding
+    // with the pre-gap point would hand it a position that is still a gap's worth of travel behind, and bake
+    // that into the new basis. There the fresh sample is the right answer.
+    if (h.resumed) {
+      const inTwo = h.holdId != null && holds.get(h.holdId)?.kind === 'two';
+      h.filter.reset(inTwo ? grip : (h.point || grip), now / 1000);
+    }
     h.point = h.filter.filter(grip, now / 1000);
     h.trail.push(now, h.point);
 
@@ -126,16 +138,50 @@ export function createGrab({ config = cloneConfig(GRAB_CONFIG) } = {}) {
   }
 
   // ---------- choosing what you grabbed ----------
-  function bestTarget(point, bodies, h, now) {
-    let best = null, bestD = Infinity;
+
+  /**
+   * How far the pinch point is from a body's pick volume — the ONE ranking, used by both bestTarget and
+   * the intent memory, because ranking them differently means the highlight and the grab disagree.
+   *
+   * It is the distance to the part's own oriented box when bodies.js measured one. The old measure was
+   * (distance to centre - bounding-sphere radius), and bodies.js set that radius to half the bounding-box
+   * DIAGONAL, so size was a pure bonus with no upper bound: a 30 x 2 x 30 cm base slab beat the 5 cm ball
+   * sitting on it even when the hand was dead centre on the ball, and any model with one large or flat
+   * part had exactly one grabbable part. A sphere fallback is kept for bodies built by hand (the tests,
+   * and anything that is really a ball).
+   */
+  function pickScore(point, b) {
+    const c = centreOf(b);
+    const h = b.half;
+    if (!h) return vdist(point, c) - (b.radius || 0);
+    const d = vsub(point, c);
+    const q = b.quaternion || b.pose?.quaternion;
+    const p = q ? qapply(qconj(q), d) : d;          // into the part's own axes
+    const dx = Math.max(0, Math.abs(p.x) - h.x);
+    const dy = Math.max(0, Math.abs(p.y) - h.y);
+    const dz = Math.max(0, Math.abs(p.z) - h.z);
+    return Math.hypot(dx, dy, dz);
+  }
+
+  /**
+   * The nearest takeable body, and whether the nearest body of all is one this hand may not take yet.
+   * Those are two different questions and conflating them was the bug: the re-grab lockout skipped the
+   * body it had just dropped and then handed the grab to the NEXT nearest one, so for 620 ms after every
+   * release a re-pinch on the same spot took the neighbouring part instead — and the hover highlight
+   * moved with it.
+   */
+  function bestTarget(point, bodies, h, now, { ignoreLockout = false } = {}) {
+    let best = null, bestD = Infinity, lockedOut = false;
     for (const b of bodies) {
       if (b.locked) continue;
+      const d = pickScore(point, b);
+      if (d >= bestD) continue;
       const until = h.lockout.get(b.id);
-      if (until != null && now < until) continue;
-      const d = vdist(point, centreOf(b)) - (b.radius || 0);
-      if (d < bestD) { bestD = d; best = b; }
+      const blocked = !ignoreLockout && until != null && now < until;
+      bestD = d; best = b; lockedOut = blocked;
     }
-    return best && bestD <= cfg.grabRadius ? { body: best, dist: bestD } : null;
+    if (!best || bestD > cfg.grabRadius) return null;
+    return { body: best, dist: bestD, lockedOut };
   }
 
   const intentValid = (h, bodies, now) =>
@@ -146,6 +192,10 @@ export function createGrab({ config = cloneConfig(GRAB_CONFIG) } = {}) {
   // by a margin, and stay that way, before it takes over: one jittery frame cannot steal the grab.
   function updateIntent(h, bodies, now) {
     const near = h.point ? bestTarget(h.point, bodies, h, now) : null;
+    // The nearest body is one this hand just dropped: the honest answer is "nothing yet", not "the one
+    // behind it". Leave the intent where it is and show no hover, so the highlight cannot promise a part
+    // the grab will not take.
+    if (near && near.lockedOut) { h.challenger = null; h.hoverId = null; return; }
     if (!near) {
       h.challenger = null;
       h.hoverId = intentValid(h, bodies, now) ? h.intent.bodyId : null;
@@ -157,7 +207,7 @@ export function createGrab({ config = cloneConfig(GRAB_CONFIG) } = {}) {
       h.challenger = null;
     } else {
       const cur = bodies.find(b => b.id === h.intent.bodyId);
-      const curD = vdist(h.point, centreOf(cur)) - (cur.radius || 0);
+      const curD = pickScore(h.point, cur);
       if (near.dist < curD - cfg.intentStealMargin) {
         if (!h.challenger || h.challenger.bodyId !== near.body.id) h.challenger = { bodyId: near.body.id, since: now };
         if (now - h.challenger.since >= cfg.intentSwitchMs) { h.intent = { bodyId: near.body.id, t: now }; h.challenger = null; }
@@ -290,9 +340,12 @@ export function createGrab({ config = cloneConfig(GRAB_CONFIG) } = {}) {
     const tPre = Math.min(now - cfg.releaseLagMs, firm);
     const pose = clonePose(body.pose);
     let vel = v3();
-    // Only a one-hand release rolls back. Two hands have two flicks and no single anchor to roll back along,
-    // and the pose is a rotation and a scale as well as a point — it is left exactly where it was.
-    if (h && hold.kind === 'one' && h.trail.items.length > 1) {
+    // Only a DELIBERATE one-hand release rolls back and throws. A hold that ended because the hand
+    // vanished is not a gesture: rolling back put the model where the hand was ~250 ms ago, and handing
+    // the settle that velocity flung it across the volume — a tracking blink was indistinguishable from
+    // the user throwing the model. Two hands never roll back either: two flicks, no single anchor, and
+    // the pose is a rotation and a scale as well as a point.
+    if (reason === 'released' && h && hold.kind === 'one' && h.trail.items.length > 1) {
       const pre = h.trail.at(tPre);
       if (pre) pose.position = clampToVolume(vadd(pre, hold.offset));
       vel = h.trail.velocity(tPre, cfg.velocityWindowMs);
@@ -311,6 +364,14 @@ export function createGrab({ config = cloneConfig(GRAB_CONFIG) } = {}) {
     for (const id of hold.handIds) hands.get(id)?.lockout.set(hold.bodyId, now + cfg.regrabLockoutMs);
     emit('grabEnd', { bodyId: body.id, handIds: [...hold.handIds], pose: clonePose(pose), velocity: vcopy(vel), reason, record: rec, at: now });
 
+    // A lost hand does not drop the model on the floor either. Gating only the velocity still let gravity
+    // carry it ~90 mm down, which is what the user would actually see after a 200 ms occlusion: it left
+    // where it was and landed somewhere else. Close the record immediately instead, so undo still works.
+    if (reason !== 'released') {
+      rec.settled = true;
+      emit('settleEnd', { bodyId: body.id, pose: clonePose(pose), record: rec, at: now });
+      return;
+    }
     settles.set(body.id, { bodyId: body.id, vel: vmul(vel, cfg.throwGain), startedAt: now, record: rec });
     emit('settleStart', { bodyId: body.id, pose: clonePose(pose), at: now });
   }
@@ -381,7 +442,7 @@ export function createGrab({ config = cloneConfig(GRAB_CONFIG) } = {}) {
     // a hand that has been gone longer than the dropout window drops what it holds
     for (const h of hands.values()) {
       if (h.live || !h.holdId) continue;
-      if (h.lostAt != null && now - h.lostAt <= cfg.dropoutMs) continue;
+      if (h.lostAt != null && now - (h.seenAt ?? h.lostAt) <= cfg.dropoutMs) continue;
       const hold = holds.get(h.holdId);
       h.holdId = null;
       if (!hold) continue;
@@ -391,6 +452,17 @@ export function createGrab({ config = cloneConfig(GRAB_CONFIG) } = {}) {
       else if (byId.has(hold.bodyId)) { hold.handIds = [h.id]; endHold(hold, byId.get(hold.bodyId), now, 'lost'); }
       else holds.delete(hold.bodyId);
     }
+    // A hand that came back inside the hold-through window must re-take the two-hand basis. span0/axis0/
+    // mid0/pos0 are defined RELATIVE TO THE OTHER HAND, which kept moving while this one was gone, so
+    // reusing them made the model sit still for the whole gap and then snap 50-100 mm and tens of degrees
+    // in a single frame. A ONE-hand hold is the opposite case: its offset is meant to survive the gap
+    // untouched, and re-taking it there makes the grip slide.
+    for (const h of hands.values()) {
+      if (!h.resumed || !h.holdId) continue;
+      const hold = holds.get(h.holdId);
+      if (hold && hold.kind === 'two') reanchor(hold);
+    }
+
     // hover / intent for hands that are not holding
     for (const h of hands.values()) {
       if (!h.live) { h.hoverId = null; continue; }
@@ -404,7 +476,15 @@ export function createGrab({ config = cloneConfig(GRAB_CONFIG) } = {}) {
       let body = intentValid(h, bodies, now) ? byId.get(h.intent.bodyId) : null;
       const until = body && h.lockout.get(body.id);
       if (until != null && now < until) body = null;
-      if (!body) body = bestTarget(h.point, bodies, h, now)?.body || null;
+      if (!body) {
+        // Decide what the hand is nearest FIRST, then ask whether it may take it. If the winner is
+        // locked out, take nothing this frame — never the runner-up.
+        const near = bestTarget(h.point, bodies, h, now, { ignoreLockout: true });
+        if (!near) continue;
+        const lock = h.lockout.get(near.body.id);
+        if (lock != null && now < lock) continue;
+        body = near.body;
+      }
       if (!body) continue;
       const existing = holds.get(body.id);
       if (!existing) { startHold(h, body, now); continue; }

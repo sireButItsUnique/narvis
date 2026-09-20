@@ -89,7 +89,8 @@ export class ZedClient {
     this.clock = new ClockSync();
     this.ws = null; this.attempt = 0; this.timer = null; this.pingTimer = null; this.stopped = true;
     this.stats = { state: 'off', url: '', source: '?', fps: 0, latencyMs: 0, offsetMs: 0, seq: 0,
-                   frames: 0, stale: 0, bad: 0, drops: 0, lastAt: -1e9, since: 0, error: '' };
+                   frames: 0, stale: 0, bad: 0, drops: 0, lastAt: -1e9, since: 0, error: '',
+                   synced: false, skewMs: 0 };
     this._recent = [];
   }
 
@@ -148,12 +149,21 @@ export class ZedClient {
     this.stats.frames++; this.stats.seq = m.seq;
     this._recent.push(now); while (this._recent.length && now - this._recent[0] > 1000) this._recent.shift();
     this.stats.fps = this._recent.length;
-    const captureLocal = m.ts !== null ? this.clock.toLocal(m.ts * 1000) : now;
+    // Do not trust a capture time before the clock is synced. ClockSync.offsetMs is 0 until the first
+    // pong lands, so toLocal() hands back the bridge's raw EPOCH milliseconds (~1.76e12) — an "age" of
+    // about minus fifty years, which passes every staleness test as ultra-fresh, pins latency at 0 and
+    // makes the payload impossible to expire. One burst before the first pong and the model is held for
+    // ever by a hand frozen in mid-air, with the live cameras ignored.
+    const synced = this.clock.samples.length > 0;
+    const captureLocal = (m.ts !== null && synced) ? this.clock.toLocal(m.ts * 1000) : now;
     const age = now - captureLocal;
+    this.stats.skewMs = m.ts !== null ? now - this.clock.toLocal(m.ts * 1000) : 0;   // the RAW age, unclamped
+    this.stats.synced = synced;
     this.stats.latencyMs = Math.max(0, age);
     this.stats.lastAt = now;
     if (this.stats.state !== 'live') this._set('live');
-    if (age > MAX_AGE_MS) { this.stats.stale++; return; }   // a stale hand is worse than no hand
+    // Two-sided, and NaN-proof: anything that is not a plausible age is a clock problem, not a fresh frame.
+    if (!Number.isFinite(age) || age < -MAX_AGE_MS || age > MAX_AGE_MS) { this.stats.stale++; return; }
     const hands = m.hands.map(h => ({
       handedness: h.handedness, score: h.score,
       world: h.lm.map(p => zedToWorld(p, this.ext)),        // cm, app world frame

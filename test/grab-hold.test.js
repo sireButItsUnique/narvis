@@ -79,18 +79,24 @@ test('the noise floor does not creep into the grab either: a still noisy hand ho
     `drifted ${mm(vdist(body.pose.position, start)).toFixed(1)} mm under pure noise`);
 });
 
-test('the hand may vanish for 200 ms without dropping the model, but not for 300 ms', () => {
+test('the hand may vanish for a dropout window without dropping the model, but not for longer', () => {
   const config = wideVolume();
-  for (const [gapMs, expectHeld] of [[100, true], [190, true], [300, false]]) {
+  const STEP = 1000 / 60;
+  const HELD = config.dropoutMs - 60, DROPPED = config.dropoutMs + 60;
+  // The segments have to be CONTIGUOUS. They used to leave a 100 ms dead stretch between them, which the
+  // old lost-clock silently forgave (it started counting at the first frame after the gap) and a window
+  // measured from the last sighting correctly does not: the hand really had been unseen for 100 + gapMs.
+  for (const [gapMs, expectHeld] of [[100, true], [HELD, true], [DROPPED, false]]) {
     const body = makeBody({ id: 'b', position: at(0, 0.12, 0), radius: 0.06 });
     const grab = createGrab({ config });
     const grip = at(0, 0.12, 0);
-    run({ grab, bodies: [body], durationMs: 400, hands: now => [handFrame(0, grip, 0.012, now)] });
+    const t1 = 400;
+    run({ grab, bodies: [body], durationMs: t1, hands: now => [handFrame(0, grip, 0.012, now)] });
     assert.equal(grab.isHeld('b'), true);
     // the hand simply stops being reported; seenAt goes stale on its own
-    run({ grab, bodies: [body], durationMs: gapMs, hands: () => [], t0: 500 });
-    run({ grab, bodies: [body], durationMs: 200, hands: now => [handFrame(0, grip, 0.012, now)], t0: 500 + gapMs + 20 });
-    assert.equal(grab.isHeld('b'), expectHeld, `a ${gapMs} ms dropout`);
+    run({ grab, bodies: [body], durationMs: gapMs - 2 * STEP, hands: () => [], t0: t1 + STEP });
+    run({ grab, bodies: [body], durationMs: 200, hands: now => [handFrame(0, grip, 0.012, now)], t0: t1 + gapMs });
+    assert.equal(grab.isHeld('b'), expectHeld, `a ${gapMs.toFixed(0)} ms dropout`);
   }
 });
 
@@ -102,7 +108,7 @@ test('repeated dropouts through a carry neither drop the model nor let it slide 
   run({ grab, bodies: [body], durationMs: 400, hands: now => [handFrame(0, at(0, 0.12, 0), 0.012, now)] });
   const offset = vsub(body.pose.position, at(0, 0.12, 0));
   const r = run({
-    grab, bodies: [body], durationMs: 2500, t0: 500,
+    grab, bodies: [body], durationMs: 2500, t0: 400 + 1000 / 60,   // contiguous: no dead stretch to forgive
     // gone for 150 ms out of every 500
     hands: now => ((now % 500) < 150 ? [] : [handFrame(0, path(now), 0.012, now)]),
   });

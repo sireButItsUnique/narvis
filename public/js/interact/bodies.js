@@ -29,7 +29,11 @@ export function bindBody(object, { id = object.uuid, frame = null, radiusScale =
     id, object3d: object, frame,
     pose: { position: { x: 0, y: 0, z: 0 }, quaternion: { x: 0, y: 0, z: 0, w: 1 }, scale: 1 },
     center: { x: 0, y: 0, z: 0 }, radius: 0.05, restOffset: 0, locked,
+    // half-extents of the pick box in WORLD units, and the part's orientation, so grab.js can rank by
+    // distance to the actual part instead of to a sphere around it
+    half: { x: 0.05, y: 0.05, z: 0.05 }, quaternion: { x: 0, y: 0, z: 0, w: 1 },
     localCenter: new THREE.Vector3(), localRadius: 0.05, localBottom: 0,
+    localHalf: new THREE.Vector3(0.05, 0.05, 0.05),
   };
 
   // the pick sphere and the "how far is the bottom below the origin" figure, from the geometry itself
@@ -44,8 +48,14 @@ export function bindBody(object, { id = object.uuid, frame = null, radiusScale =
     });
     if (box.isEmpty()) return;
     box.getCenter(body.localCenter);
-    body.localRadius = box.getSize(_v).length() / 2;
+    box.getSize(_v).multiplyScalar(0.5);
+    body.localHalf.copy(_v);
+    // Cap the pick sphere at the LARGEST HALF-EXTENT rather than the circumradius (half the bounding-box
+    // diagonal). A 30 x 2 x 30 cm base slab claimed a 21 cm sphere, so it was pickable 27 cm above its
+    // own 1 cm-thick top face, through empty air where nothing is drawn.
+    body.localRadius = Math.min(_v.length(), Math.max(_v.x, _v.y, _v.z));
     body.localBottom = box.min.y;
+    body.localBox = box.clone();
   }
   measure();
 
@@ -86,11 +96,29 @@ export function bindBody(object, { id = object.uuid, frame = null, radiusScale =
   }
 
   const _c = new THREE.Vector3();
+  const _corner = new THREE.Vector3();
   function setBounds(pos, quat, k) {
     _c.copy(body.localCenter).applyQuaternion(quat).multiplyScalar(k);
     body.center = { x: pos.x + _c.x, y: pos.y + _c.y, z: pos.z + _c.z };
     body.radius = body.localRadius * k * radiusScale;
-    body.restOffset = -body.localBottom * k;
+    body.half = { x: body.localHalf.x * k * radiusScale, y: body.localHalf.y * k * radiusScale,
+                  z: body.localHalf.z * k * radiusScale };
+    body.quaternion = { x: quat.x, y: quat.y, z: quat.z, w: quat.w };
+    // How far the part's LOWEST point is below its origin, with the rotation applied. Ignoring the
+    // rotation rested a two-hand-rotated part in mid-air over its own ground ring — 17 mm at 60 degrees,
+    // 45 mm at 90 — and feedback.js draws the contact stem from the same number, so the cue came adrift
+    // from the part. Rotating the eight corners is exact for a box and conservative for anything else.
+    const b = body.localBox;
+    if (b) {
+      let minY = Infinity;
+      for (let i = 0; i < 8; i++) {
+        _corner.set(i & 1 ? b.max.x : b.min.x, i & 2 ? b.max.y : b.min.y, i & 4 ? b.max.z : b.min.z);
+        minY = Math.min(minY, _corner.applyQuaternion(quat).y);
+      }
+      body.restOffset = -minY * k;
+    } else {
+      body.restOffset = -body.localBottom * k;
+    }
   }
 
   sync();
@@ -108,18 +136,6 @@ export function bindBodies(entries, shared = {}) {
   };
 }
 
-// Hands from the shared input object (public/js/input/state.js) in whatever units it uses.
-// state.js is in centimetres today and metres later; `unitsPerMetre` says which, and grab's config must match.
-export function handsFromInput(input, now, { unitsPerMetre = 1 } = {}) {
-  const out = [];
-  input.hands.forEach((h, id) => {
-    if (!h.active) return;
-    const joints = h.jointsWorld;
-    const at = i => ({ x: joints[i * 3] / unitsPerMetre, y: joints[i * 3 + 1] / unitsPerMetre, z: joints[i * 3 + 2] / unitsPerMetre });
-    // landmark 4 is the thumb tip and 8 the index tip: the pinch pair MediaPipe gives and the ZED body
-    // formats do not (see docs/v3-plan.json research notes)
-    if (joints && joints.length >= 27) out.push({ id, active: true, seenAt: h.seenAt, thumb: at(4), index: at(8) });
-    else out.push({ id, active: true, seenAt: h.seenAt, grip: { x: h.gripRaw.x / unitsPerMetre, y: h.gripRaw.y / unitsPerMetre, z: h.gripRaw.z / unitsPerMetre }, pinch: h.pinch });
-  });
-  return out;
-}
+// handsFromInput lives in wire.js, which imports no three.js, so a page (or a test) can read the solver's
+// hands without pulling the renderer in. Re-exported here because this is where callers look for it.
+export { handsFromInput } from './wire.js';

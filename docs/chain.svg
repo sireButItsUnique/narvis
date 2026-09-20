@@ -1,0 +1,312 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1480 1000" width="1480" height="1000" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+<title>Holomodel v3: sensors to solver to grab</title>
+<desc>How camera and bridge data becomes a model you can pick up: the capture layer, the tracking solver,
+the shared input object, the grab state machine and the rig render, with the units each one works in.</desc>
+
+<defs>
+  <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#35d0ff"/>
+  </marker>
+  <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#7cff9b"/>
+  </marker>
+  <marker id="aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#ffb23e"/>
+  </marker>
+  <style>
+    .col   { fill:#0a1622; stroke:#1d3b55; stroke-width:1; rx:12 }
+    .hdr   { fill:#35d0ff; font-size:12px; font-weight:600; letter-spacing:.09em }
+    .box   { fill:#0e2336; stroke:#2b5a80; stroke-width:1.2; rx:8 }
+    .boxj  { fill:#132c1e; stroke:#4c9a5f; stroke-width:1.4; rx:8 }
+    .boxw  { fill:#2a2112; stroke:#a5762a; stroke-width:1.2; rx:8 }
+    .t     { fill:#cfe8ff; font-size:13px }
+    .tb    { fill:#ffffff; font-size:13px; font-weight:600 }
+    .m     { fill:#9fd0ee; font-size:11px; font-family:ui-monospace, Consolas, monospace }
+    .d     { fill:#7fa3bf; font-size:11px }
+    .g     { fill:#7cff9b; font-size:11px }
+    .w     { fill:#ffb23e; font-size:11px }
+    .lbl   { fill:#7fa3bf; font-size:10.5px; font-family:ui-monospace, Consolas, monospace }
+    .wire  { stroke:#35d0ff; stroke-width:1.6; fill:none; marker-end:url(#a) }
+    .wireg { stroke:#7cff9b; stroke-width:1.8; fill:none; marker-end:url(#ag) }
+    .wirea { stroke:#ffb23e; stroke-width:1.3; fill:none; stroke-dasharray:5 3; marker-end:url(#aa) }
+    .rule  { stroke:#1d3b55; stroke-width:1 }
+  </style>
+</defs>
+
+<rect width="1480" height="1000" fill="#04080e"/>
+<text x="28" y="36" fill="#ffffff" font-size="19" font-weight="600">Holomodel v3 — from the sensors to a model you can pick up</text>
+<text x="28" y="57" class="d">branch v3-cams: v3-cams-sim + v3-cams-capture + v3-grab, reconciled. Green boxes are the joins between
+the three, which is where everything broke.</text>
+
+<!-- ============================ column frames ============================ -->
+<rect class="col" x="24"  y="82" width="248" height="520"/>
+<rect class="col" x="292" y="82" width="286" height="520"/>
+<rect class="col" x="598" y="82" width="270" height="520"/>
+<rect class="col" x="888" y="82" width="238" height="520"/>
+<rect class="col" x="1146" y="82" width="310" height="520"/>
+
+<text x="40"   y="106" class="hdr">1 · SENSORS</text>
+<text x="308"  y="106" class="hdr">2 · CAPTURE  public/js/input/</text>
+<text x="614"  y="106" class="hdr">3 · SOLVER  public/js/track/</text>
+<text x="904"  y="106" class="hdr">4 · SHARED STATE</text>
+<text x="1162" y="106" class="hdr">5 · INTERACTION + RIG</text>
+
+<!-- ============================ 1 sensors ============================ -->
+<rect class="box" x="40" y="122" width="216" height="76"/>
+<text x="54" y="144" class="tb">ZED 2i</text>
+<text x="54" y="162" class="d">one exposure, two eyes, side by side</text>
+<text x="54" y="180" class="m">2560x720 → two 1280x720 crops</text>
+<text x="54" y="194" class="g">the only one that sees the hands</text>
+
+<rect class="box" x="40" y="212" width="216" height="62"/>
+<text x="54" y="234" class="tb">2 × Logitech 1080p</text>
+<text x="54" y="252" class="d">on the monitor, ~300 mm apart</text>
+<text x="54" y="268" class="m">they watch the head, not the hands</text>
+
+<rect class="box" x="40" y="288" width="216" height="86"/>
+<text x="54" y="310" class="tb">ZED SDK bridge</text>
+<text x="54" y="328" class="d">friend's laptop, NVIDIA + CUDA</text>
+<text x="54" y="344" class="m">tools/zed-bridge/zed_bridge.py</text>
+<text x="54" y="360" class="m">JSON over a LAN WebSocket</text>
+<text x="54" y="372" class="w">never linked: a separate process</text>
+
+<rect class="box" x="40" y="388" width="216" height="54"/>
+<text x="54" y="410" class="tb">mouse</text>
+<text x="54" y="428" class="d">no cameras at all — still usable</text>
+
+<rect class="boxw" x="40" y="462" width="216" height="124"/>
+<text x="54" y="484" class="tb">nothing is plugged in yet</text>
+<text x="54" y="504" class="d">Every sensor above has a stand-in:</text>
+<text x="54" y="522" class="m">test/cameras-e2e.mjs</text>
+<text x="66" y="536" class="d">a generated side-by-side video</text>
+<text x="54" y="552" class="m">zed_bridge.py --fake</text>
+<text x="66" y="566" class="d">hands that pinch, over a real socket</text>
+<text x="54" y="582" class="m">public/js/sim/rig-sim.js</text>
+
+<!-- ============================ 2 capture ============================ -->
+<rect class="box" x="308" y="122" width="254" height="68"/>
+<text x="322" y="144" class="tb">devices.js</text>
+<text x="322" y="162" class="d">which camera is which, by label, by a</text>
+<text x="322" y="178" class="d">32:9 frame, or because you said so</text>
+
+<rect class="box" x="308" y="202" width="254" height="86"/>
+<text x="322" y="224" class="tb">cameras.js</text>
+<text x="322" y="242" class="d">opens them, cuts the ZED frame in half,</text>
+<text x="322" y="258" class="d">one worker per eye, one frame in flight</text>
+<text x="322" y="276" class="d">capture time from requestVideoFrameCallback</text>
+
+<rect class="box" x="308" y="300" width="254" height="62"/>
+<text x="322" y="322" class="tb">landmarks-worker.js</text>
+<text x="322" y="340" class="d">MediaPipe face + hands, off the render</text>
+<text x="322" y="356" class="d">thread. A classic worker, deliberately.</text>
+
+<rect class="box" x="308" y="374" width="254" height="62"/>
+<text x="322" y="396" class="tb">stereo.js</text>
+<text x="322" y="414" class="d">the free factory calibration, the split,</text>
+<text x="322" y="430" class="d">and where each eye sits — in <tspan class="m">cm</tspan></text>
+
+<rect class="boxj" x="308" y="448" width="254" height="78"/>
+<text x="322" y="470" class="tb">solver.js</text>
+<text x="322" y="488" class="g">THE JOIN — one view description,</text>
+<text x="322" y="504" class="g">two consumers</text>
+<text x="322" y="520" class="m">makeView(cm) → PinholeCamera(mm)</text>
+
+<rect class="box" x="308" y="538" width="254" height="50"/>
+<text x="322" y="560" class="tb">zed-client.js</text>
+<text x="322" y="578" class="d">wire format, clock sync, reconnect</text>
+
+<!-- ============================ 3 solver ============================ -->
+<rect class="box" x="614" y="122" width="238" height="122"/>
+<text x="628" y="144" class="tb">solve.js — Tracker</text>
+<text x="628" y="164" class="d">1 line every camera up to ONE instant</text>
+<text x="628" y="182" class="d">2 match each hand across cameras</text>
+<text x="628" y="200" class="d">3 triangulate all 21 landmarks</text>
+<text x="628" y="218" class="d">4 vote out views that disagree</text>
+<text x="628" y="236" class="d">5 filter in 3D, then publish</text>
+
+<rect class="box" x="614" y="256" width="238" height="58"/>
+<text x="628" y="278" class="tb">triangulate.js</text>
+<text x="628" y="296" class="d">DLT + weighted rays + Gauss-Newton,</text>
+<text x="628" y="310" class="d">with consensus outlier rejection</text>
+
+<rect class="box" x="614" y="326" width="238" height="54"/>
+<text x="628" y="348" class="tb">camera.js · filter.js</text>
+<text x="628" y="366" class="d">pinhole + distortion; 1 euro, driven by</text>
+<text x="628" y="378" class="d">3D speed, so lag is equal in every axis</text>
+
+<rect class="boxw" x="614" y="394" width="238" height="90"/>
+<text x="628" y="416" class="tb">it degrades on its own</text>
+<text x="628" y="434" class="d">2+ views → triangulated (a few mm)</text>
+<text x="628" y="452" class="d">1 view → depth from palm size (~23 mm)</text>
+<text x="628" y="470" class="d">a camera that stalls stops counting in</text>
+<text x="628" y="482" class="d">about two of its own frame periods</text>
+
+<rect class="boxj" x="614" y="496" width="238" height="90"/>
+<text x="628" y="518" class="tb">everything here is mm</text>
+<text x="628" y="536" class="d">…in the rig frame. <tspan class="m">publish()</tspan> is the</text>
+<text x="628" y="552" class="d">one place that converts, through</text>
+<text x="628" y="568" class="m">appScale = 0.1  (mm → cm)</text>
+<text x="628" y="582" class="d">plus an optional <tspan class="m">appTransform</tspan></text>
+
+<!-- ============================ 4 state ============================ -->
+<rect class="boxj" x="904" y="122" width="206" height="216"/>
+<text x="918" y="144" class="tb">input/state.js</text>
+<text x="918" y="162" class="d">one shared object; every reader</text>
+<text x="918" y="176" class="d">already knew this shape</text>
+<line class="rule" x1="918" y1="188" x2="1096" y2="188"/>
+<text x="918" y="208" class="m">eye</text>
+<text x="918" y="226" class="m">hands[2] {</text>
+<text x="930" y="242" class="m">active, seenAt</text>
+<text x="930" y="258" class="m">tip, grip, gripRaw</text>
+<text x="930" y="274" class="m">pinch, pinchRatio</text>
+<text x="930" y="290" class="m">pinchCm</text>
+<text x="930" y="306" class="m">jointsWorld[21×3]</text>
+<text x="918" y="322" class="m">}</text>
+
+<rect class="box" x="904" y="352" width="206" height="96"/>
+<text x="918" y="374" class="tb">world centimetres</text>
+<text x="918" y="392" class="d">origin at the middle of the</text>
+<text x="918" y="408" class="d">display, x right, y up,</text>
+<text x="918" y="424" class="d">z toward the viewer</text>
+<text x="918" y="442" class="w">the scene is in the same units</text>
+
+<rect class="boxw" x="904" y="462" width="206" height="124"/>
+<text x="918" y="484" class="tb">what broke here</text>
+<text x="918" y="502" class="d">A NaN landmark (not triangulated)</text>
+<text x="918" y="518" class="d">made the pinch gap NaN, every</text>
+<text x="918" y="534" class="d">comparison false, and the hand</text>
+<text x="918" y="550" class="d">quietly unable to grab anything.</text>
+<text x="918" y="570" class="g">now: fall back to grip + pinch</text>
+
+<!-- ============================ 5 interaction ============================ -->
+<rect class="boxj" x="1162" y="122" width="278" height="78"/>
+<text x="1176" y="144" class="tb">interact/wire.js</text>
+<text x="1176" y="162" class="g">THE OTHER JOIN — hands and</text>
+<text x="1176" y="178" class="g">thresholds in the SAME units</text>
+<text x="1176" y="194" class="m">createSceneGrab(unitsPerMetre: 100)</text>
+
+<rect class="box" x="1162" y="212" width="278" height="130"/>
+<text x="1176" y="234" class="tb">grab.js</text>
+<text x="1176" y="252" class="d">pinch 25 mm in / 30 mm out, held 40 ms</text>
+<text x="1176" y="268" class="d">takes what the OPEN hand was nearest</text>
+<text x="1176" y="284" class="d">keeps its offset — nothing snaps</text>
+<text x="1176" y="300" class="d">survives 200 ms with no hand at all</text>
+<text x="1176" y="316" class="d">releases from the pose before the flick</text>
+<text x="1176" y="332" class="d">two hands rotate and resize</text>
+
+<rect class="box" x="1162" y="354" width="278" height="58"/>
+<text x="1176" y="376" class="tb">bodies.js · feedback.js</text>
+<text x="1176" y="394" class="d">three.js objects; rim glow, contact ring</text>
+<text x="1176" y="408" class="d">and a ground ring — all ADDITIVE</text>
+
+<rect class="box" x="1162" y="424" width="278" height="80"/>
+<text x="1176" y="446" class="tb">the rig</text>
+<text x="1176" y="464" class="d">off-axis frustum from the RECOVERED eye</text>
+<text x="1176" y="480" class="d">to the active area mirrored in the sheet</text>
+<text x="1176" y="496" class="w">bright on pure black: 4-5% reflection</text>
+
+<rect class="boxw" x="1162" y="516" width="278" height="70"/>
+<text x="1176" y="538" class="tb">no shadow is possible</text>
+<text x="1176" y="554" class="d">You cannot draw darker than black on a</text>
+<text x="1176" y="570" class="d">beam splitter, so height is shown with a</text>
+<text x="1176" y="582" class="d">bright ring and stem, never a dark one.</text>
+
+<!-- ============================ wires ============================ -->
+<path class="wire" d="M256 160 H 282 V 156 H 302"/>
+<path class="wire" d="M256 243 H 282 V 232 H 302"/>
+<path class="wire" d="M256 331 C 276 331, 276 560, 302 560"/>
+<path class="wire" d="M562 156 C 580 156, 580 250, 596 250"/>
+<path class="wire" d="M562 330 C 580 330, 580 190, 596 190"/>
+<path class="wire" d="M562 487 C 580 487, 580 160, 596 160"/>
+<path class="wire" d="M562 560 C 584 560, 584 300, 596 300"/>
+<path class="wireg" d="M852 180 C 872 180, 876 210, 898 210"/>
+<path class="wireg" d="M1110 230 H 1140 V 160 H 1158"/>
+<path class="wireg" d="M1300 200 V 208"/>
+<path class="wireg" d="M1300 342 V 350"/>
+<path class="wireg" d="M1300 412 V 420"/>
+
+<text x="574" y="114" class="lbl" text-anchor="end">2D landmarks</text>
+<text x="574" y="598" class="lbl" text-anchor="end">3D, already solved</text>
+<text x="875" y="176" class="lbl" text-anchor="middle">publish()</text>
+<text x="1118" y="204" class="lbl" text-anchor="middle">read</text>
+
+<!-- ============================ the ladder ============================ -->
+<rect class="col" x="24" y="620" width="866" height="176"/>
+<text x="40" y="644" class="hdr">WHAT HAPPENS WHEN SOMETHING IS MISSING — measured, not hoped for</text>
+
+<g font-size="12">
+  <rect class="box" x="40" y="660" width="156" height="58"/>
+  <text x="52" y="682" class="tb">ZED + 2 webcams</text>
+  <text x="52" y="700" class="g">2.8 mm fingertip</text>
+  <text x="52" y="714" class="d">2.0 mm eye</text>
+
+  <rect class="box" x="208" y="660" width="156" height="58"/>
+  <text x="220" y="682" class="tb">bridge instead</text>
+  <text x="220" y="700" class="g">4.2 mm fingertip</text>
+  <text x="220" y="714" class="d">+ whatever the LAN costs</text>
+
+  <rect class="box" x="376" y="660" width="156" height="58"/>
+  <text x="388" y="682" class="tb">ZED unplugged</text>
+  <text x="388" y="700" class="w">22.7 mm fingertip</text>
+  <text x="388" y="714" class="d">depth from palm size</text>
+
+  <rect class="box" x="544" y="660" width="156" height="58"/>
+  <text x="556" y="682" class="tb">one webcam</text>
+  <text x="556" y="700" class="d">head only: 2.4 mm eye</text>
+  <text x="556" y="714" class="d">no hands at all</text>
+
+  <rect class="box" x="712" y="660" width="162" height="58"/>
+  <text x="724" y="682" class="tb">nothing</text>
+  <text x="724" y="700" class="d">mouse mode</text>
+  <text x="724" y="714" class="d">the app still runs</text>
+</g>
+<path class="wirea" d="M196 689 H 204"/>
+<path class="wirea" d="M364 689 H 372"/>
+<path class="wirea" d="M532 689 H 540"/>
+<path class="wirea" d="M700 689 H 708"/>
+
+<text x="40" y="746" class="d">300 frames of reach / pinch / carry / release, 1 px landmark noise, 2% dropped frames, through the real solver.</text>
+<text x="40" y="766" class="d">One camera cannot do both jobs on this rig: the head is above the sheet and the hands are underneath it, about</text>
+<text x="40" y="784" class="d">70° apart from anywhere a camera can sit — wider than any of these lenses. So one camera has to choose the head.</text>
+
+<!-- ============================ the three bugs ============================ -->
+<rect class="col" x="906" y="620" width="550" height="176"/>
+<text x="922" y="644" class="hdr">THE THREE JOINS THAT WERE BROKEN — none of them threw</text>
+<text x="922" y="670" class="tb">1 · the hands were in metres, the thresholds in centimetres</text>
+<text x="934" y="688" class="d">A 7 cm gap measured 0.07 against a 2.5 threshold, so the hand was permanently pinched and</text>
+<text x="934" y="704" class="d">every model was 40 "units" away. It reads exactly like broken tracking.</text>
+<text x="922" y="726" class="tb">2 · the solver set input.mode = 'cameras'</text>
+<text x="934" y="744" class="d">The app branches on <tspan class="m">input.mode === 'camera'</tspan>. Head tracking silently stopped being used.</text>
+<text x="922" y="766" class="tb">3 · the capture layer never actually called the solver</text>
+<text x="934" y="784" class="d">Its adapter guessed export names and fell back to its own midpoint for ever.</text>
+
+<!-- ============================ measured chain ============================ -->
+<rect class="col" x="24" y="812" width="1432" height="164"/>
+<text x="40" y="836" class="hdr">PROVED WITH NO HARDWARE</text>
+
+<text x="40"  y="862" class="tb">node --test</text>
+<text x="40"  y="880" class="d">257 tests. test/chain.test.js drives</text>
+<text x="40"  y="896" class="d">stereo landmarks → solver → state.js →</text>
+<text x="40"  y="912" class="d">grab, and asserts the model is taken,</text>
+<text x="40"  y="928" class="d">carried and released once.</text>
+<text x="40"  y="950" class="g">fingertip 2.4 mm · lag 23 ms · shake 0.08 mm</text>
+
+<text x="420" y="862" class="tb">test/chain-e2e.mjs — headless Edge, port 8803</text>
+<text x="420" y="880" class="d">Fake cameras and the real <tspan class="m">zed_bridge.py --fake</tspan> over a real socket,</text>
+<text x="420" y="896" class="d">both through the real solver, driving a real three.js teapot.</text>
+<text x="420" y="912" class="g">26/26 checks · fingertip 3.9 mm vs truth · bridge 60 fps at 5 ms</text>
+<text x="420" y="930" class="g">hand → object lag 22 ms (correlation 0.99) · held-object shake 0.28 mm rms</text>
+<text x="420" y="950" class="d">Teapot picked up at −3.0, −8.6, 40.0 → carried to 8.0, −2.7, 37.4 → set down at 11.9, −12.0, 36.1 cm.</text>
+
+<text x="1020" y="862" class="tb">test/cameras-e2e.mjs — port 8801</text>
+<text x="1020" y="880" class="d">The video half: a generated side-by-side</text>
+<text x="1020" y="896" class="d">frame through getUserMedia, the crop, the</text>
+<text x="1020" y="912" class="d">workers and the real timestamps.</text>
+<text x="1020" y="934" class="g">19/19 · a dot encoded at 40.0 cm was</text>
+<text x="1020" y="950" class="g">published at 39.9 cm</text>
+
+<text x="1240" y="862" class="tb">test/camera-placement.mjs</text>
+<text x="1240" y="880" class="d">Every layout, same seed, same</text>
+<text x="1240" y="896" class="d">rig: the table this diagram's</text>
+<text x="1240" y="912" class="d">bottom-left row comes from.</text>
+</svg>

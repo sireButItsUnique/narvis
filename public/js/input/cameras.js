@@ -12,6 +12,7 @@ import { S, makeFilter3 } from '../settings.js';
 import * as devices from './devices.js';
 import * as stereo from './stereo.js';
 import { ZedClient } from './zed-client.js';
+import { createSolver, camIdFor } from './solver.js';
 
 // ---------------------------------------------------------------- pure helpers
 
@@ -20,25 +21,45 @@ import { ZedClient } from './zed-client.js';
 export class FrameGate {
   constructor({ maxInFlight = 1, maxAgeMs = 120 } = {}) {
     this.maxInFlight = maxInFlight; this.maxAgeMs = maxAgeMs;
-    this.inFlight = 0; this.busyDrops = 0; this.staleDrops = 0; this.sent = 0; this.done = 0;
-    this.latencyMs = 0; this.times = [];
+    this.inFlight = 0; this.busyDrops = 0; this.staleDrops = 0; this.stallDrops = 0;
+    this.sent = 0; this.done = 0; this.strikes = 0;
+    this.latencyMs = 0; this.times = []; this.offeredAt = -1;
   }
   offer(at, now) {
+    this.prune(now);
     if (this.inFlight >= this.maxInFlight) { this.busyDrops++; return false; }
     if (now - at > this.maxAgeMs) { this.staleDrops++; return false; }
-    this.inFlight++; this.sent++; return true;
+    this.inFlight++; this.sent++; this.offeredAt = now; return true;
   }
   finish(at, now) {
-    this.inFlight = Math.max(0, this.inFlight - 1); this.done++;
+    this.inFlight = Math.max(0, this.inFlight - 1); this.done++; this.strikes = 0; this.offeredAt = -1;
     this.latencyMs = this.latencyMs ? this.latencyMs * 0.8 + (now - at) * 0.2 : now - at;
     this.times.push(now);
-    while (this.times.length && now - this.times[0] > 1000) this.times.shift();
+    this.prune(now);
   }
   // A frame that went in but produced nothing (the worker was still loading, the crop failed). It must
   // still come out of the count, or the gate wedges shut and the camera looks dead for ever.
-  abort() { this.inFlight = Math.max(0, this.inFlight - 1); this.lostDrops = (this.lostDrops || 0) + 1; }
+  abort() { this.inFlight = Math.max(0, this.inFlight - 1); this.lostDrops = (this.lostDrops || 0) + 1; this.offeredAt = -1; }
+
+  /**
+   * A worker that stops answering at all — the thread killed under memory pressure, a GPU reset taking
+   * MediaPipe's delegate down — posts no message, so nothing ever frees the slot and the view stops
+   * sending frames for the life of the page. Nothing else in this file has a timeout on inFlight, and a
+   * ZED is worse than one lost view: startGrabLoop gates BOTH eyes on both gates, so one wedged eye ends
+   * hand tracking. Returns true when it actually had to free a slot.
+   */
+  watchdog(now, timeoutMs = this.maxAgeMs * 4) {
+    if (this.inFlight <= 0 || this.offeredAt < 0 || now - this.offeredAt <= timeoutMs) return false;
+    this.inFlight = Math.max(0, this.inFlight - 1);
+    this.stallDrops++; this.strikes++; this.offeredAt = -1;
+    return true;
+  }
+  // Prune by WALL CLOCK, not only on a result: pruning inside finish() alone meant a wedged view kept
+  // reporting its last good fps for ever, which is the number an operator reads to decide it is alive.
+  prune(now) { while (this.times.length && now - this.times[0] > 1000) this.times.shift(); }
+  fpsAt(now) { this.prune(now); return this.times.length; }
   get fps() { return this.times.length; }
-  get drops() { return this.busyDrops + this.staleDrops; }
+  get drops() { return this.busyDrops + this.staleDrops + this.stallDrops; }
 }
 
 // Two free-running webcams are never in phase, so a landmark seen at t0 must be moved to the instant we
@@ -165,8 +186,15 @@ export const cams = {
   lastStereoAt: -1e9,           // performance.now() of the last stereo fuse that was actually believed
   notes: [],
   solver: 'local midpoint',
+  fusion: 'tracker',            // 'tracker' (track/solve.js) | 'local' (the midpoint fallback below)
   running: false,
 };
+
+// The real solver. Built on start(); everything the cameras see goes through it, and it is the only thing
+// that writes the hands and the eye into input/state.js. The `local` helpers below stay reachable through
+// opts.fusion = 'local' as the honest fallback for a page that cannot load track/ at all.
+let solver = null;
+export const getSolver = () => solver;
 
 const eyeFilt = makeFilter3(0.6, 0.2);                     // steadier than the fingertip: the head moves slowly
 const tipFilt = [makeFilter3(1.2, 0.4), makeFilter3(1.2, 0.4)];
@@ -249,17 +277,32 @@ async function openSource(dev, opts) {
 
   // a ZED only earns the stereo path if the frame really is side-by-side; Chrome may hand back a crop
   const sbs = cls.kind === 'zed' && devices.isSbsSize(width, height);
-  if (cls.kind === 'zed' && !sbs) note(`${dev.label || 'ZED'} opened at ${width}x${height}, which is not side-by-side: treating it as one camera`);
+  if (cls.kind === 'zed' && !sbs) note(`${dev.label || 'ZED'} opened at ${width}x${height}, which is not side-by-side: treating it as one camera, with the ZED's own lens`);
   const layout = sbs ? stereo.splitLayout(width, height) : stereo.wholeLayout(width, height);
   const g = await geometry();
   // extById first: rig-frame extrinsics are per PHYSICAL camera, and prefKeys can be shared by two devices
   // of the same model if anything upstream ever matches by label again. A pose is not a preference.
   const ext = opts.extById?.[dev.deviceId] || opts.ext?.[dev.prefKey] || dev.pref?.ext
     || { posCm: g.camPos(), rotDeg: [0, 0, 180] };
-  const calib = sbs ? stereo.calibFor(await loadZedConf(), width, height) : null;
+  const calib = sbs ? stereo.calibFor(await loadZedConf(), width, height, cls.model) : null;
   const intr = sbs ? null : (() => {
-    const f = dev.pref?.dfovDeg ? devices.focalPxFromDiagFov(width, height, dev.pref.dfovDeg) : g.focalPx(width);
-    return { fx: f, fy: f, cx: width / 2, cy: height / 2, k1: 0, k2: 0, k3: 0, p1: 0, p2: 0 };
+    // Which lens this camera actually has, in order of how much the answer is worth knowing:
+    //   1. the user's own datasheet number for this camera (a diagonal fov, the way they are quoted);
+    //   2. a ZED that came back cropped instead of side-by-side — still a ZED lens, and S.hfovDeg's 60 deg
+    //      default is 2.5x too long for it, which put a hand really at 400 mm at 989 mm;
+    //   3. a plain webcam, whose datasheet number is a DIAGONAL too (a C920's 78 deg diagonal is 70 deg
+    //      horizontal, not 60), so reading S.hfovDeg as horizontal scaled every depth by ~20%.
+    // S.hfovDeg stays the last word only where the user has calibrated it (main.js's calibrate button).
+    const zedCrop = cls.kind === 'zed';
+    const calibrated = !zedCrop && S.hfovCalibrated;
+    const f = dev.pref?.dfovDeg ? devices.focalPxFromDiagFov(width, height, dev.pref.dfovDeg)
+      : zedCrop ? stereo.ZED_REF.fx * (width / stereo.ZED_REF.eyeW)
+      : calibrated ? g.focalPx(width)
+      : devices.focalPxFromDiagFov(width, height, devices.WEBCAM_DFOV_DEG);
+    return { fx: f, fy: f, cx: width / 2, cy: height / 2, k1: 0, k2: 0, k3: 0, p1: 0, p2: 0,
+             source: dev.pref?.dfovDeg ? 'your datasheet fov' : zedCrop ? 'typical ZED (cropped frame)'
+               : calibrated ? 'calibrated' : 'typical webcam fov',
+             metric: !!(calibrated || dev.pref?.dfovDeg) };
   })();
   const views = stereo.viewsForCamera({ width, height, sbs, calib, intr, ext, label: dev.label || 'camera' });
 
@@ -278,9 +321,13 @@ async function openSource(dev, opts) {
   };
   src.workers = views.map((v, i) => makeWorker(`${src.prefKey}#${i}`, src.tasks, opts, m => onWorkerMessage(src, i, m)));
   track.addEventListener('ended', () => dropSource(src.deviceId, 'the camera was unplugged'));
+  solver?.addSource(src);
   startGrabLoop(src);
   cams.sources.push(src);
   note(`${src.label}: ${width}x${height}${sbs ? ' side-by-side (2 views)' : ''}, role ${src.role}`);
+  if (sbs && !src.calib?.metric) note(`${src.label}: no SN.conf, so the lens is a typical-ZED guess — ` +
+    `the depth is good enough to reach for something, not to trust in millimetres. Drop in ` +
+    `calib.stereolabs.com/?SN=<serial> to fix that.`);
   return src;
 }
 
@@ -335,7 +382,9 @@ function onWorkerMessage(src, i, m) {
     note(`${src.label} view ${i}: ${m.detector}${m.delegate ? ' (' + m.delegate + ')' : ''}`); return;
   }
   if (m.t === 'note') { note(`${src.label}: ${m.message}`); return; }
-  if (m.t === 'error') { src.error = m.message; note(`${src.label} view ${i}: ${m.message}`); return; }
+  // 'error' was the ONE branch that did not free the slot: a worker error arriving between offer and
+  // result left inFlight at 1 for ever and the view never sent another frame.
+  if (m.t === 'error') { src.gate[i].abort(); src.error = m.message; note(`${src.label} view ${i}: ${m.message}`); return; }
   if (m.t === 'drop') { src.gate[i].abort(); return; }   // the worker could not take that frame; free the slot
   if (m.t !== 'result') return;
   const now = performance.now();
@@ -346,7 +395,13 @@ function onWorkerMessage(src, i, m) {
   while (ring.length > 6) ring.shift();
   if (m.face) src.lastFaceAt = now;
   if (m.hands?.length) src.lastHandAt = now;
-  fuse(now);
+  // Hand it straight to the solver with the CAPTURE time. Solving happens once per rendered frame in
+  // startLoop(), not here: a ZED's two eyes arrive as two messages and solving on each of them would
+  // triangulate a one-eyed frame and then immediately redo it.
+  if (solver) {
+    solver.setRate(camIdFor(src, i), src.gate[i].fpsAt(now));
+    solver.observeView(src, i, { at: m.at, face: m.face, hands: m.hands || [] });
+  } else fuse(now);
 }
 
 // ---------------------------------------------------------------- fusion
@@ -377,7 +432,7 @@ function handViewsWithSamples(now, maxAgeMs = 300) {
 
 function fuseHands(now) {
   // the bridge wins while it is fresh: it is the sensor that can actually see under the sheet
-  if (cams.bridgeHands && now - cams.bridgeHands.at < 200) {
+  if (cams.bridgeHands && Math.abs(now - cams.bridgeHands.at) < 200) {
     const hands = cams.bridgeHands.hands.map(h => h.world);
     if (hands.length) { publishHands(hands, now, 'bridge'); return; }
   }
@@ -546,7 +601,18 @@ export async function startCameras(opts = {}) {
   // vouch for cameras that have not said anything yet.
   cams.eyeSource = 'none'; cams.eyeResidualCm = null; cams.eyeSwapHint = false;
   cams.eyeOriginGapCm = null; cams.lastStereoAt = -1e9;
-  cams.solver = (await stereo.loadSolver()).name;
+  cams.fusion = opts.fusion === 'local' ? 'local' : 'tracker';
+  solver = null;
+  if (cams.fusion === 'tracker') {
+    try {
+      solver = createSolver({ eye: S.eye, ipdMm: S.ipdMm });
+      cams.solver = 'track/solve.js Tracker';
+    } catch (e) {
+      note(`the tracking solver would not load (${e?.message || e}); using the local midpoint fusion`);
+      cams.fusion = 'local';
+    }
+  }
+  if (!solver) cams.solver = (await stereo.loadSolver()).name;
   status('Looking for cameras…');
 
   let list = await devices.listCameras();
@@ -606,7 +672,11 @@ export function setBridge(url, ext) {
 function connectBridge(url, ext) {
   cams.bridge = new ZedClient({
     url, ext,
-    onHands: p => { cams.bridgeHands = p; fuseHands(performance.now()); },
+    onHands: p => {
+      cams.bridgeHands = p;
+      if (solver) solver.observeBridge(p);        // solved with everything else, in startLoop
+      else fuseHands(performance.now());
+    },
     onStatus: s => { if (s.state === 'retrying') note(`bridge ${s.state}: ${s.error}`); },
   });
   cams.bridge.connect(url);
@@ -618,6 +688,7 @@ export function dropSource(deviceId, why = 'stopped') {
   const src = cams.sources.find(s => s.deviceId === deviceId);
   if (!src) return false;
   src.stopped = true; src.live = false; src.error = why;
+  solver?.removeSource(src);     // the Tracker must stop believing a camera that is gone, not just age it out
   try { src.workers.forEach(w => w.postMessage({ t: 'stop' })); } catch {}
   try { src.stream.getTracks().forEach(t => t.stop()); } catch {}
   try { src.video.remove(); } catch {}
@@ -649,16 +720,75 @@ function onDeviceChange() {
   }, 400);
 }
 
+/**
+ * Free any slot a worker has been sitting on for too long, and give up on a worker that keeps doing it.
+ * Exported so a test can step it without animation frames.
+ */
+export function watchdog(now = (typeof performance !== 'undefined' ? performance.now() : Date.now()),
+                         { strikesToDrop = 3 } = {}) {
+  let freed = 0;
+  for (const src of [...cams.sources]) {
+    let stalled = false;
+    src.gate.forEach((g, i) => {
+      if (!g.watchdog(now)) return;
+      freed++;
+      if (g.strikes >= strikesToDrop) stalled = true;
+      else note(`${src.label} view ${i}: the worker stopped answering; the frame was dropped`);
+    });
+    // Keep dropping frames into a dead thread and the ladder never degrades. Give the camera up instead,
+    // so the solver falls back to the other camera, the bridge, or the single-view guess.
+    if (stalled) dropSource(src.deviceId, 'the landmark worker stopped answering');
+  }
+  return freed;
+}
+
 let rafId = 0;
+let legacyFails = 0;
 function startLoop() {
   if (rafId || typeof requestAnimationFrame === 'undefined') return;
   const step = now => {
     rafId = requestAnimationFrame(step);
-    if (cams.legacy) { try { cams.legacy.track(now); } catch (e) { cams.notes.push(String(e?.message || e)); } return; }
+    if (cams.legacy) {
+      // note() is the only thing that caps cams.notes at 12, and camerasStatus() copies the whole array
+      // on every poll. Pushing straight to it meant a dead MediaPipe graph — which throws on EVERY call
+      // once its context is gone — grew the array by one string per video frame for ever.
+      try { cams.legacy.track(now); legacyFails = 0; }
+      catch (e) {
+        if (++legacyFails === 1) note(`webcam.js: ${e?.message || e}`);
+        // Retrying a dead graph at camera frame rate buys nothing; stop and say why, once.
+        if (legacyFails >= 30) {
+          try { cams.legacy.stopCamera?.(); } catch {}
+          cams.legacy = null; cams.handSource = cams.eyeSource = 'none';
+          note('webcam.js kept throwing, so it was stopped: reload the page to try the camera again');
+        }
+      }
+      return;
+    }
+    watchdog(now);
+    if (solver) {
+      // One solve per rendered frame. Every camera's newest landmarks are lined up to a common instant
+      // inside the Tracker, so this is where the 3D actually happens.
+      solver.step(input, now, { hands: S.hands !== false, eyeYNudgeCm: S.eyeYNudgeCm || 0 });
+      const q = solver.quality;
+      cams.handSource = q.handsSeen ? q.handSource : 'none';
+      cams.eyeSource = q.eyeViews ? q.eyeSource : 'none';
+      return;
+    }
     for (const h of input.hands) h.active = S.hands !== false && now - h.seenAt < 300;
-    if (cams.bridge && cams.bridgeHands && now - cams.bridgeHands.at > 400 && cams.handSource === 'bridge') cams.handSource = 'none';
+    // two-sided: a payload stamped in the future (an unsynced bridge clock) must expire too
+    if (cams.bridge && cams.bridgeHands && Math.abs(now - cams.bridgeHands.at) > 400 && cams.handSource === 'bridge') cams.handSource = 'none';
   };
   rafId = requestAnimationFrame(step);
+}
+
+// For tests and for pages with no animation frames: do one solve now, exactly as the loop would.
+export function stepSolver(now = (typeof performance !== 'undefined' ? performance.now() : Date.now())) {
+  if (!solver) return null;
+  const out = solver.step(input, now, { hands: S.hands !== false, eyeYNudgeCm: S.eyeYNudgeCm || 0 });
+  const q = solver.quality;
+  cams.handSource = q.handsSeen ? q.handSource : 'none';
+  cams.eyeSource = q.eyeViews ? q.eyeSource : 'none';
+  return out;
 }
 
 export function stopCameras() {
@@ -668,8 +798,15 @@ export function stopCameras() {
   navigator?.mediaDevices?.removeEventListener?.('devicechange', onDeviceChange);
   for (const src of [...cams.sources]) dropSource(src.deviceId, 'stopped');
   cams.bridge?.close();
+  // webcam.js owns a camera stream, a hidden <video> and TWO MediaPipe landmarkers, and nulling the
+  // module reference gave none of them back. Every Stop/Start (which startCameras does to itself)
+  // leaked the lot, so after a few restarts the camera was busy for every other app.
+  try { cams.legacy?.stopCamera?.(); } catch (e) { note(`webcam.js would not stop cleanly: ${e?.message || e}`); }
   cams.bridge = null; cams.bridgeHands = null; cams.legacy = null;
+  legacyFails = 0;
+  solver = null;
   cams.mode = 'none'; cams.handSource = 'none'; cams.eyeSource = 'none';
+  cams.notes.length = 0;
 }
 
 // What the setup page (and the HUD) show: per camera fps, latency, drops, and who is seeing what.
@@ -682,14 +819,21 @@ export function camerasStatus() {
     // wait out a blink without ever accepting a guess.
     eyeResidualCm: cams.eyeResidualCm, eyeSwapHint: cams.eyeSwapHint, eyeOriginGapCm: cams.eyeOriginGapCm,
     msSinceStereo: now - cams.lastStereoAt,
-    inputMode: input.mode, notes: [...cams.notes],
+    fusion: cams.fusion, inputMode: input.mode, notes: [...cams.notes],
+    // what the solver itself thinks it is doing, which is the first thing to read when a number looks wrong
+    tracking: solver ? { readout: solver.readout, ...solver.quality } : null,
     sources: cams.sources.map(s => ({
       label: s.label, deviceId: s.deviceId, kind: s.cls.kind, model: s.cls.model, why: s.cls.why,
       role: s.role, width: s.width, height: s.height, sbs: s.sbs, mode: s.layout.mode,
-      detector: s.detector, delegate: s.delegate, calib: s.calib?.source || null, error: s.error,
+      detector: s.detector, delegate: s.delegate, error: s.error,
+      // Where this camera's lens numbers came from, and whether its millimetres are a measurement. A hand
+      // published at 2.5x the right distance looks like broken tracking unless the guess is on screen.
+      calib: s.calib?.source || s.views[0]?.intr?.source || null,
+      calibMetric: s.calib ? !!s.calib.metric : !!s.views[0]?.intr?.metric,
       views: s.views.map((v, i) => ({
-        label: v.label, fps: s.gate[i].fps, latencyMs: Math.round(s.gate[i].latencyMs),
-        busyDrops: s.gate[i].busyDrops, staleDrops: s.gate[i].staleDrops, sent: s.gate[i].sent, done: s.gate[i].done,
+        label: v.label, fps: s.gate[i].fpsAt(now), latencyMs: Math.round(s.gate[i].latencyMs),
+        busyDrops: s.gate[i].busyDrops, staleDrops: s.gate[i].staleDrops, stallDrops: s.gate[i].stallDrops,
+        sent: s.gate[i].sent, done: s.gate[i].done,
       })),
       seesHead: now - s.lastFaceAt < 500, seesHands: now - s.lastHandAt < 500,
     })),

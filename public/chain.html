@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Holomodel - the whole chain</title>
+<!--
+  Sensors -> solver -> grab, with nothing plugged in.
+
+  This page exists to prove the JOIN between the three halves of v3, which is where the bugs were:
+    fake cameras   synthetic landmarks projected through PinholeCameras built by input/solver.js from the
+                   same stereo.makeView descriptions input/cameras.js uses for real hardware;
+    fake bridge    the real tools/zed-bridge/zed_bridge.py --fake, over a real WebSocket, through the real
+                   input/zed-client.js;
+    the solver     public/js/track/solve.js Tracker - cross-camera matching, robust triangulation, 3D
+                   filtering - publishing into public/js/input/state.js exactly as the app reads it;
+    the grab       public/js/interact/grab.js, through interact/wire.js, driving a real three.js model.
+
+  The video half of the camera path (getUserMedia, the ZED side-by-side split, the workers, MediaPipe) is
+  covered by test/cameras-e2e.mjs, which drives input/cameras.js with a generated video file.
+
+  Scene units are CENTIMETRES in the app's world frame (origin at the centre of the display, x right, y up,
+  z toward the viewer) because that is what input/state.js publishes. When public/js/rig/ settles on the
+  rig's own frame, that is one appTransform on the Tracker, not a change here.
+
+  Drive it with test/chain-e2e.mjs, or open it and press the buttons.
+-->
+<style>
+  :root { --line:#1d3b55; --text:#cfe8ff; --dim:#7fa3bf; --cyan:#35d0ff; --amber:#ffb23e; --green:#7cff9b; --red:#ff6b7a; }
+  html, body { margin:0; height:100%; background:#000; color:var(--text); overflow:hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  canvas#view { display:block; width:100vw; height:100vh; }
+  .panel { position:fixed; z-index:5; background:rgba(4,10,18,.88); border:1px solid var(--line);
+    border-radius:10px; padding:10px 12px; font:11.5px/1.55 ui-monospace, Consolas, monospace; }
+  #hud { left:10px; top:10px; width:330px; white-space:pre-wrap; }
+  #chainPanel { right:10px; top:10px; width:300px; }
+  #bar { left:50%; bottom:10px; transform:translateX(-50%); display:flex; gap:8px; align-items:center;
+    flex-wrap:wrap; justify-content:center; font-family:system-ui, sans-serif; font-size:12px; }
+  h2 { margin:0 0 6px; font:600 11px/1.4 system-ui, sans-serif; color:var(--cyan);
+    text-transform:uppercase; letter-spacing:.08em; }
+  button { background:#0e2a40; color:var(--text); border:1px solid #2b5a80; border-radius:7px;
+    padding:6px 11px; font-size:12px; cursor:pointer; font-family:inherit; }
+  button:hover { background:#123551; }
+  button.on { background:#0f4a6e; border-color:var(--cyan); color:#fff; }
+  .ok { color:var(--green); } .warn { color:var(--amber); } .bad { color:var(--red); } .k { color:var(--dim); }
+  .step { display:flex; align-items:baseline; gap:6px; margin:3px 0; }
+  .step .dot { width:8px; height:8px; border-radius:50%; background:#20354a; flex:0 0 auto; }
+  .step.live .dot { background:var(--green); box-shadow:0 0 7px var(--green); }
+  .step.bad .dot { background:var(--red); }
+  .step .name { flex:0 0 96px; color:var(--dim); }
+  .step .val { color:var(--text); }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div class="panel" id="hud">loading…</div>
+<div class="panel" id="chainPanel"><h2>the chain</h2><div id="chain"></div></div>
+<div class="panel" id="bar">
+  <button id="b-sim" class="on">fake cameras</button>
+  <button id="b-bridge">fake ZED bridge</button>
+  <button id="b-both">both</button>
+  <button id="b-reset">reset model</button>
+  <span class="k" id="bridgeUrl"></span>
+</div>
+
+<script>
+  // The import map must exist before the first module loads, so choose the vendored copy or the CDN here,
+  // synchronously, rather than failing on whichever one is missing.
+  (function () {
+    const local = '/vendor/three/build/three.module.js';
+    let ok = false;
+    try { const x = new XMLHttpRequest(); x.open('HEAD', local, false); x.send(); ok = x.status >= 200 && x.status < 400; } catch (e) {}
+    const base = ok ? '/vendor/three/' : 'https://cdn.jsdelivr.net/npm/three@0.170.0/';
+    const map = document.createElement('script');
+    map.type = 'importmap';
+    map.textContent = JSON.stringify({ imports: {
+      three: base + 'build/three.module.js', 'three/addons/': base + 'examples/jsm/' } });
+    document.currentScript.after(map);
+  })();
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { input } from './js/input/state.js';
+import * as stereo from './js/input/stereo.js';
+import { createSolver, cameraForView } from './js/input/solver.js';
+import { ZedClient } from './js/input/zed-client.js';
+import { createSceneGrab, createLagMeter } from './js/interact/wire.js';
+import { createFeedback } from './js/interact/feedback.js';
+import { bindBody } from './js/interact/bodies.js';
+import { HAND, HAND_BONES } from './js/track/landmarks.js';
+import { handPose } from './js/sim/rig-sim.js';
+
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const CM = 10;                       // the simulator's hand model is millimetres; this scene is centimetres
+const BRIDGE_DEFAULT_PORT = 8810;    // tools/zed-bridge/zed_bridge.py DEFAULT_PORT
+
+// ---------------------------------------------------------------- scene (centimetres)
+
+const renderer = new THREE.WebGLRenderer({ canvas: $('view'), antialias: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+renderer.setClearColor(0x000000, 1);
+const scene = new THREE.Scene();
+const view = new THREE.PerspectiveCamera(40, 1, 1, 400);
+view.position.set(14, 22, 96);
+view.lookAt(0, 0, 38);
+
+scene.add(new THREE.HemisphereLight(0x88c8ff, 0x101820, 0.5));
+const key = new THREE.DirectionalLight(0xffffff, 2.2); key.position.set(30, 60, 50); scene.add(key);
+const rim = new THREE.DirectionalLight(0x66ccff, 1.3); rim.position.set(-40, 10, -30); scene.add(rim);
+
+// The volume the hands work in. Bright marks on black: on a 4-5% reflective sheet you cannot draw darker
+// than black, so every cue has to be additive.
+const VOLUME = { minX: -20, maxX: 20, minY: -13, maxY: 16, minZ: 27, maxZ: 53 };
+const FLOOR_Y = -12;
+{
+  const mat = new THREE.MeshBasicMaterial({ color: 0x0d3a52, blending: THREE.AdditiveBlending,
+                                            transparent: true, depthWrite: false, toneMapped: false });
+  const g = new THREE.Group();
+  for (const r of [5, 10, 15]) {
+    const ring = new THREE.Mesh(new THREE.RingGeometry(r, r + 0.12, 72), mat);
+    ring.rotation.x = -Math.PI / 2; ring.position.set(0, FLOOR_Y + 0.05, 40);
+    g.add(ring);
+  }
+  const post = new THREE.CylinderGeometry(0.12, 0.12, VOLUME.maxY - VOLUME.minY, 6);
+  for (const [x, z] of [[VOLUME.minX, VOLUME.minZ], [VOLUME.maxX, VOLUME.minZ],
+                        [VOLUME.minX, VOLUME.maxZ], [VOLUME.maxX, VOLUME.maxZ]]) {
+    const p = new THREE.Mesh(post, mat); p.position.set(x, (VOLUME.minY + VOLUME.maxY) / 2, z); g.add(p);
+  }
+  scene.add(g);
+}
+
+// ---------------------------------------------------------------- the model
+
+const holder = new THREE.Group();
+scene.add(holder);
+let bindings = [], bodies = [], modelSource = 'built-in';
+
+function addPart(mesh, id, at) {
+  mesh.position.set(at[0], at[1], at[2]);
+  holder.add(mesh);
+  const b = bindBody(mesh, { id });
+  bindings.push(b); bodies.push(b.body);
+  return b;
+}
+
+function buildParts(geo) {
+  for (const b of bindings) holder.remove(b.body.object3d);
+  bindings = []; bodies = [];
+  const mat = () => new THREE.MeshStandardMaterial({ color: 0x8fd7ff, emissive: 0x0a2b3d, roughness: 0.35, metalness: 0.1 });
+  addPart(new THREE.Mesh(geo, mat()), 'teapot', [-3, FLOOR_Y + 3.4, 40]);
+  addPart(new THREE.Mesh(new THREE.IcosahedronGeometry(2.2, 1), mat()), 'blob', [13, FLOOR_Y + 2.2, 44]);
+}
+const fallback = new THREE.TorusKnotGeometry(2.6, 0.85, 90, 14);
+buildParts(fallback);
+
+(async () => {
+  try {
+    const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js');
+    for (const url of ['../test/fixtures/teapot.glb', '/test/fixtures/teapot.glb']) {
+      try {
+        const gltf = await new GLTFLoader().loadAsync(url);
+        let geo = null;
+        gltf.scene.traverse(o => { if (o.isMesh && !geo) geo = o.geometry; });
+        if (!geo) continue;
+        geo = geo.clone();
+        geo.computeBoundingBox();
+        const size = geo.boundingBox.getSize(new THREE.Vector3());
+        geo.scale(7 / size.length(), 7 / size.length(), 7 / size.length());   // about 7 cm across
+        geo.computeBoundingBox();
+        geo.translate(0, -geo.boundingBox.min.y, 0);
+        buildParts(geo);
+        modelSource = url;
+        break;
+      } catch (e) { /* try the next path */ }
+    }
+  } catch (e) { /* no loader: the built-in shape is fine */ }
+})();
+
+// ---------------------------------------------------------------- the hand, drawn from state.js
+
+const handGroup = new THREE.Group();
+scene.add(handGroup);
+const jointMat = new THREE.MeshBasicMaterial({ color: 0x35d0ff, toneMapped: false });
+const boneMat = new THREE.LineBasicMaterial({ color: 0x1f8fc0, transparent: true, opacity: 0.85 });
+const joints = Array.from({ length: HAND.COUNT }, () => {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(0.35, 10, 8), jointMat);
+  m.visible = false; handGroup.add(m); return m;
+});
+const boneGeo = new THREE.BufferGeometry();
+boneGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(HAND_BONES.length * 6), 3));
+const boneLines = new THREE.LineSegments(boneGeo, boneMat);
+handGroup.add(boneLines);
+
+function drawHand(h) {
+  const j = h && h.active ? h.jointsWorld : null;
+  handGroup.visible = !!j;
+  if (!j) return;
+  joints.forEach((m, i) => {
+    const ok = Number.isFinite(j[i * 3]);
+    m.visible = ok;
+    if (ok) m.position.set(j[i * 3], j[i * 3 + 1], j[i * 3 + 2]);
+  });
+  const p = boneGeo.attributes.position.array;
+  HAND_BONES.forEach(([a, b], k) => {
+    for (let c = 0; c < 3; c++) { p[k * 6 + c] = j[a * 3 + c]; p[k * 6 + 3 + c] = j[b * 3 + c]; }
+  });
+  boneGeo.attributes.position.needsUpdate = true;
+}
+
+// ---------------------------------------------------------------- the fake cameras
+//
+// A ZED-shaped side-by-side camera watching the volume, plus two webcams on the display watching the head.
+// They are described exactly the way input/cameras.js describes real hardware - a stereo.viewsForCamera()
+// per device - and turned into PinholeCameras by the same input/solver.js the app uses, so what is being
+// tested here is the real path and not a parallel one.
+
+const ZED_W = 1344, ZED_H = 376, CAM_W = 1280, CAM_H = 720;
+
+function buildFakeCameras() {
+  const out = [];
+  const zedCalib = stereo.defaultCalib(ZED_W, ZED_H);
+  const zedExt = { posCm: [-6, 6, 4], rotDeg: [-8, 0, 180] };      // in front of the volume, looking in
+  stereo.viewsForCamera({ width: ZED_W, height: ZED_H, sbs: true, calib: zedCalib, ext: zedExt, label: 'ZED' })
+    .forEach((v, i) => out.push({ view: v, camera: cameraForView(v, { id: `zed#${i}`, role: 'hands', fps: 60, noisePx: 1.0 }),
+                                  jobs: { face: false, hands: true }, fps: 60 }));
+  for (const [id, x] of [['cam-l', -15], ['cam-r', 15]]) {
+    const intr = (() => { const f = (CAM_W / 2) / Math.tan(78 * Math.PI / 360); return { fx: f, fy: f, cx: CAM_W / 2, cy: CAM_H / 2, k1: 0, k2: 0, k3: 0, p1: 0, p2: 0 }; })();
+    const v = stereo.makeView({ intr, eyeW: CAM_W, eyeH: CAM_H, ext: { posCm: [x, 18, 2], rotDeg: [10, 0, 180] }, label: id });
+    out.push({ view: v, camera: cameraForView(v, { id, role: 'head', fps: 30, noisePx: 1.2 }),
+               jobs: { face: true, hands: false }, fps: 30 });
+  }
+  return out;
+}
+
+const fakeCams = buildFakeCameras();
+
+// The scripted motion: reach in, pinch, carry across, let go, withdraw - then repeat. The pause in the
+// middle is deliberate: shake only shows when the hand is not moving.
+const START = [-3, 12, 48], AT = [-3, -8, 40], CARRIED = [12, 1, 36];
+const smooth = t => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t));
+const mix = (a, b, k) => a.map((v, i) => v + (b[i] - v) * k);
+const CYCLE = 7.5;
+
+function scriptAt(sec) {
+  const t = ((sec % CYCLE) + CYCLE) % CYCLE;
+  const head = [8 * Math.sin(sec * 0.5), 4 + 3 * Math.sin(sec * 0.31), 62 + 5 * Math.sin(sec * 0.23)];
+  let c, pinch01;
+  if (t < 1.4) { c = mix(START, AT, smooth(t / 1.4)); pinch01 = 1; }
+  else if (t < 1.8) { c = AT; pinch01 = 1 - smooth((t - 1.4) / 0.4); }
+  else if (t < 3.2) { c = mix(AT, CARRIED, smooth((t - 1.8) / 1.4)); pinch01 = 0; }
+  else if (t < 4.6) { c = CARRIED; pinch01 = 0; }
+  else if (t < 5.0) { c = CARRIED; pinch01 = smooth((t - 4.6) / 0.4); }
+  else { c = mix(CARRIED, START, smooth((t - 5.0) / 2.5)); pinch01 = 1; }
+  return { c, pinch01, head, phase: t };
+}
+
+// the simulator's hand model works in millimetres; this scene is centimetres
+const handAt = (centreCm, pinch01) =>
+  handPose({ centre: centreCm.map(v => v * CM), pinch01, handedness: 'Right' }).map(p => p.map(v => v / CM));
+
+const eyesAt = head => {
+  const ipd = 6.3 / 2;
+  return [[head[0] - ipd, head[1], head[2]], [head[0] + ipd, head[1], head[2]]];   // viewer's right eye first
+};
+
+let noisePx = Number(params.get('noise') ?? 1.0);
+let rngState = 20260919;
+const rnd = () => { rngState = (rngState * 1664525 + 1013904223) >>> 0; return rngState / 4294967296; };
+const gauss = () => Math.sqrt(-2 * Math.log(1 - rnd())) * Math.cos(2 * Math.PI * rnd());
+
+// One camera's view of the truth, in the normalised coordinates MediaPipe reports.
+//
+// MediaPipe does NOT drop a hand because one fingertip crossed the edge of the frame: it reports the whole
+// 21 points, some of them outside 0..1. Refusing the frame instead would quietly halve the number of views
+// the solver has and drop it to the single-camera guess, which is a 40 mm jump, not a graceful degradation.
+// So the rule here is the detector's: enough of the hand in frame to be detected at all, then all 21 points.
+function shoot(camera, pointsCm, minInFrame = 0.7) {
+  const out = [];
+  let inFrame = 0;
+  for (const p of pointsCm) {
+    const q = camera.project([p[0] * CM, p[1] * CM, p[2] * CM]);
+    if (!q.inFront) return null;              // behind the lens: there is nothing to report
+    if (q.inFrame) inFrame++;
+    out.push({ x: q.u / camera.width + gauss() * noisePx / camera.width,
+               y: q.v / camera.height + gauss() * noisePx / camera.height, z: 0 });
+  }
+  return inFrame >= pointsCm.length * minInFrame ? out : null;
+}
+
+// ---------------------------------------------------------------- solver + grab
+
+const solver = createSolver({ eye: 'center', ipdMm: 63 });
+for (const c of fakeCams) solver.addCamera(c.camera);
+
+const chain = createSceneGrab({ unitsPerMetre: 100, overrides: { volume: VOLUME, floorY: FLOOR_Y } });
+const feedback = createFeedback({ scene, config: chain.config, unitsPerMetre: 100 });
+const meter = createLagMeter({ windowMs: 2500, stillSpeed: 2 });   // cm/s
+
+const events = [];
+for (const name of ['grabStart', 'grabEnd', 'settleStart', 'settleEnd']) {
+  chain.grab.on(name, e => {
+    events.push({ name, at: Math.round(e.at), bodyId: e.bodyId, kind: e.kind || null, reason: e.reason || null,
+                  pose: e.pose ? { x: +e.pose.position.x.toFixed(2), y: +e.pose.position.y.toFixed(2), z: +e.pose.position.z.toFixed(2) } : null,
+                  source: current });
+    if (events.length > 60) events.shift();
+  });
+}
+
+// ---------------------------------------------------------------- sources
+
+let current = params.get('source') || 'sim';
+const BRIDGE_URL = params.get('bridge') || `ws://127.0.0.1:${BRIDGE_DEFAULT_PORT}`;
+let bridge = null, bridgeStats = null, lastBridgeAt = -1e9;
+let t0 = performance.now();
+
+function setBridge(url) {
+  bridge?.close();
+  bridge = null;
+  if (!url) return;
+  // onStatus only fires on a STATE change, so a snapshot taken there has fps and latency frozen at the
+  // moment the socket opened. Read bridge.stats live instead; it is updated on every frame.
+  bridge = new ZedClient({
+    url,
+    onHands: p => { lastBridgeAt = p.at; solver.observeBridge(p); },
+    onStatus: s => { bridgeStats = s; },
+  });
+  bridge.connect(url);
+  $('bridgeUrl').textContent = url;
+}
+
+function setSource(mode) {
+  current = mode;
+  events.length = 0;
+  tipErr = [];
+  lastTruth = null;
+  meter.reset();
+  chain.grab.reset();
+  for (const id of ['sim', 'bridge', 'both']) $(`b-${id}`).classList.toggle('on', id === mode);
+  // The bridge is only connected when a source wants it, so "fake cameras" really is cameras only.
+  if (mode === 'sim') setBridge('');
+  else if (!bridge) setBridge(BRIDGE_URL);
+}
+
+// ---------------------------------------------------------------- the frame
+
+let lastTruth = null, frames = 0, tipErr = [];
+
+function feedCameras(now) {
+  const s = scriptAt((now - t0) / 1000);
+  const hand = handAt(s.c, s.pinch01);
+  const eyes = eyesAt(s.head);
+  lastTruth = { hand, eyes, phase: s.phase };
+  for (const c of fakeCams) {
+    const lm = c.jobs.hands ? shoot(c.camera, hand) : null;
+    const face = c.jobs.face ? shoot(c.camera, eyes) : null;
+    if (!lm && !face) continue;
+    solver.tracker.observe2D({
+      camId: c.camera.id, tMs: now,
+      face: face ? face.map(p => ({ x: p.x, y: p.y })) : null,
+      hands: lm ? [{ handedness: 'Right', score: 1, landmarks: lm }] : [],
+      normalized: true,
+    });
+  }
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (current === 'sim' || current === 'both') feedCameras(now);
+  solver.step(input, now);
+
+  const state = chain.step(input, bodies, now);
+  for (const b of bindings) b.apply();
+  feedback.update({ state, bodies, camera: view, dt: 1 / 60 });
+  drawHand(input.hands.find(h => h.active) || input.hands[0]);
+
+  const gh = state.hands.find(h => h.live);
+  const held = state.holds[0];
+  if (gh?.point && held) {
+    const body = bodies.find(b => b.id === held.bodyId);
+    if (body) meter.push(now, gh.point, body.pose.position);
+  }
+  // Only the synthetic cameras have a truth to compare against. In bridge mode there is none — the bridge
+  // IS the measurement — so keep the counter honest rather than comparing against a stale script.
+  if (lastTruth && (current === 'sim' || current === 'both') && solver.quality.handSource !== 'bridge'
+      && input.hands[0].active && Number.isFinite(input.hands[0].tip.x)) {
+    const t = lastTruth.hand[HAND.INDEX_TIP], p = input.hands[0].tip;
+    tipErr.push(Math.hypot(p.x - t[0], p.y - t[1], p.z - t[2]) * 10);
+    if (tipErr.length > 600) tipErr.shift();
+  }
+  frames++;
+
+  const w = innerWidth, h = innerHeight;
+  if (renderer.domElement.width !== w * renderer.getPixelRatio() || view.aspect !== w / h) {
+    renderer.setSize(w, h, false); view.aspect = w / h; view.updateProjectionMatrix();
+  }
+  renderer.render(scene, view);
+  if (frames % 6 === 0) paint(now);
+}
+
+// ---------------------------------------------------------------- readouts
+
+const mean = a => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+const fx = (v, n = 1) => (v == null || !Number.isFinite(v) ? '—' : v.toFixed(n));
+
+function metrics() {
+  const lag = meter.lagMs(), jit = meter.jitter();
+  return {
+    source: current, frames, model: modelSource,
+    solver: { readout: solver.readout, ...solver.quality },
+    handSource: solver.quality.handSource, eyeSource: solver.quality.eyeSource,
+    tipErrMeanMm: mean(tipErr), tipErrN: tipErr.length,
+    lagMs: lag.ms, lagR: lag.r, lagSamples: lag.n, lagDtMs: lag.dtMs,
+    jitterMmRms: jit.rms == null ? null : jit.rms * 10,
+    jitterMmWorst: jit.worst == null ? null : jit.worst * 10,
+    jitterFrames: jit.n,
+    held: chain.grab.state().holds.map(h => h.bodyId),
+    bodies: bodies.map(b => ({ id: b.id, pos: [+b.pose.position.x.toFixed(2), +b.pose.position.y.toFixed(2), +b.pose.position.z.toFixed(2)] })),
+    events: events.slice(-20),
+    bridge: bridge ? { ...bridge.stats } : bridgeStats,
+    eye: [+input.eye.x.toFixed(2), +input.eye.y.toFixed(2), +input.eye.z.toFixed(2)],
+    hands: input.hands.map(h => ({ active: h.active, pinch: h.pinch, pinchCm: h.pinchCm ?? null,
+                                   tip: [+h.tip.x.toFixed(2), +h.tip.y.toFixed(2), +h.tip.z.toFixed(2)] })),
+    inputMode: input.mode,
+  };
+}
+
+function step(name, live, val, bad = false) {
+  return `<div class="step ${bad ? 'bad' : live ? 'live' : ''}"><span class="dot"></span>` +
+         `<span class="name">${name}</span><span class="val">${val}</span></div>`;
+}
+
+function paint(now) {
+  const m = metrics();
+  const q = m.solver;
+  const held = m.held.length ? m.held.join(', ') : 'nothing';
+  const last = events[events.length - 1];
+  $('hud').textContent =
+    `source   ${m.source}\n` +
+    `solver   ${q.readout}\n` +
+    `hands    ${q.handSource} from ${q.handViews} view(s)   eye ${q.eyeSource}\n` +
+    `input    mode ${m.inputMode}   pinch ${fx(m.hands[0].pinchCm, 2)} cm ${m.hands[0].pinch ? '(closed)' : '(open)'}\n` +
+    `fingertip vs truth   ${fx(m.tipErrMeanMm, 2)} mm over ${m.tipErrN} frames\n` +
+    `holding  ${held}\n` +
+    `lag      ${fx(m.lagMs)} ms   (r ${fx(m.lagR, 2)}, ${m.lagSamples} samples)\n` +
+    `jitter   ${fx(m.jitterMmRms, 2)} mm rms, worst ${fx(m.jitterMmWorst, 2)} mm (${m.jitterFrames} still frames)\n` +
+    `model    ${m.model}\n` +
+    (last ? `last     ${last.name}${last.reason ? ' (' + last.reason + ')' : ''} on ${last.bodyId} at ${last.at} ms\n` : '') +
+    (m.bridge ? `bridge   ${m.bridge.state}  ${m.bridge.fps} fps  ${Math.round(m.bridge.latencyMs)} ms\n` : '');
+
+  $('chain').innerHTML =
+    step('cameras', q.cameras > 0, `${q.cameras} posed, ${q.stale} stale`) +
+    step('bridge', !!(m.bridge && m.bridge.state === 'live'), m.bridge ? `${m.bridge.state} ${m.bridge.fps} fps` : 'off') +
+    step('solver', q.handsSeen > 0, `${fx(q.handRmsPx, 2)} px, ${Math.round(q.latencyMs)} ms late`) +
+    step('state.js', m.hands.some(h => h.active), `tip ${m.hands[0].tip.join(', ')} cm`) +
+    step('grab', m.held.length > 0, m.held.length ? `holding ${held}` : 'open') +
+    step('model', true, m.bodies.map(b => `${b.id} ${b.pos.join(',')}`).join('<br><span class="name"></span>'));
+}
+
+// ---------------------------------------------------------------- go
+
+$('b-sim').onclick = () => setSource('sim');
+$('b-bridge').onclick = () => setSource('bridge');
+$('b-both').onclick = () => setSource('both');
+$('b-reset').onclick = () => {
+  chain.grab.reset();
+  bindings.forEach((b, i) => {
+    b.body.pose = { position: i === 0 ? { x: -3, y: FLOOR_Y + 3.4, z: 40 } : { x: 13, y: FLOOR_Y + 2.2, z: 44 },
+                    quaternion: { x: 0, y: 0, z: 0, w: 1 }, scale: 1 };
+    b.apply();
+  });
+};
+
+window.__chain = {
+  metrics, events, input, solver, grab: chain.grab, bodies,
+  setSource, setBridge, reset: () => $('b-reset').onclick(),
+  // Put a part somewhere: the bridge's hands sweep their own volume, so a test has to move the model into
+  // reach of them rather than assume the two happen to overlap.
+  place(id, p) {
+    const bnd = bindings.find(b => b.body.id === id);
+    if (!bnd) return false;
+    chain.grab.reset();
+    bnd.body.pose = { position: { x: p[0], y: p[1], z: p[2] }, quaternion: { x: 0, y: 0, z: 0, w: 1 }, scale: 1 };
+    bnd.apply();
+    return true;
+  },
+  set noisePx(v) { noisePx = v; }, get noisePx() { return noisePx; },
+  restartScript: () => { t0 = performance.now(); tipErr = []; meter.reset(); events.length = 0; },
+  ready: true,
+};
+
+$('bridgeUrl').textContent = BRIDGE_URL;
+setSource(current);
+requestAnimationFrame(now => { t0 = now; requestAnimationFrame(frame); });
+</script>
+</body>
+</html>

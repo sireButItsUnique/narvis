@@ -14,7 +14,7 @@
 
 import { add, sub, scale, dot, cross, normalize, dist, lerp3, matVec, rodrigues,
          mean, percentile, mulberry32, gaussian } from '../track/linalg.js';
-import { makeCamera } from '../track/camera.js';
+import { makeCamera, PinholeCamera } from '../track/camera.js';
 import { expectedErrorMm } from '../track/triangulate.js';
 import { Tracker } from '../track/solve.js';
 import { HAND, PALM } from '../track/landmarks.js';
@@ -116,18 +116,31 @@ export function parallaxGain(eye, screen, floatDepthMm = 150) {
 
 // ---------- the sensors ----------
 
+// MEASURED ZED intrinsics, not the marketing field of view.
+//
+// The datasheet's "110 degrees" is the maximum DISTORTED horizontal field of the sensor; the HD720 readout
+// is not the full sensor field, so no pinhole reproduces the published 110 H x 70 V x 120 D triple and
+// there is no choice of fovAxis that is "correct". Reading 110 as the diagonal gave fx = 514 px at
+// 1280x720 and as horizontal 448 px, while two independent real SN.conf files (a ZED Mini with
+// Baseline=63.001 and a 120 mm-baseline ZED) both carry LEFT_CAM_HD fx ~= 700 — which is also what this
+// repo's own sample calibration in test/cameras-stereo.test.js has (fx = 700.5). So the simulated frustum
+// used to be ~26% WIDER than the hardware's and every millimetre it printed was measured through the
+// wrong lens. Store the measured numbers, with the barrel distortion a ZED visibly has.
+const ZED_DIST = { k1: -0.174, k2: 0.027 };
 const ZED_MODELS = {
-  'ZED 2i': { baselineMm: 120, fovDeg: 110, width: 1280, height: 720, fps: 60 },
-  'ZED 2': { baselineMm: 120, fovDeg: 110, width: 1280, height: 720, fps: 60 },
-  'ZED Mini': { baselineMm: 63, fovDeg: 110, width: 1280, height: 720, fps: 60 },
+  'ZED 2i': { baselineMm: 120, fx: 700, width: 1280, height: 720, fps: 60, dist: ZED_DIST },
+  'ZED 2': { baselineMm: 120, fx: 700, width: 1280, height: 720, fps: 60, dist: ZED_DIST },
+  'ZED Mini': { baselineMm: 63, fx: 699, width: 1280, height: 720, fps: 60, dist: ZED_DIST },
 };
 const WEBCAM = { fovDeg: 78, width: 1920, height: 1080, fps: 30 };          // Logitech C920/C922
 
 /** A ZED as what it really is for us: two ordinary cameras that share one exposure. */
 export function makeZed({ position, target, model = 'ZED 2i', id = 'zed', noisePx = 1.0, up = [0, 1, 0] }) {
   const m = ZED_MODELS[model] || ZED_MODELS['ZED 2i'];
-  const left = makeCamera({ id: `${id}-l`, label: `${model} left`, role: 'hands', position, target, up,
-                            fovDeg: m.fovDeg, width: m.width, height: m.height, fps: m.fps, noisePx });
+  const left = new PinholeCamera({ id: `${id}-l`, label: `${model} left`, role: 'hands', position, target, up,
+                                   width: m.width, height: m.height, fx: m.fx, fy: m.fx,
+                                   cx: m.width / 2, cy: m.height / 2, dist: { ...m.dist },
+                                   fps: m.fps, noisePx });
   const right = left.clone({ id: `${id}-r`, label: `${model} right`,
                              position: add(left.position, scale(left.right, m.baselineMm)) });
   right.setPose({ R: left.R });        // the eyes are parallel; the factory convergence is a few milliradians
@@ -143,9 +156,19 @@ export function makeWebcam({ id, position, target, label, role = 'head', noisePx
  * Camera layouts. "zed-hands" is the user's own kit as planned; the others are the alternatives worth
  * measuring against it. Every layout is a function of the rig, so moving the monitor moves the cameras.
  */
-// How far in front of the hand volume to put the ZED. Swept in the simulator: closer is more precise but
-// the volume overflows the frustum, and the moment ONE eye loses the fingertip the solver drops to the
-// single-camera guess — which is a 40-50 mm jump, not a graceful degradation. 380 mm was the knee.
+// How far in front of the hand volume to put the ZED. Re-derived after two corrections: the simulated ZED
+// now has the lens the hardware has (fx 700, not a field-of-view guess 26% short of it), and runSession
+// can express a calibration error, which the noise-only model could not.
+//
+// Swept at 1 px noise, 300 frames, seed 1, and it comes back to the same answer for a better reason.
+// With PERFECT calibration the geometry is flat (2.4-2.9 mm of fingertip error anywhere from 300 to
+// 460 mm), and under the residual this project's own calibration leaves (1.3% scale plus 0.3 deg on one
+// eye — both printed by test/track-calibrate.test.js) the error grows monotonically with range: 12.0 mm
+// at 300 mm, 13.1 at 340, 16.1 at 380, 18.1 at 420. So the error terms alone want the ZED CLOSER.
+// What stops them is the frustum: nearer than 380 mm the hand leaves one eye's view during the reach and
+// the solve drops to the single-camera guess, which is ~99 mm, not a graceful degradation — 5.7% of
+// frames at 300 mm, 6.0% at 340, 4.3% at 360, and exactly 0% from 380 mm out (coverage of the padded
+// volume 82% / 89% / 91% / 94%). 380 mm is the nearest standoff that never drops a frame to mono.
 export const ZED_RANGE_MM = 380;
 
 export const LAYOUTS = {
@@ -342,12 +365,69 @@ export function synthesizeView(camera, truth, { noisePx, rng, dropRate = 0, occl
   return { face: face ? face.map(q => ({ x: q.u / camera.width, y: q.v / camera.height })) : null, hands };
 }
 
-/** The two iris centres, from a head position. IPD is the one number a per-user calibration must fix. */
+/**
+ * The two iris centres, from a head position, in the order Tracker.observe2D documents:
+ * [viewer's RIGHT eye, viewer's LEFT eye].
+ *
+ * In the rig frame (X right, Y up, Z toward the viewer) the viewer's right eye is at +X, and it is the
+ * iris that appears on the LEFT of a raw, unmirrored frame — which is what input/cameras.js pickEye and
+ * input/landmarks-worker.js both assume. This used to return them the other way round, so anything
+ * validated against the simulator with eye: 'right' was validated against the wrong eye, 63 mm away.
+ * IPD is the one number a per-user calibration must fix.
+ */
 export function eyePoints(head, ipdMm = 63, yawDeg = 0) {
   const R = rodrigues([0, yawDeg * Math.PI / 180, 0]);
-  return [add(head, matVec(R, [-ipdMm / 2, 0, 0])),    // the viewer's right eye is at -x as they face us
-          add(head, matVec(R, [ipdMm / 2, 0, 0]))];
+  return [add(head, matVec(R, [ipdMm / 2, 0, 0])),     // viewer's right eye: +x
+          add(head, matVec(R, [-ipdMm / 2, 0, 0]))];   // viewer's left eye: -x
 }
+
+// ---------- calibration error ----------
+
+/**
+ * A copy of the cameras with a DELIBERATE calibration error in it, to hand to the solver while the
+ * generator keeps the truth. Every term is named and signed rather than random, because the cost depends
+ * on the axis: 3 mm of ZED-eye translation costs a few millimetres along y and roughly twice that along
+ * the baseline, so "3 mm of calibration error" on its own is not a reproducible statement.
+ *
+ * Realistic magnitudes, by this repo's own measurements: relativePoseRansac leaves 0.5-0.8 deg
+ * (test/track-calibrate.test.js prints it) and the end-to-end touch fit needs a ~1.3% scale change, which
+ * is a focal error. Those are LARGER than the perturbations that double the error below.
+ *
+ * @param err.focalPct     percent added to fx/fy of every camera matching `only`
+ * @param err.baselineMm   millimetres added to the ZED's baseline (moves `-r` along the left eye's +x)
+ * @param err.rotDeg       degrees of rotation applied to `rotCam`, about `rotAxis` in the rig frame
+ * @param err.translateMm  millimetres of translation applied to `transCam`, along `transAxis`
+ * @param err.only         id substring: which cameras the focal error touches (default: all)
+ */
+export function perturbCameras(cameras, err = {}) {
+  const { focalPct = 0, baselineMm = 0, rotDeg = 0, rotAxis = 'y', rotCam = 'zed-r',
+          translateMm = 0, transAxis = 'y', transCam = 'zed-r', only = null } = err;
+  const axisVec = a => (a === 'x' ? [1, 0, 0] : a === 'z' ? [0, 0, 1] : [0, 1, 0]);
+  const left = cameras.find(c => c.id.endsWith('-l')) || cameras[0];
+  return cameras.map(c => {
+    const out = c.clone();
+    if (focalPct && (!only || c.id.includes(only))) {
+      out.fx = c.fx * (1 + focalPct / 100); out.fy = c.fy * (1 + focalPct / 100);
+    }
+    if (baselineMm && c.id.endsWith('-r') && left) {
+      out.position = add(c.position, scale(left.right, baselineMm));
+    }
+    if (translateMm && c.id === transCam) {
+      out.position = add(out.position, scale(axisVec(transAxis), translateMm));
+    }
+    if (rotDeg && c.id === rotCam) {
+      out.setPose({ R: matMul3x3(c.R, rodrigues(scale(axisVec(rotAxis), rotDeg * Math.PI / 180))) });
+    }
+    return out;
+  });
+}
+
+const matMul3x3 = (a, b) => {
+  const m = new Array(9);
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+    m[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+  return m;
+};
 
 // ---------- running a session ----------
 
@@ -357,15 +437,23 @@ export function eyePoints(head, ipdMm = 63, yawDeg = 0) {
  */
 export function runSession({ layout = 'zed-hands', rig = DEFAULT_RIG, frames = 300, hz = 60, seed = 1,
                              noisePx = 1.0, dropRate = 0.02, unsyncMs = null, unsyncZed = false, ipdMm = 63,
-                             headSpeed = 1, handSpeed = 1, twoHands = false, latencyMs = 0,
-                             tracker: existing = null, overrides = {} } = {}) {
+                             headSpeed = 1, handSpeed = 1, twoHands = false, latencyMs = 0, eye = 'center',
+                             calibError = null, tracker: existing = null, overrides = {} } = {}) {
   const built = typeof layout === 'string' ? buildLayout(layout, rig, { noisePx, ...overrides }) : layout;
   const g = built.geometry;
   const rng = mulberry32(seed);
-  const tracker = existing || new Tracker({ cameras: built.cameras, ipdMm, appScale: 1,
+  // The generator always projects through the TRUE cameras; the solver gets a perturbed copy when
+  // calibError asks for one. Without this the simulator cannot express a calibration error at all —
+  // the solver's intrinsics and extrinsics were the exact inverse of the generator's by construction, so
+  // zero-mean pixel noise was the only error term and every millimetre it reported assumed perfect
+  // calibration. In practice the calibration residual is 3-7x the noise term.
+  const solverCameras = calibError ? perturbCameras(built.cameras, calibError) : built.cameras;
+  const tracker = existing || new Tracker({ cameras: solverCameras, ipdMm, appScale: 1, eye,
                                             interpolate: overrides.interpolate !== false,
                                             ...(overrides.extrapolateMs != null ? { extrapolateMs: overrides.extrapolateMs } : {}) });
-  tracker.setCameras(built.cameras);
+  // Only when we built it: an injected tracker owns its own cameras, which is the whole reason to inject one.
+  if (!existing) tracker.setCameras(solverCameras);
+  const eyeSide = existing ? existing.eyeSide : eye;
 
   // Free-running cameras each sit at their own phase within a frame period, so they sample the world at
   // different instants. The two ZED eyes share ONE exposure, which is the whole point of them — set
@@ -385,8 +473,11 @@ export function runSession({ layout = 'zed-hands', rig = DEFAULT_RIG, frames = 3
       const capture = Math.floor((nowMs - phase.get(c.id)) / period) * period + phase.get(c.id);
       if (capture < 0) continue;
       const truthAtCapture = truthAt(capture / 1000, g, { headSpeed, handSpeed, twoHands });
-      const view = synthesizeView(c, truthAtCapture, { noisePx: c.noisePx, rng, dropRate });
-      if (!view) continue;
+      // A miss is a RESULT, not a silence: landmarks-worker.js always posts { face: null, hands: [] } and
+      // input/cameras.js forwards it. Skipping observe2D here modelled the opposite and hid a real defect
+      // in the solver's grouping for a whole branch, so the simulator now pushes what the app pushes.
+      const view = synthesizeView(c, truthAtCapture, { noisePx: c.noisePx, rng, dropRate })
+        || { face: null, hands: [] };
       tracker.observe2D({ camId: c.id, tMs: capture, face: view.face, hands: view.hands, normalized: true });
     }
     if (built.bridge) {
@@ -408,7 +499,13 @@ export function runSession({ layout = 'zed-hands', rig = DEFAULT_RIG, frames = 3
     // because otherwise a faster camera looks like a more accurate one.
     const truthRef = truthAt(out.tHandMs / 1000, g, { headSpeed, handSpeed, twoHands });
     const truthEyeRef = truthAt(out.tEyeMs / 1000, g, { headSpeed, handSpeed, twoHands });
-    const eyeTruth = scale(add(...eyePoints(truth.head, ipdMm)), 0.5);
+    // Measure against the iris the solver was ASKED for. Always using the midpoint made an eyeSide run
+    // report ~ipd/2 of error whichever eye it picked, which is why the flipped eye order went unnoticed.
+    const eyeTruthOf = head => {
+      const e = eyePoints(head, ipdMm);
+      return eyeSide === 'right' ? e[0] : eyeSide === 'left' ? e[1] : scale(add(e[0], e[1]), 0.5);
+    };
+    const eyeTruth = eyeTruthOf(truth.head);
     const tipTruth = truth.hands[0].points[HAND.INDEX_TIP];
     const thumbTruth = truth.hands[0].points[HAND.THUMB_TIP];
     const gripTruth = scale(add(tipTruth, thumbTruth), 0.5);
@@ -422,8 +519,7 @@ export function runSession({ layout = 'zed-hands', rig = DEFAULT_RIG, frames = 3
       rawTipErrMm: hand && hand.raw && hand.raw[HAND.INDEX_TIP] ? dist(hand.raw[HAND.INDEX_TIP], tipTruth) : null,
       geomTipErrMm: hand && hand.raw && hand.raw[HAND.INDEX_TIP]
         ? dist(hand.raw[HAND.INDEX_TIP], truthRef.hands[0].points[HAND.INDEX_TIP]) : null,
-      geomEyeErrMm: tracker.eyeRaw
-        ? dist(tracker.eyeRaw, scale(add(...eyePoints(truthEyeRef.head, ipdMm)), 0.5)) : null,
+      geomEyeErrMm: tracker.eyeRaw ? dist(tracker.eyeRaw, eyeTruthOf(truthEyeRef.head)) : null,
       lagMs: nowMs - out.tHandMs,
       pinch: hand ? hand.pinch : false,
       pinchTruth: truth.pinch01 < 0.25,

@@ -105,6 +105,49 @@ test('the client tracks latency and refuses a hand that arrived too late', () =>
   c.close();
 });
 
+test('hands that arrive before the first pong cannot poison the session', async () => {
+  // ClockSync.offsetMs is 0 until a pong lands, so toLocal() hands back the bridge's raw EPOCH
+  // milliseconds — an "age" of about minus fifty years. That passed every staleness test as ultra-fresh,
+  // pinned latency at 0, and made the payload impossible to expire: the solver preferred one frozen
+  // frame over every live camera for the rest of the session, with the model still in its hand.
+  FakeWS.made = [];
+  let clock = 12_000;
+  const got = [];
+  const c = new ZedClient({ url: 'ws://x', WebSocket: FakeWS, now: () => clock, onHands: p => got.push(p), pingEveryMs: 1e9 });
+  c.connect();
+  const ws = FakeWS.made[0];
+  ws.open();
+  ws.deliver({ t: 'hello', version: 1, source: 'fake', fps: 60 });
+  const bridgeNow = () => 1_758_900_000_000 + clock;
+  // three frames at 60 Hz, and then the Wi-Fi drops — all before the pong comes back
+  for (let i = 0; i < 3; i++) {
+    ws.deliver({ t: 'hands', seq: i, ts: bridgeNow() / 1000, hands: [{ handedness: 'right', lm: lm21() }] });
+    clock += 16.6667;
+  }
+  console.log(`      ${got.length} payload(s) accepted before the clock was synced; ` +
+              `the raw stamp is ${(c.stats.skewMs / 1000 / 86400 / 365).toFixed(1)} years out`);
+  assert.equal(c.stats.synced, false, 'the client knows it has no clock yet');
+  assert.ok(Math.abs(c.stats.skewMs) > 1e9, 'and it reports the real skew instead of clamping it to 0');
+  // The hands are still USED — they are only a few milliseconds old and the ping is still in flight —
+  // but they are stamped on OUR clock, so everything downstream can expire them on schedule.
+  assert.equal(got.length, 3);
+  for (const p of got) {
+    assert.ok(Math.abs(p.at - clock) < 100, `a payload stamped at ${p.at} could never be expired`);
+  }
+  // once the pong lands, the capture time is the bridge's own again
+  const c0 = JSON.parse(ws.sent[0]).c0;
+  ws.deliver({ t: 'pong', c0, s: bridgeNow() });
+  ws.deliver({ t: 'hands', seq: 9, ts: bridgeNow() / 1000, hands: [{ handedness: 'right', lm: lm21() }] });
+  assert.equal(c.stats.synced, true);
+  assert.equal(got.length, 4, 'and a synced frame goes through');
+  assert.ok(Math.abs(got[3].at - clock) < 50);
+  // a stamp from the FUTURE is a clock problem too, and must not read as ultra-fresh
+  ws.deliver({ t: 'hands', seq: 10, ts: (bridgeNow() + 5000) / 1000, hands: [{ handedness: 'right', lm: lm21() }] });
+  assert.equal(got.length, 4, 'a frame stamped in the future is refused');
+  assert.ok(c.stats.stale >= 1);
+  c.close();
+});
+
 test('a dropped bridge reconnects on its own, and stopping it stops the retries', async () => {
   FakeWS.made = [];
   const c = new ZedClient({ url: 'ws://x', WebSocket: FakeWS, pingEveryMs: 1e9 });

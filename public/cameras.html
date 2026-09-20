@@ -155,10 +155,13 @@ function paint() {
     c.el.querySelector('.badges').innerHTML =
       badge(info.seesHead, 'head') + badge(info.seesHands, 'hands') +
       badge(info.kind === 'zed', info.kind === 'zed' ? 'ZED: ' + info.why : 'webcam') +
-      (info.calib ? badge(true, info.calib, info.calib.startsWith('SN') ? 'on' : 'warn') : '') +
+      // A lens that is a guess is worth saying out loud: a wrong focal length comes out as DEPTH, and a
+      // hand published at 2.5x the right distance looks like broken tracking rather than a wrong number.
+      (info.calib ? badge(true, info.calib + (info.calibMetric ? '' : ' (guess)'), info.calibMetric ? 'on' : 'warn') : '') +
       (info.error ? badge(true, info.error, 'bad') : '');
     c.el.querySelector('.nums').textContent = info.views
-      .map(v => `${v.label}\n  ${v.fps} fps  ${v.latencyMs} ms  drops ${v.busyDrops} busy / ${v.staleDrops} stale`).join('\n');
+      .map(v => `${v.label}\n  ${v.fps} fps  ${v.latencyMs} ms  drops ${v.busyDrops} busy / ${v.staleDrops} stale` +
+                `${v.stallDrops ? ' / ' + v.stallDrops + ' STALLED' : ''}`).join('\n');
   }
   for (const [id, c] of cards) if (!cams.sources.some(s => s.deviceId === id)) { c.el.remove(); cards.delete(id); }
 
@@ -169,7 +172,9 @@ function paint() {
     badge(st.inputMode === 'camera', 'input.mode ' + st.inputMode, st.inputMode === 'camera' ? 'on' : 'warn');
   const b = st.bridge;
   $('bridgeNums').textContent = b
-    ? `${b.state}  ${b.url}\nsource ${b.source}  ${b.fps} fps  latency ${b.latencyMs.toFixed(0)} ms\nclock offset ${b.offsetMs.toFixed(0)} ms  frames ${b.frames}  stale ${b.stale}  bad ${b.bad}${b.error ? '\n' + b.error : ''}`
+    ? `${b.state}  ${b.url}\nsource ${b.source}  ${b.fps} fps  latency ${b.latencyMs.toFixed(0)} ms` +
+      `\nclock ${b.synced ? `synced, offset ${b.offsetMs.toFixed(0)} ms` : 'NOT SYNCED YET (waiting for the first pong)'}` +
+      `  frames ${b.frames}  stale ${b.stale}  bad ${b.bad}${b.error ? '\n' + b.error : ''}`
     : 'not connected';
   $('log').textContent = st.notes.join('\n');
   requestAnimationFrame(paint);

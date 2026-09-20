@@ -219,6 +219,98 @@ test('already-3D input from a bridge is accepted and filtered the same way', () 
   assert.ok(dist(moved, pts[HAND.INDEX_TIP]) > 10, 'the transform was actually applied');
 });
 
+// ---------------------------------------------------------------- misses, and what they must not cost
+
+// The capture layer never goes silent: landmarks-worker.js ALWAYS posts a result, and a frame where
+// MediaPipe found nothing is { face: null, hands: [] }. Nothing in the test suite used to feed that shape
+// in, and the solver treated it as "this camera has no hands", evicting a camera whose previous frame was
+// perfectly good and dropping the whole solve to the single-camera guess.
+test('a frame with no detections does not evict the camera that found one 16 ms ago', () => {
+  const { cams, tracker } = rig();
+  const rng = mulberry32(31);
+  const centre = g.handVolume.centre;
+  const zed = cams.filter(c => c.id.startsWith('zed'));
+  let sawMono = 0, frames = 0;
+  for (let f = 0; f < 40; f++) {
+    const tMs = f * 16, truth = still(centre, 0);
+    for (const c of cams) {
+      const view = synthesizeView(c, truth, { noisePx: 1, rng }) || { face: null, hands: [] };
+      // one eye of the ZED misses every third frame, the way a detector really does
+      const miss = c === zed[0] && f % 3 === 2;
+      tracker.observe2D({ camId: c.id, tMs, face: miss ? null : view.face,
+                          hands: miss ? [] : view.hands, normalized: true });
+    }
+    const out = tracker.solve(tMs);
+    if (f < 6) continue;                                  // let the ring fill
+    frames++;
+    if (out.quality.handSource === 'mono') sawMono++;
+    assert.equal(out.quality.handSource, 'stereo', `frame ${f} fell back to ${out.quality.handSource}`);
+    assert.equal(out.quality.handViews, 2, `frame ${f} solved with ${out.quality.handViews} view(s)`);
+  }
+  console.log(`  a third of one eye's frames empty: ${sawMono}/${frames} frames on the single-camera guess`);
+});
+
+// sampleAt takes the blend path whenever gap <= extrapolateMs, and gap is exactly 0 for the camera that
+// DEFINES the reference time — every frame. blend() used to build its hand list from the OLDER frame, so
+// at t == 1 the reference camera's fresh detection was thrown away whenever the previous frame lacked it.
+test('a camera that missed only the PREVIOUS frame still contributes this one', () => {
+  const { cams, tracker } = rig();
+  const rng = mulberry32(32);
+  const zed = cams.filter(c => c.id.startsWith('zed'));
+  const path = f => [g.handVolume.centre[0] + f * 10, g.handVolume.centre[1], g.handVolume.centre[2]];
+  for (let f = 0; f < 8; f++) {
+    const tMs = f * 16;
+    const truth = { head: [0, g.viewer[1], g.viewer[2]],
+                    hands: [{ handedness: 'Right', points: handPose({ centre: path(f), pinch01: 0 }) }] };
+    for (const c of cams) {
+      const view = synthesizeView(c, truth, { noisePx: 0, rng }) || { face: null, hands: [] };
+      const miss = c === zed[0] && f === 6;              // exactly the frame before the one we check
+      tracker.observe2D({ camId: c.id, tMs, face: view.face, hands: miss ? [] : view.hands, normalized: true });
+    }
+  }
+  const out = tracker.solve(7 * 16);
+  const hand = out.hands.find(h => h.active);
+  const err = dist(hand.raw[HAND.INDEX_TIP], handPose({ centre: path(7), pinch01: 0 })[HAND.INDEX_TIP]);
+  console.log(`  the frame after a single missed detection: ${out.quality.handSource}, ` +
+              `${out.quality.handViews} views, tip ${err.toFixed(2)} mm`);
+  assert.equal(out.quality.handSource, 'stereo');
+  assert.equal(out.quality.handViews, 2);
+  assert.ok(err < 2, `tip error ${err.toFixed(2)} mm`);
+});
+
+// pairCost() returns a sentinel meaning "these cannot be the same hand". It used to be 1e6, and the
+// acceptance test was Number.isFinite — which 1e6 passes — so two DIFFERENT hands seen by two cameras
+// were fused into one point hundreds of millimetres from either, reported as a clean two-view fix.
+test('two different hands are never fused into one phantom', () => {
+  const zed = makeZed({ id: 'zed', position: [-60, g.handVolume.centre[1] + 40, 380], target: g.handVolume.centre });
+  const side = makeWebcam({ id: 'side', role: 'hands', position: [420, g.handVolume.centre[1] + 120, 180],
+                            target: g.handVolume.centre });
+  const cams = [zed[0], side];
+  const tracker = new Tracker({ cameras: cams, appScale: 1 });
+  const rng = mulberry32(33);
+  const rightCentre = g.handVolume.centre;
+  const leftCentre = [g.handVolume.centre[0] + 220, g.handVolume.centre[1], g.handVolume.centre[2]];
+  const rightPts = handPose({ centre: rightCentre, pinch01: 0, handedness: 'Right' });
+  const leftPts = handPose({ centre: leftCentre, pinch01: 1, handedness: 'Left' });
+  let out = null;
+  for (let f = 0; f < 20; f++) {
+    const tMs = f * 16;
+    // the ZED eye only sees the RIGHT hand; the side webcam only sees the LEFT one
+    for (const [c, pts, handedness] of [[zed[0], rightPts, 'Right'], [side, leftPts, 'Left']]) {
+      const view = synthesizeView(c, { head: [0, g.viewer[1], g.viewer[2]],
+                                       hands: [{ handedness, points: pts }] }, { noisePx: 0.6, rng });
+      if (view) tracker.observe2D({ camId: c.id, tMs, face: null, hands: view.hands, normalized: true });
+    }
+    out = tracker.solve(tMs);
+  }
+  const hand = out.hands.find(h => h.active && h.handedness === 'Right');
+  const err = dist(hand.raw[HAND.INDEX_TIP], rightPts[HAND.INDEX_TIP]);
+  console.log(`  a Right hand and a Left hand, one camera each: ${hand.source}, ` +
+              `${hand.views} view(s), tip ${err.toFixed(1)} mm from the real right hand`);
+  assert.equal(hand.source, 'mono', 'a handedness mismatch must not become a stereo pair');
+  assert.ok(err < 25, `the published point is the hand that was really there (${err.toFixed(1)} mm)`);
+});
+
 test('the quality readout says what is tracking and how late it is', () => {
   const { cams, tracker } = rig();
   const rng = mulberry32(12);
