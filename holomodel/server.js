@@ -132,6 +132,60 @@ for o in [o for o in bpy.data.objects if o.get('holo_id') in ids]:
 print('deleted: %s' % (', '.join(gone) if gone else 'nothing'))
 `;
 
+// One THING moved, turned or resized by hand, apart from the rest of the scene. The page sends the ids of the
+// thing's parts and the change as a 4x4 in its own frame - the glTF scene: metres, Y up - and Blender applies
+// it to the objects' world matrices in ITS frame (Z up; glTF's (x, y, z) is Blender's (x, -z, y)), so the next
+// thing Fable builds finds the teapot where the hand left it, and the next export does not put it back.
+// If every mesh under a parent Empty is part of the thing, the Empty is what moves, and the thing stays a thing.
+const XFORM_PY = (ids, rows) => `
+import mathutils
+ids = set(${JSON.stringify(ids)})
+G = mathutils.Matrix(${JSON.stringify(rows)})
+C = mathutils.Matrix(((1, 0, 0, 0), (0, 0, 1, 0), (0, -1, 0, 0), (0, 0, 0, 1)))   # Blender -> glTF
+D = C.inverted() @ G @ C
+chosen = [o for o in bpy.data.objects if o.get('holo_id') in ids]
+inside = set(chosen)
+def meshes_under(o):
+    return [c for c in o.children_recursive if c.type == 'MESH']
+tops = []
+for o in chosen:
+    top = o
+    while top.parent is not None and all(m in inside for m in meshes_under(top.parent)):
+        top = top.parent
+    if top not in tops:
+        tops.append(top)
+tops = [t for t in tops if not any(t in u.children_recursive for u in tops if u is not t)]
+bpy.context.view_layer.update()
+for t in tops:
+    t.matrix_world = D @ t.matrix_world
+bpy.context.view_layer.update()
+print('moved: %s' % (', '.join(t.name for t in tops) if tops else 'nothing'))
+`;
+
+async function blenderXform(req, res) {
+  let body;
+  try { body = await readJson(req); } catch (err) { return sendJson(res, 400, { error: 'bad_request', message: err.message }); }
+  const ids = Array.isArray(body.ids) ? body.ids.filter(s => typeof s === 'string').slice(0, 80) : [];
+  const m = Array.isArray(body.matrix) && body.matrix.length === 16 && body.matrix.every(Number.isFinite) ? body.matrix : null;
+  if (!ids.length || !m) return sendJson(res, 400, { error: 'bad_request', message: 'ids and a 16-number column-major matrix' });
+  const rows = [0, 1, 2, 3].map(r => [0, 1, 2, 3].map(c => m[c * 4 + r]));      // three.js is column-major; mathutils wants rows
+  const release = lock('detail');
+  if (!release) return sendJson(res, 409, { error: 'busy', message: busyMessage() });
+  try {
+    const r = await bridge('exec', { code: XFORM_PY(ids, rows), label: 'Move' }, { timeout: 60000 });
+    if (!r.ok) return sendJson(res, 502, { error: 'blender', message: r.error || 'move failed' });
+    const note = String(r.output || '').trim().split('\n').pop() || '';
+    if (/nothing/.test(note)) return sendJson(res, 200, { ok: true, changed: false, message: 'nothing to move' });
+    const state = await publish('moved');
+    return sendJson(res, 200, { ok: true, changed: true, message: note, rev: state.rev });
+  } catch (err) {
+    const status = err instanceof BridgeError || err instanceof SceneError ? 502 : 500;
+    return sendJson(res, status, { error: 'blender', message: err.message });
+  } finally {
+    release();
+  }
+}
+
 async function blenderDelete(req, res) {
   let body;
   try { body = await readJson(req); } catch (err) { return sendJson(res, 400, { error: 'bad_request', message: err.message }); }
@@ -410,6 +464,9 @@ http.createServer((req, res) => {
   }
   if (pathname === '/api/blender/delete') {
     return req.method === 'POST' ? blenderDelete(req, res) : sendJson(res, 405, { error: 'method_not_allowed', message: 'POST only' });
+  }
+  if (pathname === '/api/blender/xform') {
+    return req.method === 'POST' ? blenderXform(req, res) : sendJson(res, 405, { error: 'method_not_allowed', message: 'POST only' });
   }
   if (pathname === '/api/edits') return editsRoute(req, res);
   if (pathname === '/api/history' || pathname.startsWith('/api/history/')) return historyRoute(req, res, pathname);

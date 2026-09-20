@@ -64,6 +64,10 @@ export function createParts() {
     get: id => byId.get(id) || null,
     ofMesh: mesh => { const p = mesh && byId.get(mesh.userData.holo_id); return p && p.mesh === mesh ? p : null; },
     meshes: () => [...byId.values()].filter(p => p.mesh.visible).map(p => p.mesh),   // what can be pointed at
+    // THINGS: parts that were built together (load.js thingId). A scene with one thing in it is handled as it
+    // always was; with several, a hand takes hold of ONE of them.
+    thingOf: part => { const k = part?.meta?.thingId ?? part?.id; return [...byId.values()].filter(p => (p.meta?.thingId ?? p.id) === k); },
+    thingCount: () => new Set([...byId.values()].map(p => p.meta?.thingId ?? p.id)).size,
     findByName(words) {
       const w = String(words).toLowerCase().trim();
       const all = [...byId.values()];

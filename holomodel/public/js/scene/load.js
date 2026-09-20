@@ -89,6 +89,8 @@ export function partsFromGltf(gltf) {
       ghash: ud.holo_ghash ?? null, mhash: ud.holo_mhash ?? null,
       meta: {
         parentId: parentIdOf(obj, src, assoc),
+        // the THING this part is a piece of: what was built together moves together (interaction.js)
+        thingId: (typeof ud.holo_thing === 'string' && ud.holo_thing ? `thing:${ud.holo_thing}` : null) || thingIdOf(obj, src, assoc) || null,
         sculpted: !!ud.holo_sculpted, vidok: !!ud.holo_vidok, nv: ud.holo_nv ?? null,
         tris: (geo.index ? geo.index.count : geo.attributes.position.count) / 3,
         textured: materials.some(m => !!m.map), bake: baked, blenderId: HEX12.test(id),
@@ -96,6 +98,7 @@ export function partsFromGltf(gltf) {
     }));
   });
 
+  groupIntoThings(parts);
   const sym = extras.holo_sym || {};
   const top = src.children.length === 1 ? src.children[0] : null;
   return {
@@ -109,6 +112,28 @@ export function partsFromGltf(gltf) {
   };
 }
 
+// Parts Blender did not say belong to anything (no collection of their own, no parent: a model built loose at the
+// top of the scene, a fixture, an older export) are grouped by TOUCH: parts whose boxes overlap, give or take a
+// fiftieth of the scene, are one thing - a teapot's lid, spout and handle all touch its body - and what stands
+// clear of everything else is a thing by itself. Wrong for a cup ON a table; right for everything loose so far.
+function groupIntoThings(parts) {
+  const loose = parts.filter(p => !p.meta.thingId);
+  if (!loose.length) return;
+  const boxes = loose.map(p => {
+    const g = p.mesh.geometry;
+    if (!g.boundingBox) g.computeBoundingBox();
+    p.mesh.updateMatrix();
+    return g.boundingBox.clone().applyMatrix4(p.mesh.matrix);
+  });
+  const all = boxes.reduce((u, b) => u.union(b), new THREE.Box3());
+  const gap = 0.02 * all.getSize(new THREE.Vector3()).length();
+  const parent = loose.map((_, i) => i);
+  const find = i => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  for (let i = 0; i < loose.length; i++) for (let j = i + 1; j < loose.length; j++)
+    if (boxes[i].clone().expandByScalar(gap).intersectsBox(boxes[j])) parent[find(i)] = find(j);
+  loose.forEach((p, i) => { p.meta.thingId = `touching:${loose[find(i)].id}`; });
+}
+
 // The triangle primitives a glTF node draws, or null for objects that aren't nodes (primitives of a
 // multi-material node, which its Group handles). Lines and points (loose edges) aren't parts.
 function primitivesOf(obj, assoc) {
@@ -118,6 +143,16 @@ function primitivesOf(obj, assoc) {
   if (obj.isMesh) return [obj];
   if (a.meshes === undefined) return [];   // an Empty
   return obj.children.filter(c => c.isMesh && assoc.get(c)?.nodes === undefined);
+}
+
+// The OUTERMOST ancestor Blender exported with an id: Fable hangs each thing it builds off one root Empty,
+// so that root is the thing. A part with no such ancestor - a plain cube - is a thing by itself.
+function thingIdOf(obj, src, assoc) {
+  let top = null;
+  for (let p = obj.parent; p && p !== src; p = p.parent) {
+    if ((!assoc || assoc.get(p)?.nodes !== undefined) && p.userData?.holo_id) top = p.userData.holo_id;
+  }
+  return top;
 }
 
 function parentIdOf(obj, src, assoc) {

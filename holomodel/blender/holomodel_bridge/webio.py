@@ -65,6 +65,18 @@ def ensure_ids(objs):
             fixed += 1
         if o.get('holo_name') != o.name:
             o['holo_name'] = o.name
+        # Which THING it is a piece of, for the page to move things apart from one another: the collection it
+        # was built into (the prompt has Fable name one after each thing it makes), else its outermost parent.
+        # (not Blender's own default 'Collection': everything lands there unless somebody chose otherwise, so it
+        # says nothing - the page then groups those parts by whether they touch)
+        col = next((c.name for c in o.users_collection
+                    if c is not bpy.context.scene.collection and not c.name.startswith('Collection')), '')
+        top = o
+        while top.parent is not None:
+            top = top.parent
+        thing = col or (top.name if top is not o else '')
+        if o.get('holo_thing') != thing:
+            o['holo_thing'] = thing
         seen.add(o['holo_id'])
     return fixed
 

@@ -13,7 +13,7 @@ import { canvas, rect, boxDepth } from './view.js';
 import { input } from './input/state.js';
 import { S } from './settings.js';
 import { model, parts, beginEdit, beginMove, cancelEdit, discardEdit, endGrab, clampPosition,
-         setTransform, setGestureFlush } from './model.js';
+         setTransform, setGestureFlush, rememberStep } from './model.js';
 import { highlight } from './scene/highlight.js';
 import { updateViz } from './handviz.js';
 import * as sculpt from './sculpting.js';
@@ -117,6 +117,56 @@ function worldNormal(hit) {
   return n.dot(raycaster.ray.direction) > 0 ? n.negate() : n;   // face the viewer (inside of open surfaces)
 }
 
+// ---------- one THING among several ----------
+// A scene can hold several things - a cube, then a teapot beside it - and they are not one object: a hand takes
+// hold of the one it is on, and move / rotate / scale / zoom act on THAT, not on the table and everything on it.
+// (With a single thing in the scene nothing here runs, and the tools act on the model as they always have.)
+//
+// The gesture is worked out in world centimetres, as a change D_world to the thing as it was when it was taken:
+// a translation, a turn about the vertical through its middle, a scaling about its middle. The parts live in the
+// glTF root's frame (metres), so each part's matrix becomes (W^-1 D_world W) x what it was, W being the root's
+// world matrix. When the hand lets go, that same root-frame change is posted to Blender (/api/blender/xform),
+// which applies it to the objects themselves - so the next export, and the next thing Fable builds, find the
+// thing where it was left. Undo puts the parts back and posts the inverse.
+const _m = new THREE.Matrix4(), _inv = new THREE.Matrix4();
+function thingStart(mesh) {
+  const part = parts.ofMesh(mesh);
+  if (!part || parts.thingCount() < 2) return null;
+  const members = parts.thingOf(part).filter(p => p.mesh.visible);
+  if (!members.length) return null;
+  for (const p of members) p.mesh.updateMatrix();
+  const box = new THREE.Box3();
+  for (const p of members) box.expandByObject(p.mesh);
+  return { members, m0: members.map(p => p.mesh.matrix.clone()), centre0: box.getCenter(new THREE.Vector3()),
+           bottom0: box.min.y, dRoot: new THREE.Matrix4(), name: part.name };
+}
+function thingApply(thing, dWorld) {
+  const W = parts.root.matrixWorld;
+  thing.dRoot.copy(_inv.copy(W).invert()).multiply(dWorld).multiply(W);
+  thing.members.forEach((p, i) => {
+    _m.multiplyMatrices(thing.dRoot, thing.m0[i]).decompose(p.mesh.position, p.mesh.quaternion, p.mesh.scale);
+    p.mesh.updateMatrix();
+  });
+}
+const IDENTITY = new THREE.Matrix4();
+const isIdentity = m => m.elements.every((v, i) => Math.abs(v - IDENTITY.elements[i]) < 1e-6);
+async function thingSync(ids, dRoot, label) {
+  try {
+    const res = await fetch('/api/blender/xform', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                                     body: JSON.stringify({ ids, matrix: dRoot.elements }) });
+    if (!res.ok) { const r = await res.json().catch(() => ({})); notify(`${label} moved here, but Blender did not take it: ${r.message || res.status}`); }
+  } catch (e) { notify(`${label} moved here, but Blender could not be reached`); }
+}
+function thingCommit(thing) {
+  if (isIdentity(thing.dRoot)) return;
+  const ids = thing.members.map(p => p.id), done = thing.dRoot.clone(), members = thing.members, before = thing.m0;
+  rememberStep({ undo() {
+    members.forEach((p, i) => { before[i].decompose(p.mesh.position, p.mesh.quaternion, p.mesh.scale); p.mesh.updateMatrix(); });
+    thingSync(ids, done.clone().invert(), thing.name);
+  } });
+  thingSync(ids, done, thing.name);
+}
+
 // ---------- one-hand gestures ----------
 function startAction(p, target, now) {
   const root = model.group, base = { pid: p.id, root, dist: target.dist, handZ0: p.handZ, t0: now };
@@ -145,7 +195,16 @@ function startAction(p, target, now) {
   // One tool, one property, one number on the badge. A gesture that changed two things at once was
   // quicker to reach and impossible to describe: "pull it toward you" meant nearer in one tool and
   // bigger in another, and the only way to know which you had just done was to look at the model.
-  const hand3 = spatial() && p.grip ? { grip0: p.grip.clone(), centre0: modelCentre() } : null;
+  const thing = thingStart(target.mesh);
+  const hand3 = spatial() && p.grip ? { grip0: p.grip.clone(), centre0: thing ? thing.centre0.clone() : modelCentre() } : null;
+  if (thing) {
+    // one thing of several: every tool acts on it alone, by the hand itself where there is one, else by the ray
+    action = { ...base, kind: 'thing', tool: tool.mode, thing, hand3, mesh: null,
+               aim0: rayPoint(p, target.dist).clone(), turn: 0,
+               angPrev: hand3 ? headingAbout(hand3.grip0, thing.centre0) : null,
+               r0: hand3 ? hand3.grip0.distanceTo(thing.centre0) : 0 };
+    return true;
+  }
   if (tool.mode === 'rotate') {
     beginEdit();                                    // rotation is a property of the thing: undoable
     action = { ...base, kind: 'turn', rot0: model.rotY, aim0: rayPoint(p, target.dist).clone(), hand3,
@@ -166,8 +225,36 @@ function startAction(p, target, now) {
   return true;
 }
 
+function updateThing(p) {
+  const a = action, c = a.thing.centre0, d = new THREE.Matrix4();
+  const about = m => new THREE.Matrix4().makeTranslation(c.x, c.y, c.z).multiply(m).multiply(new THREE.Matrix4().makeTranslation(-c.x, -c.y, -c.z));
+  if (a.tool === 'rotate') {
+    if (a.hand3 && p.grip) {
+      const ang = headingAbout(p.grip, c);
+      if (ang !== null && a.angPrev !== null) { const k = ang - a.angPrev; a.turn += Math.atan2(Math.sin(k), Math.cos(k)); }
+      a.angPrev = ang;
+    } else a.turn = (rayPoint(p, a.dist).x - a.aim0.x) * TURN_PER_CM;
+    d.copy(about(new THREE.Matrix4().makeRotationY(a.turn)));
+  } else if (a.tool === 'scale') {
+    const s = a.hand3 && p.grip && a.r0 >= MIN_RADIUS_CM ? Math.max(0.2, p.grip.distanceTo(c) / a.r0)
+      : Math.pow(2, (p.handZ - a.handZ0) / SCALE_DOUBLE_CM);
+    d.copy(about(new THREE.Matrix4().makeScale(s, s, s)));
+  } else if (a.tool === 'zoom') {
+    d.makeTranslation(0, 0, (p.handZ - a.handZ0) * (a.hand3 ? 1 : PUSH_GAIN));
+  } else {
+    // move: with the hand, in three dimensions; by the ray, across the picture with its depth held
+    const t = a.hand3 && p.grip ? p.grip.clone().sub(a.hand3.grip0) : rayPoint(p, a.dist).sub(a.aim0).setZ(0);
+    const to = clampPosition(c.clone().add(t));          // across and toward you: its middle stays on the stage
+    const dy = Math.min(Math.max(t.y, rect.y0 - a.thing.bottom0), rect.y1 - 1 - c.y);   // and its underside on the floor
+    d.makeTranslation(to.x - c.x, dy, to.z - c.z);
+  }
+  thingApply(a.thing, d);
+  p.end = p.grip ? p.grip.clone() : rayPoint(p, a.dist);
+}
+
 function updateAction(p) {
   const root = action.root;
+  if (action.kind === 'thing') return updateThing(p);
   if (action.kind === 'stroke') {
     // Every frame, not every hand sample: the engine does its own spacing along the stroke, so a
     // fast drag lays down as many dabs as the distance calls for and a still hand lays down none.
@@ -252,6 +339,7 @@ function updateAction(p) {
 function changed(a) {
   const moved = (p, q, eps) => p.distanceTo(q) > eps;
   if (a.kind === 'stroke') return !!a.moved;
+  if (a.kind === 'thing') return !isIdentity(a.thing.dRoot);
   if (a.kind === 'grab' || a.kind === 'zoom') return moved(a.root.position, a.startPos, 0.01);
   if (a.kind === 'turn') return Math.abs(model.rotY - a.rot0) > 1e-3;
   if (a.kind === 'scale') return Math.abs(model.userScale - a.scale0) > 1e-4;
@@ -270,6 +358,7 @@ function endAction() {
                                              : 'Nothing sculpted there — pinch on the model and drag');
     return;
   }
+  if (a.kind === 'thing') { thingCommit(a.thing); return; }     // its own undo step, and Blender is told
   if (!changed(a)) discardEdit();
   else endGrab();
 }
@@ -286,6 +375,7 @@ function cancelAction() {
   // A stroke cannot be thrown away as if it never happened - the clay has already moved - so it is
   // banked like any other stroke and stays undoable.
   if (a.kind === 'stroke') { sculpt.end({ timeMs: performance.now() }); return; }
+  if (a.kind === 'thing') { thingApply(a.thing, IDENTITY); return; }        // back where it was; nothing was sent
   cancelEdit();
 }
 
@@ -392,9 +482,10 @@ export function updateInteraction() {
         // Fingers AT the model have hold of it even when the line from the eye through them misses - taking it
         // from the side, or from behind. (Not for the brushes: a stroke has to land on a surface.)
         if (!target && spatial() && p.grip && !SCULPT_TOOLS.has(tool.mode) && meshes.length) {
-          const box = new THREE.Box3().setFromObject(model.group);
-          if (box.distanceToPoint(p.grip) <= REACH_CM)
-            target = { mesh: meshes[0], point: p.grip.clone(), dist: eye.distanceTo(p.grip) };
+          // ...and of several things, the one the fingers are nearest
+          let best = null, bestD = REACH_CM;
+          for (const m of meshes) { const dist = new THREE.Box3().setFromObject(m).distanceToPoint(p.grip); if (dist <= bestD) { best = m; bestD = dist; } }
+          if (best) target = { mesh: best, point: p.grip.clone(), dist: eye.distanceTo(p.grip) };
         }
         if (target) { per[p.id].consumed = !startAction(p, target, now); break; }
       }
@@ -413,8 +504,9 @@ export function updateInteraction() {
       brush = { point, normal, radius: tool.brush };
     }
   }
-  highlight(meshes, { hovered: action ? null : hovered, active: action?.mesh || null,
-                      all: action?.kind === 'grab' || action?.kind === 'two' });
+  const heldThing = action?.kind === 'thing' ? action.thing.members.map(q => q.mesh) : null;
+  highlight(heldThing || meshes, { hovered: action ? null : hovered, active: action?.mesh || null,
+                                   all: !!heldThing || action?.kind === 'grab' || action?.kind === 'two' });
   updateViz(ps.map(p => ({ ...p, end: p.end || eye.clone() })), eye, brush);
 }
 

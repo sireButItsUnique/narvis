@@ -85,6 +85,8 @@ function placementStep(mesh = null) {
   };
 }
 export function remember(mesh = null) { push(placementStep(mesh)); }
+// an undo step of somebody else's making (interaction.js: one thing moved apart from the rest)
+export function rememberStep(step) { push(step); }
 
 export function undo() {
   flushGesture();
