@@ -73,6 +73,18 @@ export const hoveredMesh = () => lastHover.mesh;
 
 const rayPoint = (p, t) => input.eye.clone().addScaledVector(p.gripDir, t);
 
+// On a desk the model is behind a screen and the hand is in front of it: the hand can only POINT, so every
+// tool was built on the ray from the eye through the fingers, sliding the model across the picture with its
+// depth locked. On the hologram rig the hand and the model are in the same cubic foot of air (input.spatial,
+// set by input/bridge.js). There the ray is the wrong tool - it left a teapot that would only go left and
+// right - and each gesture follows the hand itself instead: carry it in three dimensions, turn it by going
+// round it, stretch it by pulling away from its middle, and take hold of it by being AT it.
+const spatial = () => input.spatial === true && input.mode === 'camera';
+const REACH_CM = 4;             // fingers this near the model's box have hold of it, wherever the eye is
+const MIN_RADIUS_CM = 3;        // nearer the model's axis than this, 'round it' and 'away from it' are noise
+const modelCentre = () => new THREE.Box3().setFromObject(model.group).getCenter(new THREE.Vector3());
+const headingAbout = (grip, c) => (Math.hypot(grip.x - c.x, grip.z - c.z) >= MIN_RADIUS_CM ? Math.atan2(-(grip.z - c.z), grip.x - c.x) : null);
+
 function readPointers() {
   const eye = input.eye;
   if (input.mode === 'mouse') {   // the mouse is one hand: drag = pinch, wheel while dragging = push/pull
@@ -118,19 +130,23 @@ function startAction(p, target, now) {
   // One tool, one property, one number on the badge. A gesture that changed two things at once was
   // quicker to reach and impossible to describe: "pull it toward you" meant nearer in one tool and
   // bigger in another, and the only way to know which you had just done was to look at the model.
+  const hand3 = spatial() && p.grip ? { grip0: p.grip.clone(), centre0: modelCentre() } : null;
   if (tool.mode === 'rotate') {
     beginEdit();                                    // rotation is a property of the thing: undoable
-    action = { ...base, kind: 'turn', rot0: model.rotY, aim0: rayPoint(p, target.dist).clone() };
+    action = { ...base, kind: 'turn', rot0: model.rotY, aim0: rayPoint(p, target.dist).clone(), hand3,
+               turn: 0, angPrev: hand3 ? headingAbout(hand3.grip0, hand3.centre0) : null };
   } else if (tool.mode === 'scale') {
     beginEdit();                                    // so is size
-    action = { ...base, kind: 'scale', scale0: model.userScale };
+    action = { ...base, kind: 'scale', scale0: model.userScale, hand3,
+               r0: hand3 ? hand3.grip0.distanceTo(hand3.centre0) : 0 };
   } else if (tool.mode === 'zoom') {
     // Where it stands is not what it is: no undo step. See model.beginMove().
     beginMove();
-    action = { ...base, kind: 'zoom', startPos: root.position.clone() };
+    action = { ...base, kind: 'zoom', startPos: root.position.clone(), hand3 };
   } else {
     beginMove();
-    action = { ...base, kind: 'grab', startPos: root.position.clone(), offset: root.position.clone().sub(rayPoint(p, target.dist)) };
+    action = { ...base, kind: 'grab', startPos: root.position.clone(), hand3,
+               offset: hand3 ? root.position.clone().sub(hand3.grip0) : root.position.clone().sub(rayPoint(p, target.dist)) };
   }
   return true;
 }
@@ -152,6 +168,17 @@ function updateAction(p) {
     // A turntable, and nothing but: how far your hand travels ACROSS the model is how far it turns.
     // TURN_PER_CM is set so a comfortable 20 cm sweep is most of a half turn, which is as much as
     // anyone wants to do without letting go.
+    if (action.hand3 && p.grip) {
+      // round it: the model turns by the angle your hand has gone about its axis, one for one - the way a
+      // thing on a turntable is turned by its rim. Summed frame by frame so it cannot jump at 180 degrees,
+      // and held while the hand is over the axis, where the angle means nothing.
+      const ang = headingAbout(p.grip, action.hand3.centre0);
+      if (ang !== null && action.angPrev !== null) { const d = ang - action.angPrev; action.turn += Math.atan2(Math.sin(d), Math.cos(d)); }
+      action.angPrev = ang;
+      setTransform({ rotY: action.rot0 + action.turn, userScale: model.userScale, position: root.position.clone() });
+      p.end = p.grip.clone();
+      return;
+    }
     const at = rayPoint(p, action.dist);
     setTransform({ rotY: action.rot0 + (at.x - action.aim0.x) * TURN_PER_CM,
                    userScale: model.userScale, position: root.position.clone() });
@@ -162,6 +189,13 @@ function updateAction(p) {
     // How BIG the thing is. It does not move: the model stands where it stood, your distance to it
     // is unchanged, the room and the grid squares behind it do not shift, and a 10 cm teapot
     // becomes a 20 cm teapot in the same room. Pull it SCALE_DOUBLE_CM toward you and it doubles.
+    if (action.hand3 && p.grip && action.r0 >= MIN_RADIUS_CM) {
+      // stretch it: take it by the edge and pull away from its middle, and the edge comes with your fingers
+      setTransform({ rotY: model.rotY, position: root.position.clone(),
+                     userScale: action.scale0 * Math.max(0.2, p.grip.distanceTo(action.hand3.centre0) / action.r0) });
+      p.end = p.grip.clone();
+      return;
+    }
     setTransform({ rotY: model.rotY, position: root.position.clone(),
                    userScale: action.scale0 * Math.pow(2, (p.handZ - action.handZ0) / SCALE_DOUBLE_CM) });
     return;
@@ -173,7 +207,7 @@ function updateAction(p) {
     // and the screen corners, so there is no field of view to widen, and inventing one would stop
     // the picture matching where your head is. Sideways is locked, so a zoom cannot drift.
     const wanted = action.startPos.clone();
-    wanted.z += (p.handZ - action.handZ0) * PUSH_GAIN;
+    wanted.z += (p.handZ - action.handZ0) * (action.hand3 ? 1 : PUSH_GAIN);   // in the hand, it moves WITH the hand
     const zWanted = wanted.z;
     root.position.lerp(clampPosition(wanted), 0.5);
     // Pop-out is what allows it past the screen. It is off by default and invisible, so a pull that
@@ -185,6 +219,13 @@ function updateAction(p) {
   if (action.kind === 'grab') {
     // Carry it about the picture. The depth is held where it was - bringing it nearer is zoom, and
     // that is its own tool now, so a move can never quietly resize what you are looking at.
+    if (action.hand3 && p.grip) {
+      // in the hand: it goes where the fingers go, up, across and toward you alike, keeping the hold it was
+      // taken by. (clampPosition keeps it on the stage and above the floor.)
+      root.position.lerp(clampPosition(p.grip.clone().add(action.offset)), 0.5);
+      p.end = p.grip.clone();
+      return;
+    }
     const wanted = rayPoint(p, action.dist).add(action.offset);
     wanted.z = action.startPos.z;
     root.position.lerp(clampPosition(wanted), 0.5);
@@ -328,8 +369,15 @@ export function updateInteraction() {
       for (const p of ps) {
         if (!p.onset || per[p.id].consumed) continue;
         const aim = per[p.id].aim;
-        const target = p.hit ? { mesh: p.hit.object, point: p.hit.point, dist: p.hit.distance }
+        let target = p.hit ? { mesh: p.hit.object, point: p.hit.point, dist: p.hit.distance }
           : input.mode === 'camera' && aim && now - aim.t < AIM_MS && meshes.includes(aim.mesh) ? aim : null;
+        // Fingers AT the model have hold of it even when the line from the eye through them misses - taking it
+        // from the side, or from behind. (Not for the brushes: a stroke has to land on a surface.)
+        if (!target && spatial() && p.grip && !SCULPT_TOOLS.has(tool.mode) && meshes.length) {
+          const box = new THREE.Box3().setFromObject(model.group);
+          if (box.distanceToPoint(p.grip) <= REACH_CM)
+            target = { mesh: meshes[0], point: p.grip.clone(), dist: eye.distanceTo(p.grip) };
+        }
         if (target) { per[p.id].consumed = !startAction(p, target, now); break; }
       }
     }

@@ -103,6 +103,7 @@ export function writeEye(eyeRig, tracked, now) {
   if (tracked) input.faceSeenAt = now;
 }
 export function writeHand(s, pts, pinch, now) {
+  input.spatial = true;                  // this hand is WHERE the model is, not in front of a screen: interaction.js
   const h = input.hands[0], other = input.hands[1];
   other.active = false; other.pinch = false; other.jointsWorld = null;
   if (!pts) {
