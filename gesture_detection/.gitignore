@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# recordings of the rig (large, and they are video of whoever was at it) and traces made from them
+*.svo
+*.svo2
+*.pkl

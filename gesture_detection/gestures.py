@@ -19,14 +19,36 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, List, Optional, Tuple
 
 import numpy as np
 
+#: Position-smoothing presets, selectable with --smoothing.
+#:
+#: Measured on a stationary hand with anisotropic noise (2 mm in X/Y from
+#: pixels, 8 mm in Z from disparity) and 5% bad-depth samples. X RMS error /
+#: worst excursion / when a 250 ms swipe reaches 90% of its travel:
+#:
+#:   no stabilisation   52.5 mm   469 mm   250 ms
+#:   responsive         14.1 mm   102 mm   250 ms
+#:   balanced            0.6 mm     3 mm   267 ms
+#:   steady              0.6 mm     3 mm   300 ms
+#:
+#: Two mechanisms, contributing separately: rejecting lone impulses does most
+#: of the work (52 -> 14 mm), the median tap finishes it (14 -> 0.6 mm). All
+#: three presets still detect a standard swipe, which is the constraint that
+#: matters -- see test_every_smoothing_preset_still_detects_a_swipe.
+SMOOTHING_PRESETS = {
+    "responsive": dict(min_cutoff=1.5, beta=6.0, median_taps=1, vel_deadband=0.02),
+    "balanced": dict(min_cutoff=1.0, beta=4.0, median_taps=3, vel_deadband=0.03),
+    "steady": dict(min_cutoff=0.6, beta=2.0, median_taps=5, vel_deadband=0.05),
+}
+
 __all__ = [
-    "OneEuroFilter", "Vec3Filter",
+    "OneEuroFilter", "Vec3Filter", "SMOOTHING_PRESETS",
     "PinchEvent", "SwipeEvent", "PresenceEvent", "HandState",
-    "PinchTracker", "SwipeDetector", "HandTracker", "HandRegistry",
+    "PinchTracker", "SwipeDetector", "HandTracker", "OneHand",
+    "pinch_gaps", "fuse_gaps", "tracking_confidence",
 ]
 
 
@@ -93,10 +115,24 @@ class Vec3Filter:
     # still sits at the 1 Hz minimum cutoff and stays rock steady.
     def __init__(self, min_cutoff: float = 1.0, beta: float = 4.0,
                  d_cutoff: float = 1.0, vel_tau: float = 0.06,
-                 max_dt: float = 0.15):
-        self._f = [OneEuroFilter(min_cutoff, beta, d_cutoff, max_dt) for _ in range(3)]
+                 max_dt: float = 0.15, median_taps: int = 3,
+                 max_step_speed: float = 5.0, vel_deadband: float = 0.03,
+                 z_scale: float = 0.5):
+        # Z gets a lower cutoff than X and Y. X and Y come from pixel
+        # coordinates and are precise; Z comes from disparity or a depth map
+        # and carries error that grows as Z^2. Filtering all three identically
+        # means either X/Y lag for no reason or Z stays noisy.
+        self._f = [OneEuroFilter(min_cutoff, beta, d_cutoff, max_dt),
+                   OneEuroFilter(min_cutoff, beta, d_cutoff, max_dt),
+                   OneEuroFilter(min_cutoff * z_scale, beta * z_scale,
+                                 d_cutoff, max_dt)]
         self._vel_tau = vel_tau
         self._max_dt = max_dt
+        self._median_taps = max(1, median_taps)
+        self._raw: Deque[np.ndarray] = deque(maxlen=self._median_taps)
+        self._max_step_speed = max_step_speed
+        self._vel_deadband = vel_deadband
+        self._held: Optional[np.ndarray] = None   # a rejected outlier, pending
         self._p_prev: Optional[np.ndarray] = None
         self._t_prev: Optional[float] = None
         self.position: Optional[np.ndarray] = None
@@ -107,12 +143,40 @@ class Vec3Filter:
             f.reset()
         self._p_prev = None
         self._t_prev = None
+        self._raw.clear()
+        self._held = None
         self.position = None
         self.velocity = np.zeros(3)
 
     def update(self, p: np.ndarray, t: float) -> Tuple[np.ndarray, np.ndarray]:
         p = np.asarray(p, dtype=np.float64)
-        f = np.array([self._f[i](float(p[i]), t) for i in range(3)])
+
+        gap = self._t_prev is None or (t - self._t_prev) > self._max_dt
+        if gap:
+            # samples from before a dropout must not be medianed with samples
+            # from after it -- they describe different moments
+            self._raw.clear()
+            self._held = None
+
+        # Reject a lone impulse. One Euro alone cannot: a spike looks exactly
+        # like fast motion, so the filter widens its cutoff and passes it
+        # through. A second jump in the same direction is real -- the hand was
+        # re-acquired somewhere else -- so only the first is held back.
+        if not gap and self._raw and self._t_prev is not None:
+            step = float(np.linalg.norm(p - self._raw[-1])) / max(t - self._t_prev, 1e-6)
+            if step > self._max_step_speed and self._held is None:
+                self._held = p
+                return (self.position if self.position is not None else p,
+                        self.velocity)
+
+        self._held = None
+        self._raw.append(p)
+        # median across the last few raw samples, per axis: kills single-frame
+        # outliers before they ever reach the smoother
+        src = (np.median(np.array(self._raw), axis=0)
+               if len(self._raw) >= self._median_taps else p)
+
+        f = np.array([self._f[i](float(src[i]), t) for i in range(3)])
         if self._p_prev is not None and self._t_prev is not None:
             dt = t - self._t_prev
             if 0.0 < dt <= self._max_dt:
@@ -121,6 +185,9 @@ class Vec3Filter:
                 self.velocity = a * v + (1.0 - a) * self.velocity
             else:
                 self.velocity = np.zeros(3)
+        # a resting hand should read as resting, not as drifting slowly
+        if float(np.linalg.norm(self.velocity)) < self._vel_deadband:
+            self.velocity = np.zeros(3)
         self._p_prev, self._t_prev = f, t
         self.position = f
         return f, self.velocity
@@ -225,6 +292,51 @@ def _xyz(v) -> Optional[list]:
 # pinch
 # --------------------------------------------------------------------------
 
+_WRIST, _THUMB_TIP, _INDEX_TIP, _MIDDLE_MCP, _MIDDLE_TIP = 0, 4, 8, 9, 12
+
+
+def pinch_gaps(landmarks) -> Tuple[float, float]:
+    """(pinch, grab): two thumb-to-fingertip gaps, each as a fraction of the
+    palm's length (wrist to middle knuckle), from any 21 metric landmarks.
+
+    `pinch` is thumb to INDEX, the gesture. `grab` is thumb to whichever of
+    index and middle is nearer, for picking things up: people grab with either,
+    and seen from the fingertip end -- which is where this rig's camera sits --
+    one of the two is usually hiding behind the other, so the landmarker is
+    guessing at it. Asking for the nearer one asks for the one it can see.
+
+    Both are ratios of lengths on the same hand, so neither needs the hand's
+    distance; nan when the landmarks are not all there.
+    """
+    p = np.asarray(landmarks, dtype=float)
+    if p.shape != (21, 3) or not np.isfinite(p[[_WRIST, _THUMB_TIP, _INDEX_TIP,
+                                                 _MIDDLE_MCP, _MIDDLE_TIP]]).all():
+        return float("nan"), float("nan")
+    palm = max(float(np.linalg.norm(p[_WRIST] - p[_MIDDLE_MCP])), 1e-4)
+    index = float(np.linalg.norm(p[_THUMB_TIP] - p[_INDEX_TIP])) / palm
+    middle = float(np.linalg.norm(p[_THUMB_TIP] - p[_MIDDLE_TIP])) / palm
+    return index, min(index, middle)
+
+
+def fuse_gaps(views, solved: float = float("nan")) -> float:
+    """One gap from every measurement of it this frame.
+
+    `views` are the landmarker's own metric hands, one per camera view that
+    saw THIS hand: two independent looks at the same fingers, so their mean
+    halves the noise, and it is rare for both to lose the same fingertip
+    behind the thumb. `solved` is the gap on the reconstructed 3D joints. It
+    is only ever a referee -- the median of three -- because the thresholds
+    were tuned on the landmarker's hand, and the reconstruction's fingertips
+    are the joints its depth is least sure of; with fewer than two views there
+    is nothing for it to referee, and it is used only if there is nothing else.
+    """
+    v = [float(g) for g in views if g is not None and np.isfinite(g)]
+    if len(v) >= 2 and np.isfinite(solved):
+        return float(np.median(v + [float(solved)]))
+    if v:
+        return float(np.mean(v))
+    return float(solved)
+
 @dataclass
 class PinchTracker:
     """Hysteresis state machine over the normalised thumb/index gap.
@@ -295,6 +407,36 @@ class PinchTracker:
 
 
 # --------------------------------------------------------------------------
+# how far to trust this frame's hand
+# --------------------------------------------------------------------------
+
+def tracking_confidence(score: float, other_score: Optional[float] = None,
+                        n_triangulated: int = 0, n_joints: int = 21) -> float:
+    """One number in 0..1 for "how much should this frame's hand be believed",
+    for whoever draws the hand to gate on (the rig page holds the last good
+    pose while this is under its threshold).
+
+    Two things go into it, multiplied, because either one alone can sink a frame:
+
+      what the landmarker thinks -- its own score for the hand, averaged over
+        the views that saw it. It sags toward 0.5 when the hand is half out of
+        frame, blurred, or end-on enough to be ambiguous.
+      where the DEPTH came from -- with both views paired, the fraction of the
+        21 joints that triangulated, mapped to 0.5..1. With one view there is
+        no triangulation at all and the hand's distance is a guess from its
+        size, good to a few centimetres at best: that alone caps the frame at
+        0.5, so a threshold above 0.5 means "both lenses or hold still".
+
+    `other_score` is None when the other view did not see this hand.
+    """
+    paired = other_score is not None and np.isfinite(other_score)
+    view = float(np.mean([score, other_score])) if paired else float(score)
+    depth = 0.5 + 0.5 * float(np.clip(n_triangulated / max(n_joints, 1), 0.0, 1.0)) if paired else 0.5
+    out = float(np.clip(view, 0.0, 1.0)) * depth
+    return out if np.isfinite(out) else 0.0
+
+
+# --------------------------------------------------------------------------
 # swipe
 # --------------------------------------------------------------------------
 
@@ -329,7 +471,9 @@ class SwipeDetector:
     min_straightness: float = 0.70    # net / path length
     refractory: float = 0.50
     rearm_speed: float = 0.25         # must slow below this to fire again
-    max_speed: float = 12.0           # m/s; above this the track jumped, see feed()
+    # 5 m/s: a vigorous arm swing peaks near 4. Above it the tracked point did
+    # not move, its depth estimate did -- which live produced 7.9 m/s "swipes".
+    max_speed: float = 5.0            # m/s; above this the track jumped, see feed()
     # A hand that is moving fast enough to swipe is also moving fast enough to
     # motion-blur out of the landmarker's reach. The dropout is not noise, it
     # is evidence: see _try_bridge.
@@ -585,9 +729,11 @@ class HandTracker:
                  max_transition: float = 0.35, pinch_refractory: float = 0.35,
                  swipe_window: float = 0.35, min_speed: float = 0.55,
                  min_travel: float = 0.14, swipe_refractory: float = 0.50,
-                 mirror_x: bool = False, swipe_while_pinched: bool = True):
+                 mirror_x: bool = False, swipe_while_pinched: bool = True,
+                 smoothing: str = "balanced"):
         self.hand = hand
-        self.filt = Vec3Filter()
+        self.filt = Vec3Filter(**SMOOTHING_PRESETS.get(
+            smoothing, SMOOTHING_PRESETS["balanced"]))
         self.pinch = PinchTracker(hand=hand, close_thresh=close, open_thresh=open_,
                                   max_transition=max_transition,
                                   refractory=pinch_refractory)
@@ -646,6 +792,10 @@ class HandTracker:
 
         return events
 
+    def relabel(self, hand: str) -> None:
+        """Rename the hand without disturbing anything it has learned."""
+        self.hand = self.pinch.hand = self.swipe.hand = hand
+
     def state(self, t: float) -> HandState:
         return HandState(
             hand=self.hand, t=t, position=self.position, velocity=self.velocity,
@@ -655,34 +805,111 @@ class HandTracker:
         )
 
 
-class HandRegistry:
-    """Keeps a HandTracker per handedness label and emits presence events.
+class OneHand:
+    """The one hand being tracked: which detection it is, what it is called,
+    and whether it is there.
 
-    MediaPipe gives no stable track ids, so the label is the identity. That is
-    sound for two hands and breaks for two right hands in frame -- which the
-    landmarker will not report anyway.
+    There is exactly one track. MediaPipe's handedness label used to be the
+    identity, a tracker per label, and that made two hands out of one in two
+    ways: the label flickers, so a single hand spent its life split between
+    a "Left" tracker and a "Right" one, each with half a trajectory; and the
+    two camera views are labelled independently, so when they disagreed the
+    same hand was tracked twice in the same frame.
+
+    So identity is where the hand is, not what it is called. A detection is
+    the tracked hand if it is where that hand could have got to:
+
+        close by                     -> yes, whatever its label says
+        further, within reach of a   -> yes if its label agrees. This is a fast
+        fast arm, and not the rival     swipe, or one that blurred the hand out
+                                        of the landmarker and back in elsewhere
+        anything else                -> no. It becomes the RIVAL, and whatever
+                                        follows on from the rival is refused
+                                        too, until the tracked hand is lost
+
+    The rival is what makes one track safe. With a tracker per label, a
+    landmarker hopping between two hands fed two separate trajectories. With
+    one tracker it would feed both hands into the same trajectory, and the
+    jump between them is exactly what a swipe looks like -- including to the
+    gap-bridge, which exists to believe a hand that vanishes and reappears
+    somewhere else. A second hand therefore waits until the first has been
+    gone for `lost_after`, which is longer than any gap the bridge will span,
+    and then starts a new track with a new tracker.
+
+    The label is decided by a decaying vote over the track's life, so events
+    carry a steady name and a single wrong frame cannot change it. When the
+    vote does settle the other way the track is renamed in place: same hand,
+    same trajectory, no HAND_LOST.
+
+    Positions here are rough lateral ones in metres -- landmarks scaled by
+    apparent size -- because identity has to be decided before depth is known.
     """
 
-    def __init__(self, lost_after: float = 0.50, **tracker_kwargs):
+    def __init__(self, lost_after: float = 0.50, near: float = 0.12,
+                 slow: float = 1.0, patience: float = 0.10,
+                 max_speed: float = 3.0, label_decay: float = 0.9,
+                 relabel_at: float = 2.0, **tracker_kwargs):
         self.lost_after = lost_after
+        self.near = near                  # m; two hands closer than this are one
+        self.slow = slow                  # m/s allowed without the label agreeing,
+        self.patience = patience          #   for at most this long unseen
+        self.max_speed = max_speed        # m/s allowed when it does
+        self.label_decay = label_decay
+        self.relabel_at = relabel_at
         self._kwargs = tracker_kwargs
-        self.trackers: Dict[str, HandTracker] = {}
-        self._present: Dict[str, bool] = {}
+        self.tracker: Optional[HandTracker] = None
+        self._xy: Optional[np.ndarray] = None
+        self._t: float = -1e9
+        self._rival_xy: Optional[np.ndarray] = None
+        self._rival_t: float = -1e9
+        self._vote = 0.0                  # > 0 leans Right
 
-    def get(self, label: str, t: float) -> Tuple[HandTracker, Optional[PresenceEvent]]:
-        tr = self.trackers.get(label)
-        ev = None
-        if tr is None:
-            tr = self.trackers[label] = HandTracker(label, **self._kwargs)
-        if not self._present.get(label, False):
-            self._present[label] = True
-            ev = PresenceEvent("HAND_FOUND", label, t)
-        return tr, ev
+    @property
+    def present(self) -> bool:
+        return self.tracker is not None
+
+    def _within(self, xy, ref_xy, ref_t, t, speed, patience=None) -> bool:
+        dt = max(t - ref_t, 0.0)
+        if patience is not None:
+            dt = min(dt, patience)
+        return bool(np.linalg.norm(xy - ref_xy) <= self.near + speed * dt)
+
+    def claim(self, xy, label: str, t: float,
+              score: float = 1.0) -> Tuple[bool, Optional[PresenceEvent]]:
+        """Offer a detection. Returns (is it the tracked hand, HAND_FOUND or None)."""
+        xy = np.asarray(xy, dtype=np.float64)[:2]
+        lean = score if label == "Right" else -score
+
+        if self.tracker is None:
+            self.tracker = HandTracker(label, **self._kwargs)
+            self._xy, self._t, self._vote = xy, t, lean
+            self._rival_xy = None
+            return True, PresenceEvent("HAND_FOUND", label, t)
+
+        # "Close by" does not grow with absence. A hand that has not been seen
+        # for a third of a second could be anywhere -- and so could another one,
+        # so past a frame or two only the label can vouch for it.
+        mine = self._within(xy, self._xy, self._t, t, self.slow, self.patience)
+        if not mine:
+            rival = (self._rival_xy is not None and t - self._rival_t <= self.lost_after
+                     and self._within(xy, self._rival_xy, self._rival_t, t, self.slow,
+                                      self.patience))
+            mine = (not rival and label == self.tracker.hand
+                    and self._within(xy, self._xy, self._t, t, self.max_speed))
+        if not mine:
+            self._rival_xy, self._rival_t = xy, t
+            return False, None
+
+        self._xy, self._t = xy, t
+        self._vote = self._vote * self.label_decay + lean
+        leans = "Right" if self._vote > 0 else "Left"
+        if leans != self.tracker.hand and abs(self._vote) >= self.relabel_at:
+            self.tracker.relabel(leans)
+        return True, None
 
     def sweep(self, t: float) -> List[PresenceEvent]:
-        out = []
-        for label, tr in self.trackers.items():
-            if self._present.get(label) and t - tr.last_seen > self.lost_after:
-                self._present[label] = False
-                out.append(PresenceEvent("HAND_LOST", label, t, tr.position))
-        return out
+        if self.tracker is None or t - self._t <= self.lost_after:
+            return []
+        lost = PresenceEvent("HAND_LOST", self.tracker.hand, t, self.tracker.position)
+        self.tracker = None
+        return [lost]
