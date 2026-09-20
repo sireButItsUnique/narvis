@@ -2,6 +2,21 @@
  * Portions adapted from SculptGL by Stéphane Ginier.
  * Copyright (c) 2019 Stéphane GINIER
  * Licensed under the MIT License; see ./LICENSE-SculptGL.txt.
+ *
+ * HOLOMODEL FORK (still MIT). Upstream: three.js r186 examples/jsm/misc/SculptorMesh.js.
+ * Every change is tagged with "HOLOMODEL:" so a diff against upstream stays readable:
+ *  1. initFromWelded(positions, triangles, triRenderMap, faceMaterials): take an already welded
+ *     proxy (binding.js welds by Blender _vid), so proxy vertex i keeps Blender's vertex id.
+ *  2. Float32Array mask per vertex (Blender's .sculpt_mask lives on the proxy).
+ *  3. Lazy per-stroke original positions/normals (origP/origN) keyed by a stroke stamp; this is
+ *     both the brushes' "original data" and the undo record (Blender does the same, sculpt_undo.cc).
+ *  4. Per-face material id, so a merged multi-material part can still be split on export.
+ *  5. Angle-weighted vertex normals, which is what Blender's mesh normals are; the upstream
+ *     area-weighted average moved parity by more than the whole brush tolerance.
+ *  6. The octree root is sized for DEFORMATION, not for the rest pose (see _computeOctree): a pull
+ *     that leaves the root box costs a full synchronous rebuild inside the dab.
+ *  7. Both octree walks reject a non-finite query up front, so a NaN from the hand tracker degrades
+ *     to "no hit" instead of collecting every face in the mesh.
  */
 
 import {
@@ -10,10 +25,19 @@ import {
 	getMemory
 } from './SculptorUtils.js';
 
-const OCTREE_MAX_DEPTH = 8;
+// HOLOMODEL: 8 upstream. The root split box now spans OCTREE_ROOT_REACH half-diagonals rather than
+// the rest-pose bounding box (see _computeOctree), which costs about two levels of resolution, so
+// the depth limit goes up by two to keep leaves the same size.
+const OCTREE_MAX_DEPTH = 10;
 const OCTREE_MAX_FACES = 100;
 // A depth-first walk retains at most seven siblings for each level.
 const OCTREE_STACK = new Array( 1 + 7 * OCTREE_MAX_DEPTH ).fill( null );
+// HOLOMODEL: how far past the rest-pose centre the root split box reaches, in half-diagonals.
+// Anything a face centre can be dragged to inside this box is re-filed incrementally; outside it,
+// addFace fails and the whole octree is rebuilt synchronously inside the dab (measured: 26 ms at
+// 150k faces, 260 ms at 400k, against a 6 ms dab budget). Pulling clay a third of the model's own
+// size out of it is the product's core gesture, so the rest-pose box is far too tight.
+const OCTREE_ROOT_REACH = 3;
 const RELATIVE_WELD_TOLERANCE = 1e-7;
 
 function queueLeaf( leaves, leaf ) {
@@ -460,7 +484,20 @@ class OctreeCell {
 	collectIntersectRay( vNear, eyeDir, collectFaces, leavesHit ) {
 
 		const vx = vNear[ 0 ], vy = vNear[ 1 ], vz = vNear[ 2 ];
-		const irx = 1.0 / eyeDir[ 0 ], iry = 1.0 / eyeDir[ 1 ], irz = 1.0 / eyeDir[ 2 ];
+		const dirX = eyeDir[ 0 ], dirY = eyeDir[ 1 ], dirZ = eyeDir[ 2 ];
+		// HOLOMODEL: a NaN anywhere in the ray makes every slab comparison below false, so the walk
+		// descends into all eight children at every level and hands back the whole mesh to be
+		// brute-force ray-tested (measured: 40 ms per hover at 400k faces, 750x a good ray). The
+		// test has to be on the INPUTS: `tmax < 0 || tmin > tmax` must keep falling through on NaN,
+		// because a legitimate axis-aligned ray produces 0 * Infinity = NaN whenever it grazes a
+		// cell plane, and failing closed there loses real hits.
+		if ( dirX !== dirX || dirY !== dirY || dirZ !== dirZ || vx !== vx || vy !== vy || vz !== vz ) {
+
+			return collectFaces.slice( 0, 0 );
+
+		}
+
+		const irx = 1.0 / dirX, iry = 1.0 / dirY, irz = 1.0 / dirZ;
 		let acc = 0;
 		const stack = OCTREE_STACK;
 		stack[ 0 ] = this;
@@ -500,6 +537,14 @@ class OctreeCell {
 	collectIntersectSphere( vert, radiusSquared, collectFaces, leavesHit ) {
 
 		const vx = vert[ 0 ], vy = vert[ 1 ], vz = vert[ 2 ];
+		// HOLOMODEL: same guard as collectIntersectRay. A NaN radius returns every face; a NaN in
+		// the centre silently leaves that axis' distance at 0 and degrades the query to two axes.
+		if ( vx !== vx || vy !== vy || vz !== vz || ! ( radiusSquared >= 0 ) ) {
+
+			return collectFaces.slice( 0, 0 );
+
+		}
+
 		let acc = 0;
 		const stack = OCTREE_STACK;
 		stack[ 0 ] = this;
@@ -682,6 +727,17 @@ class SculptorMesh {
 		this._topologyVersion = 0;
 		this._tagFlag = 1;
 		this._sculptFlag = 1;
+
+		// HOLOMODEL additions.
+		this._mask = null;            // Float32Array, 0 = fully sculptable (Blender's .sculpt_mask)
+		this._origP = null;           // stroke-start positions, filled lazily on first touch
+		this._origN = null;           // stroke-start normals, same
+		this._origMask = null;        // stroke-start mask, same (so a mask stroke can be undone)
+		this._origStamp = null;       // Int32Array: which stroke stamped this vertex
+		this._strokeStamp = 0;
+		this._touched = [];           // vertices stamped during the current stroke (undo record)
+		this._faceMaterial = null;    // Uint16Array per face
+		this._triRenderMap = null;    // proxy face -> render triangle index
 
 	}
 
@@ -892,6 +948,17 @@ class SculptorMesh {
 		this._facePosInLeaf = new Uint32Array( triangleCount );
 		this._faceLeaf = new Array( triangleCount ).fill( null );
 
+		// HOLOMODEL: same per-vertex sculpt data as initFromWelded, so either entry point works.
+		this._mask = new Float32Array( vertexCount );
+		this._origP = new Float32Array( vertexDataLength );
+		this._origN = new Float32Array( vertexDataLength );
+		this._origMask = new Float32Array( vertexCount );
+		this._origStamp = new Int32Array( vertexCount );
+		this._strokeStamp = 0;
+		this._touched = [];
+		this._faceMaterial = new Uint16Array( triangleCount );
+		this._triRenderMap = null;
+
 		this._initTopology();
 		this._updateGeometry();
 
@@ -1019,11 +1086,16 @@ class SculptorMesh {
 
 	}
 
+	// HOLOMODEL: angle-weighted instead of the upstream plain average of face normals, because
+	// Blender's mesh vertex normals weigh each face by its corner angle and the brush maths reads
+	// these normals (area normal, Inflate direction, front-face test).
 	_updateVerticesNormal( iVerts ) {
 
 		const nAr = this._normalsXYZ;
 		const renderNAr = this._renderNormalsXYZ;
 		const faceNormals = this._faceNormals;
+		const fAr = this._facesABCD;
+		const vAr = this._verticesXYZ;
 		const ringFaces = this._vertRingFace;
 		const full = iVerts === undefined;
 		const nbVerts = full ? this._nbVertices : iVerts.length;
@@ -1032,21 +1104,41 @@ class SculptorMesh {
 
 			const ind = full ? i : iVerts[ i ];
 			const vrf = ringFaces[ ind ];
+			const ind3 = ind * 3;
+			const px = vAr[ ind3 ], py = vAr[ ind3 + 1 ], pz = vAr[ ind3 + 2 ];
 			let nx = 0, ny = 0, nz = 0;
+
 			for ( let j = 0, l = vrf.length; j < l; ++ j ) {
 
-				const id = vrf[ j ] * 3;
-				nx += faceNormals[ id ];
-				ny += faceNormals[ id + 1 ];
-				nz += faceNormals[ id + 2 ];
+				const iFace = vrf[ j ];
+				const idf = iFace * 4;
+				const a = fAr[ idf ], b = fAr[ idf + 1 ], c = fAr[ idf + 2 ];
+				// The two other corners of this triangle.
+				const o1 = a === ind ? b : ( b === ind ? c : a );
+				const o2 = a === ind ? c : ( b === ind ? a : b );
+				const o13 = o1 * 3, o23 = o2 * 3;
+				let e1x = vAr[ o13 ] - px, e1y = vAr[ o13 + 1 ] - py, e1z = vAr[ o13 + 2 ] - pz;
+				let e2x = vAr[ o23 ] - px, e2y = vAr[ o23 + 1 ] - py, e2z = vAr[ o23 + 2 ] - pz;
+				const l1 = Math.sqrt( e1x * e1x + e1y * e1y + e1z * e1z );
+				const l2 = Math.sqrt( e2x * e2x + e2y * e2y + e2z * e2z );
+				if ( l1 === 0 || l2 === 0 ) continue;
+				e1x /= l1; e1y /= l1; e1z /= l1;
+				e2x /= l2; e2y /= l2; e2z /= l2;
+				let cosAngle = e1x * e2x + e1y * e2y + e1z * e2z;
+				if ( cosAngle > 1 ) cosAngle = 1; else if ( cosAngle < - 1 ) cosAngle = - 1;
+				const weight = Math.acos( cosAngle );
+
+				const idn = iFace * 3;
+				const fx = faceNormals[ idn ], fy = faceNormals[ idn + 1 ], fz = faceNormals[ idn + 2 ];
+				const fl = Math.sqrt( fx * fx + fy * fy + fz * fz );
+				if ( fl === 0 ) continue;
+				const w = weight / fl;
+				nx += fx * w;
+				ny += fy * w;
+				nz += fz * w;
 
 			}
 
-			const inverseCount = vrf.length > 0 ? 1.0 / vrf.length : 0;
-			const ind3 = ind * 3;
-			nx *= inverseCount;
-			ny *= inverseCount;
-			nz *= inverseCount;
 			nAr[ ind3 ] = nx;
 			nAr[ ind3 + 1 ] = ny;
 			nAr[ ind3 + 2 ] = nz;
@@ -1121,10 +1213,16 @@ class SculptorMesh {
 		const octree = new OctreeCell();
 		octree.resetNbFaces( this._nbFaces );
 		octree._setAabbLoose( xmin, ymin, zmin, xmax, ymax, zmax );
-		octree._setAabbSplit(
-			xmin - dx * 0.3, ymin - dy * 0.3, zmin - dz * 0.3,
-			xmax + dx * 0.3, ymax + dy * 0.3, zmax + dz * 0.3
-		);
+		// HOLOMODEL: upstream anchors the root split box to the rest pose (bbox + 30% of each
+		// extent). The split box is what decides WHERE a face is filed, and a face centre that
+		// leaves it makes addFace fail, which rebuilds the whole octree synchronously inside the
+		// dab. A 9 cm pull out of a 30 cm ball is enough to cross the upstream box. Queries test
+		// _aabbLoose, which grows on its own, so a roomier split box costs nothing but depth: give
+		// the root a cube of OCTREE_ROOT_REACH half-diagonals about the rest centre. Not Infinity -
+		// _constructChildren halves (min + max), which would be NaN.
+		const cx = ( xmin + xmax ) * 0.5, cy = ( ymin + ymax ) * 0.5, cz = ( zmin + zmax ) * 0.5;
+		const reach = Math.max( Math.hypot( dx, dy, dz ) * 0.5 * OCTREE_ROOT_REACH, thickness, 1e-6 );
+		octree._setAabbSplit( cx - reach, cy - reach, cz - reach, cx + reach, cy + reach, cz + reach );
 		octree.build( this );
 
 		this._octree = octree;
@@ -1209,6 +1307,11 @@ class SculptorMesh {
 
 			if ( newLeaf === undefined ) {
 
+				// The face centre left the root split box: nothing incremental can file it, so the
+				// whole octree is rebuilt. Returning early is only safe because _computeOctree
+				// re-files EVERY face (and clears _leavesToUpdate), including the ones this loop
+				// has not reached yet. HOLOMODEL: with the roomier root box above this is now the
+				// unbounded-stroke backstop rather than something an ordinary pull hits.
 				this._computeOctree();
 				return;
 
@@ -1471,6 +1574,156 @@ class SculptorMesh {
 			this._vertSculptFlags = this._resizeArray( this._vertSculptFlags, requiredCount );
 
 		}
+
+	}
+
+	// HOLOMODEL: build from data that binding.js has already welded, so vertex i stays Blender's
+	// _vid i. positions: Float32Array(3n); triangles: Uint32Array(3t) into those vertices;
+	// triRenderMap/faceMaterials are optional per-face side tables.
+	initFromWelded( positions, triangles, triRenderMap, faceMaterials ) {
+
+		this._tagFlag = 1;
+		this._sculptFlag = 1;
+
+		const vertexCount = positions.length / 3;
+		const triangleCount = triangles.length / 3;
+
+		if ( vertexCount === 0 || triangleCount === 0 ) {
+
+			throw new Error( 'SculptorMesh: initFromWelded needs at least one triangle.' );
+
+		}
+
+		const faces = new Uint32Array( triangleCount * 4 );
+		for ( let i = 0; i < triangleCount; ++ i ) {
+
+			const it = i * 3;
+			const idf = i * 4;
+			faces[ idf ] = triangles[ it ];
+			faces[ idf + 1 ] = triangles[ it + 1 ];
+			faces[ idf + 2 ] = triangles[ it + 2 ];
+			faces[ idf + 3 ] = TRI_INDEX;
+
+		}
+
+		this._nbVertices = vertexCount;
+		this._nbFaces = triangleCount;
+		this._topologyVersion = 0;
+		this._leavesToUpdate.length = 0;
+
+		this._verticesXYZ = positions instanceof Float32Array ? positions : new Float32Array( positions );
+		this._normalsXYZ = new Float32Array( vertexCount * 3 );
+		this._renderNormalsXYZ = new Float32Array( vertexCount * 3 );
+
+		this._facesABCD = faces;
+		this._trianglesABC = triangles instanceof Uint32Array ? triangles : new Uint32Array( triangles );
+		this._vertOnEdge = new Uint8Array( vertexCount );
+		this._vertTagFlags = new Int32Array( vertexCount );
+		this._vertSculptFlags = new Int32Array( vertexCount );
+		this._facesTagFlags = new Int32Array( triangleCount );
+		this._faceBoxes = new Float32Array( triangleCount * 6 );
+		this._faceNormals = new Float32Array( triangleCount * 3 );
+		this._faceCenters = new Float32Array( triangleCount * 3 );
+		this._facePosInLeaf = new Uint32Array( triangleCount );
+		this._faceLeaf = new Array( triangleCount ).fill( null );
+
+		this._mask = new Float32Array( vertexCount );
+		this._origP = new Float32Array( vertexCount * 3 );
+		this._origN = new Float32Array( vertexCount * 3 );
+		this._origMask = new Float32Array( vertexCount );
+		this._origStamp = new Int32Array( vertexCount );
+		this._strokeStamp = 0;
+		this._touched = [];
+		this._triRenderMap = triRenderMap ?? null;
+		this._faceMaterial = faceMaterials ?? new Uint16Array( triangleCount );
+
+		this._initTopology();
+		this._updateGeometry();
+
+	}
+
+	getMask() {
+
+		return this._mask;
+
+	}
+	getOrigPositions() {
+
+		return this._origP;
+
+	}
+	getOrigNormals() {
+
+		return this._origN;
+
+	}
+	// HOLOMODEL: the stroke-start mask of every stamped vertex, so a Mask stroke gets a real undo
+	// record instead of none at all (Blender pushes undo::Type::Mask there, sculpt.cc:3393).
+	getOrigMask() {
+
+		return this._origMask;
+
+	}
+	getTouched() {
+
+		return this._touched;
+
+	}
+	getFaceMaterials() {
+
+		return this._faceMaterial;
+
+	}
+	getTriRenderMap() {
+
+		return this._triRenderMap;
+
+	}
+
+	// HOLOMODEL: start a stroke; nothing is copied yet, the snapshot is taken per vertex on first
+	// touch (Blender saves an undo node the first time a BVH node is touched).
+	beginStrokeSnapshot() {
+
+		this._strokeStamp ++;
+		this._touched = [];
+		return this._strokeStamp;
+
+	}
+
+	// HOLOMODEL: make sure iVert's stroke-start position and normal are stored. Returns true the
+	// first time it is called for that vertex in this stroke.
+	stampOriginal( iVert ) {
+
+		if ( this._origStamp[ iVert ] === this._strokeStamp ) return false;
+
+		this._origStamp[ iVert ] = this._strokeStamp;
+		const i3 = iVert * 3;
+		const v = this._verticesXYZ;
+		const n = this._renderNormalsXYZ;
+		this._origP[ i3 ] = v[ i3 ];
+		this._origP[ i3 + 1 ] = v[ i3 + 1 ];
+		this._origP[ i3 + 2 ] = v[ i3 + 2 ];
+		this._origN[ i3 ] = n[ i3 ];
+		this._origN[ i3 + 1 ] = n[ i3 + 1 ];
+		this._origN[ i3 + 2 ] = n[ i3 + 2 ];
+		this._origMask[ iVert ] = this._mask[ iVert ];
+		this._touched.push( iVert );
+		return true;
+
+	}
+
+	// HOLOMODEL: true when iVert already carries this stroke's original data.
+	hasOriginal( iVert ) {
+
+		return this._origStamp[ iVert ] === this._strokeStamp;
+
+	}
+
+	// HOLOMODEL: public name for the partial rebuild after an edit (face normals and boxes, vertex
+	// normals, octree), so callers outside this file do not have to reach for a private method.
+	refreshGeometry( iFaces, iVerts ) {
+
+		this._updateGeometry( iFaces, iVerts );
 
 	}
 
