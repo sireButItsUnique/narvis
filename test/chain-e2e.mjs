@@ -95,11 +95,23 @@ try {
   check(await b.evaluate('!!window.__chain'), 'the page loaded and exposed its chain');
 
   // ---------- 1. fake cameras -> solver -> state.js ----------
+  // Wait for the page to finish standing the rig up rather than guessing how long it takes. On a busy
+  // machine (this file and test/cameras-e2e.mjs each drive their own headless browser on software GL)
+  // a fixed sleep caught it with three of the four cameras posed and the hands still on one view.
   await sleep(2500);
   let m = await b.metrics();
+  for (let i = 0; i < 30 && !(m.solver.cameras === 4 && m.handSource === 'stereo'); i++) {
+    await sleep(300);
+    m = await b.metrics();
+  }
   console.log(`      solver says: ${m.solver.readout}`);
   check(m.solver.cameras === 4, 'four cameras are posed in the solver', `${m.solver.cameras}`);
   check(m.handSource === 'stereo', 'hands are triangulated, not guessed', m.handSource);
+  // Measure the fingertip over frames from AFTER the rig is up. The accumulator starts with the page, so
+  // any single-camera frame from the first second is otherwise averaged into a figure about the geometry.
+  await b.evaluate('window.__chain.restartScript()');
+  await sleep(1200);
+  m = await b.metrics();
   check(m.eyeSource === 'stereo', 'the eye is triangulated from the two head webcams', m.eyeSource);
   check(m.inputMode === 'camera', 'input.mode is the contract the rest of the app reads', m.inputMode);
   check(m.hands[0].active, 'a hand reached input/state.js', m.hands[0].tip.join(', ') + ' cm');
@@ -188,6 +200,10 @@ try {
   bridgeProc.kill();
   await sleep(2500);
   m = await b.metrics();
+  // Poll rather than take one sample. Under load (two headless browsers on one machine) a single frame
+  // can genuinely find only one eye fresh, which honestly reads as 'mono'; what this check is about is
+  // whether the cameras take the hands back at all.
+  for (let i = 0; i < 20 && m.handSource !== 'stereo'; i++) { await sleep(200); m = await b.metrics(); }
   check(m.handSource === 'stereo', 'a dead bridge hands the hands back to the cameras', m.handSource);
   check(/retrying|connecting/.test(m.bridge?.state || ''), 'and the client keeps retrying', m.bridge?.state);
   check(m.hands[0].active, 'tracking never stopped', `${m.hands[0].tip.join(', ')} cm`);

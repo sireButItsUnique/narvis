@@ -25,8 +25,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // in a circle. Anything downstream that reports 40 cm has really done the geometry.
 
 const EYE_W = 672, EYE_H = 376, W = EYE_W * 2, H = EYE_H, FRAMES = 24;
-const HFOV_DEG = 102;                                   // must match stereo.js defaultCalib
-const FX = (EYE_W / 2) / Math.tan(HFOV_DEG * Math.PI / 360);
+// Take the focal length from the module under test rather than restating it: this used to be a hard-coded
+// 102-degree guess with a "must match stereo.js" comment, and the moment stereo.js moved to the measured
+// figure a real ZED's .conf carries, the video encoded one geometry and the page solved another.
+const { ZED_REF } = await import('../public/js/input/stereo.js');
+const FX = ZED_REF.fx * (EYE_W / ZED_REF.eyeW);
 const BASELINE_CM = 12, TARGET_Z_CM = 40;
 const DISPARITY_NORM = (FX * BASELINE_CM / TARGET_Z_CM) / EYE_W;
 
@@ -149,10 +152,33 @@ try {
   check(st.sources[0]?.sbs === true, 'its frame was recognised as side-by-side', `${st.sources[0]?.width}x${st.sources[0]?.height}`);
   check(st.sources[0]?.views.length === 2, 'both eyes run their own worker');
   check(st.sources[0]?.views.every(v => v.fps > 5), 'frames are flowing', st.sources[0]?.views.map(v => `${v.fps} fps / ${v.latencyMs} ms`).join(', '));
-  check(st.handSource === 'stereo', 'hands come from triangulation, not a guess', st.handSource);
+  // Sample a WINDOW, not one frame. The solver deliberately refuses to fuse two views the detector found
+  // more than a line-up window apart, because that pairing puts the disparity error straight into depth —
+  // so on a slow machine the odd frame honestly reports 'mono'. What this checks is the geometry when the
+  // geometry is running, which is the median of the frames that actually got two views.
+  const stereoDepths = [];
+  let sawStereo = 0, sampled = 0;
+  for (let i = 0; i < 40; i++) {
+    const s = await b.status();
+    sampled++;
+    if (s.handSource === 'stereo') {
+      sawStereo++;
+      const t = s.hands.find(h => h.active)?.tip;
+      if (t) stereoDepths.push(t[2]);
+    }
+    await sleep(70);
+  }
+  stereoDepths.sort((x, y) => x - y);
+  const median = stereoDepths.length ? stereoDepths[stereoDepths.length >> 1] : null;
+  st = await b.status();
+  check(sawStereo > sampled * 0.5, 'hands come from triangulation, not a guess',
+    `${sawStereo}/${sampled} frames stereo`);
   const tip = st.hands.find(h => h.active)?.tip;
-  check(!!tip, 'a 3D hand reached the shared input', tip ? tip.map(v => v.toFixed(1)).join(', ') : 'none');
-  if (tip) check(Math.abs(tip[2] - TARGET_Z_CM) < TARGET_Z_CM * 0.05, `depth is within 5% of the ${TARGET_Z_CM} cm the video encodes`, `${tip[2].toFixed(1)} cm`);
+  check(stereoDepths.length > 0, 'a 3D hand reached the shared input',
+    tip ? tip.map(v => v.toFixed(1)).join(', ') : 'none');
+  if (median != null) check(Math.abs(median - TARGET_Z_CM) < TARGET_Z_CM * 0.05,
+    `depth is within 5% of the ${TARGET_Z_CM} cm the video encodes`,
+    `${median.toFixed(1)} cm (median of ${stereoDepths.length} two-view frames)`);
 
   // the dot moves in a circle, so the published point must move too
   // Diagnostic only: these two rings are read separately, so they can be a frame apart — the fused depth
@@ -188,6 +214,9 @@ try {
   await sleep(2500);
   st = await b.status();
   check(/retrying|connecting/.test(st.bridge?.state || ''), 'a dead bridge is retried, not mourned', st.bridge?.state);
+  // Poll rather than take one sample: on a busy machine a single frame can honestly find only one eye
+  // fresh, which reads as 'mono'. What this checks is that the cameras take the hands back at all.
+  for (let i = 0; i < 20 && st.handSource !== 'stereo'; i++) { await sleep(200); st = await b.status(); }
   check(st.handSource === 'stereo', 'hands fell back to the cameras', st.handSource);
   check(st.sources[0]?.views.every(v => v.fps > 5), 'the cameras never stopped', st.sources[0]?.views.map(v => v.fps).join('/'));
 

@@ -26,12 +26,19 @@ import { GRAB_CONFIG, scaleConfig, cloneConfig } from './config.js';
  * failure. `inputUnitsPerMetre` is the escape hatch for the day state.js really does move to metres while
  * the scene stays in centimetres — set it, and only then is anything scaled.
  */
-export function handsFromInput(input, now, { unitsPerMetre = 1, inputUnitsPerMetre = unitsPerMetre } = {}) {
+export function handsFromInput(input, now, { unitsPerMetre = 1, inputUnitsPerMetre = unitsPerMetre,
+                                             maxAgeMs = null } = {}) {
   const out = [];
   const k = unitsPerMetre / inputUnitsPerMetre;      // 1 in every case the app actually runs
   const finite = p => p && Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.z);
   input.hands.forEach((h, id) => {
     if (!h.active) return;
+    // The solver keeps a hand `active` with its pose FROZEN for maxAgeMs (300 ms) after the last sighting,
+    // and grab.js then starts its own dropoutMs clock only once that grace is up — so the two windows ran
+    // in series and a held model stayed glued to a dead hand for ~450 ms, not the 200 ms grab.js documents
+    // and tests. Dropping a hand here as soon as it is older than the grab's own window makes 'active' and
+    // 'live' agree at the boundary, so exactly one clock ever runs.
+    if (maxAgeMs != null && now != null && h.seenAt != null && now - h.seenAt > maxAgeMs) return;
     const joints = h.jointsWorld;
     const at = i => ({ x: joints[i * 3] * k, y: joints[i * 3 + 1] * k, z: joints[i * 3 + 2] * k });
     // landmark 4 is the thumb tip and 8 the index tip: the pinch pair MediaPipe gives and the ZED body
@@ -48,21 +55,36 @@ export function handsFromInput(input, now, { unitsPerMetre = 1, inputUnitsPerMet
   return out;
 }
 
+let warnedNoVolume = false;
+
 /**
  * @param opts.unitsPerMetre  100 for a centimetre scene (what state.js publishes), 1 for metres.
  * @param opts.config         a base config in METRES; it is scaled for you.
- * @param opts.overrides      applied AFTER scaling, so it is in scene units (e.g. volume, floorY).
+ * @param opts.overrides      applied AFTER scaling, so it is in scene units. `volume` and `floorY` are
+ *                            effectively REQUIRED: config.js's box describes grab-demo.html's metre
+ *                            scene, not yours, and clamping into somebody else's frame yanks the model
+ *                            across the volume on the very first grab. Without them, this turns clamping
+ *                            and gravity off rather than pretend to know where your floor is.
  */
 export function createSceneGrab({ unitsPerMetre = 100, config = GRAB_CONFIG, overrides = {} } = {}) {
   const cfg = Object.assign(scaleConfig(cloneConfig(config), unitsPerMetre), overrides);
+  if (overrides.volume == null) {
+    cfg.clampToVolume = false;
+    cfg.settleGravity = 0;     // there is no floor to fall to if nobody has said where the floor is
+    if (!warnedNoVolume) {
+      warnedNoVolume = true;
+      console.warn('[grab] createSceneGrab was given no `overrides.volume`, so clamping and gravity are ' +
+                   'off. Pass the volume your scene actually works in (and floorY) to get them back.');
+    }
+  }
   const grab = createGrab({ config: cfg });
   return {
     grab, config: cfg, unitsPerMetre,
     /** Hands as grab.js wants them, straight from the shared input object. */
-    hands: (input, now) => handsFromInput(input, now, { unitsPerMetre }),
+    hands: (input, now) => handsFromInput(input, now, { unitsPerMetre, maxAgeMs: cfg.dropoutMs }),
     /** One frame: read the solver's output, drive the bodies. Returns grab's frame. */
     step(input, bodies, now) {
-      return grab.update({ hands: handsFromInput(input, now, { unitsPerMetre }), bodies, now });
+      return grab.update({ hands: handsFromInput(input, now, { unitsPerMetre, maxAgeMs: cfg.dropoutMs }), bodies, now });
     },
   };
 }

@@ -48,9 +48,12 @@ export function classifyCamera(dev, seen = null, pref = null) {
   return { kind: 'webcam', sbs: false, mode: null, model: label.split('(')[0].trim() || (id ? 'camera' : 'unknown'), why: 'not a ZED' };
 }
 
+// The Logitech C920/C922's published diagonal field of view, and a fair default for any 1080p webcam.
+export const WEBCAM_DFOV_DEG = 78;
+
 // Logitech-style webcams quote a DIAGONAL fov; we need a horizontal focal length in pixels.
 // f = (diag_px / 2) / tan(dfov / 2), which is exact for a pinhole and good enough to start a calibration from.
-export function focalPxFromDiagFov(width, height, dfovDeg = 78) {
+export function focalPxFromDiagFov(width, height, dfovDeg = WEBCAM_DFOV_DEG) {
   const diag = Math.hypot(width, height);
   return (diag / 2) / Math.tan((dfovDeg * Math.PI / 180) / 2);
 }

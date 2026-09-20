@@ -216,13 +216,17 @@ export function refineRelativePose(A, B, R0, t0, opts = {}) {
 /**
  * Relative pose between two cameras from a moving point seen by both (wave a fingertip through the volume).
  * @param pairs [{ a: {u,v}, b: {u,v} }] pixels
- * @returns { R, t (unit), inliers, inlierRatio, sampsonRmsPx } or null
+ * @returns { ok, R, t (unit), inliers, inlierRatio, sampsonRmsPx, planarInliers } — or, when the motion
+ *          was too flat to solve or too few points matched, { ok: false, reason } with no pose on it.
+ *          Callers must test `ok`: a refused answer with a healthy-looking RMS is exactly the failure
+ *          this guard exists for.
  */
 export function relativePoseRansac(camA, camB, pairs, opts = {}) {
-  const { iterations = 400, thresholdPx = 3.0, seed = 12345, minInliers = 8, refine = true } = opts;
+  const { iterations = 400, thresholdPx = 3.0, seed = 12345, minInliers = 8, refine = true,
+          planarRatio = 0.9, checkPlanarity = true } = opts;
   const A = pairs.map(p => camA.normalized(p.a.u ?? p.a[0], p.a.v ?? p.a[1]));
   const B = pairs.map(p => camB.normalized(p.b.u ?? p.b[0], p.b.v ?? p.b[1]));
-  if (A.length < 8) return null;
+  if (A.length < 8) return { ok: false, reason: 'need at least 8 matched points' };
   // The Sampson error is in normalised units; convert the pixel threshold with the average focal length.
   const f = (camA.fx + camB.fx) / 2, thr = (thresholdPx / f) ** 2;
   const rng = mulberry32(seed);
@@ -236,7 +240,7 @@ export function relativePoseRansac(camA, camB, pairs, opts = {}) {
     if (!best || inliers.length > best.inliers.length) best = { E, inliers };
     if (best.inliers.length === A.length && it > 20) break;
   }
-  if (!best || best.inliers.length < minInliers) return null;
+  if (!best || best.inliers.length < minInliers) return { ok: false, reason: 'too few points agree on any pose' };
 
   // Refit on every inlier, but never accept a refit that explains fewer points than the hypothesis did.
   const countInliers = E => { const keep = []; for (let i = 0; i < A.length; i++) if (sampsonError(E, A[i], B[i]) < thr) keep.push(i); return keep; };
@@ -245,8 +249,18 @@ export function relativePoseRansac(camA, camB, pairs, opts = {}) {
   if (inliers.length < best.inliers.length) { E = best.E; inliers = countInliers(E); }
   if (inliers.length < minInliers) inliers = best.inliers;
 
+  // The degeneracy test, before anything is handed out. If a homography explains essentially as many
+  // points as the essential matrix does, the motion was flat and the pose is not determined — however
+  // good the Sampson RMS looks.
+  const planarInliers = checkPlanarity ? planarityCheck(A, B, thr) : 0;
+  if (checkPlanarity && planarInliers >= planarRatio * inliers.length) {
+    return { ok: false, degenerate: true, planarInliers, inlierRatio: inliers.length / A.length,
+             reason: 'the point stayed in one plane — wave your hand toward and away from the cameras as ' +
+                     'well as across them' };
+  }
+
   const pick = chooseByCheirality(decomposeEssential(E), inliers.map(i => A[i]), inliers.map(i => B[i]));
-  if (!pick) return null;
+  if (!pick) return { ok: false, reason: 'no pose puts the points in front of both cameras' };
   let R = pick.R, t = normalize(pick.t);
   if (refine) {
     const ref = refineRelativePose(inliers.map(i => A[i]), inliers.map(i => B[i]), R, t);
@@ -259,8 +273,67 @@ export function relativePoseRansac(camA, camB, pairs, opts = {}) {
     if (grown.length >= inliers.length) inliers = grown;
   }
   const errs = inliers.map(i => Math.sqrt(sampsonError(E, A[i], B[i])) * f);
-  return { E, R, t, inliers, inlierRatio: inliers.length / A.length,
-           sampsonRmsPx: Math.sqrt(mean(errs.map(e => e * e))) };
+  return { ok: true, E, R, t, inliers, inlierRatio: inliers.length / A.length, planarInliers,
+           degenerate: false, sampsonRmsPx: Math.sqrt(mean(errs.map(e => e * e))) };
+}
+
+/**
+ * A homography from >= 4 NORMALISED correspondences, by the 4-point DLT with Hartley normalisation.
+ * Only needed to answer one question: could a PLANE explain these matches just as well?
+ */
+export function homographyFrom4Point(a, b) {
+  if (a.length < 4) return null;
+  const na = hartley(a), nb = hartley(b);
+  const rows = [];
+  na.pts.forEach((p, i) => {
+    const q = nb.pts[i];
+    rows.push([-p[0], -p[1], -1, 0, 0, 0, q[0] * p[0], q[0] * p[1], q[0]]);
+    rows.push([0, 0, 0, -p[0], -p[1], -1, q[1] * p[0], q[1] * p[1], q[1]]);
+  });
+  const h = nullVector(rows);
+  if (!h) return null;
+  const H = matMul(invert3x3Affine(nb.T), matMul([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]], na.T));
+  return H;
+}
+
+// hartley()'s transform is [s,0,-s*cx, 0,s,-s*cy, 0,0,1]; its inverse is the same shape, written out
+// rather than run through a general solver because a singular one here would be a bug, not an input.
+function invert3x3Affine(T) {
+  const s = T[0] || 1;
+  return [1 / s, 0, -T[2] / s, 0, 1 / s, -T[5] / s, 0, 0, 1];
+}
+
+/** Symmetric transfer error of a homography on one correspondence, in normalised units (squared). */
+export function homographyError(H, p, q) {
+  const Hp = matVec(H, [p[0], p[1], 1]);
+  if (Math.abs(Hp[2]) < 1e-12) return Infinity;
+  const dx = Hp[0] / Hp[2] - q[0], dy = Hp[1] / Hp[2] - q[1];
+  return dx * dx + dy * dy;
+}
+
+/**
+ * Is a plane enough to explain these matches? The 8-point algorithm is DEGENERATE for coplanar points,
+ * and it fails silently: a fingertip waved in one plane gives a pose 30-70 degrees wrong with a Sampson
+ * RMS indistinguishable from a good fit (1.0 px on 140/140 inliers in the measured case, while the TRUE
+ * pose scores the same on the same data). The standard H-vs-E model-selection test catches it and the
+ * returned diagnostics do not, so it has to be run before the answer is handed out.
+ *
+ * Deliberately measured on the CORRESPONDENCES, not on triangulated points: the reconstruction is itself
+ * wrong in exactly the failure case, so testing it would be testing the suspect's own alibi.
+ */
+export function planarityCheck(A, B, thr, { iterations = 200, seed = 4242 } = {}) {
+  const rng = mulberry32(seed);
+  let best = 0;
+  for (let it = 0; it < iterations; it++) {
+    const idx = sampleIndices(A.length, 4, rng);
+    if (idx.length < 4) continue;
+    const H = homographyFrom4Point(idx.map(i => A[i]), idx.map(i => B[i]));
+    if (!H || !H.every(Number.isFinite)) continue;
+    let n = 0;
+    for (let i = 0; i < A.length; i++) if (homographyError(H, A[i], B[i]) < thr) n++;
+    if (n > best) best = n;
+  }
+  return best;
 }
 
 function sampleIndices(n, k, rng) {
@@ -488,10 +561,19 @@ export function importCalibration(json) {
  * where my hand is" and gets blamed on the display.
  */
 export function calibrationReport({ touchFit = null, spread = null, bundle = null, crossCheckMm = null,
-                                    triangulationMm = null } = {}) {
+                                    triangulationMm = null, relativePose = null } = {}) {
   const warnings = [];
   const agreementMm = touchFit ? touchFit.rmsMm : triangulationMm;
   if (spread && !spread.ok) warnings.push(spread.reason);
+  // A relative pose can be badly wrong with a perfectly healthy reprojection error, so its own verdict
+  // has to reach the user. The degeneracy test is the primary guard; the inlier ratio is a hint, and only
+  // a hint — a measured sweep found 72-degree errors that still kept 61% of their points.
+  if (relativePose && relativePose.ok === false) warnings.push(
+    relativePose.degenerate ? `the camera-to-camera calibration was refused: ${relativePose.reason}`
+                            : `the camera-to-camera calibration failed: ${relativePose.reason}`);
+  if (relativePose && relativePose.ok && relativePose.inlierRatio < 0.6) warnings.push(
+    `only ${(relativePose.inlierRatio * 100).toFixed(0)}% of the waved points fit the camera-to-camera ` +
+    `pose — wave more slowly, and through more of the volume`);
   if (touchFit && touchFit.maxMm > 3 * Math.max(1, touchFit.rmsMm)) warnings.push(
     `one touched point is ${touchFit.maxMm.toFixed(0)} mm out — redo that one`);
   if (crossCheckMm != null && crossCheckMm > 8) warnings.push(
@@ -502,6 +584,8 @@ export function calibrationReport({ touchFit = null, spread = null, bundle = nul
   const grade = agreementMm == null ? 'unknown' : agreementMm < 8 ? 'good' : agreementMm < 15 ? 'fair' : 'poor';
   return { agreementMm, grade, warnings, reprojectionPx: bundle ? bundle.rmsPx : null,
            scale: touchFit ? touchFit.scale : null,
+           poseInlierRatio: relativePose ? (relativePose.inlierRatio ?? null) : null,
+           poseDegenerate: relativePose ? !!relativePose.degenerate : null,
            headline: agreementMm == null ? 'not calibrated'
              : `finger-to-model agreement: ${agreementMm.toFixed(1)} mm (${grade})` };
 }

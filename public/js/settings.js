@@ -1,5 +1,10 @@
 // ---------- settings (all lengths in cm unless noted) ----------
-export const DEFAULTS = { diagIn: 14, camAboveCm: 0.8, camXCm: 0, ipdMm: 63, hfovDeg: 60, eyeYNudgeCm: 0,
+// hfovCalibrated says whether hfovDeg is a MEASUREMENT (the 'calibrate' button, which solves it from a
+// known distance) or just the 60-degree placeholder. The multi-camera path only believes it when it is a
+// measurement: read as a horizontal fov, the placeholder is ~20% short for a webcam and 2.5x short for a
+// ZED, and both errors come out as depth.
+export const DEFAULTS = { diagIn: 14, camAboveCm: 0.8, camXCm: 0, ipdMm: 63, hfovDeg: 60, hfovCalibrated: false,
+                          eyeYNudgeCm: 0,
                           knownDistCm: 50, eye: 'center', hands: true, popout: false, mic: true, talk: true };
 export const S = loadSettings();
 function loadSettings() {

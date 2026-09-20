@@ -12,6 +12,12 @@ import {
   LAYOUTS, DEFAULT_RIG, buildLayout, runSession, coverageSlice, rigGeometry, parallaxGain, ZED_RANGE_MM,
 } from '../public/js/sim/rig-sim.js';
 
+// The residual this project's OWN calibration leaves, measured by test/track-calibrate.test.js: a 1.3%
+// scale change on the end-to-end touch fit, and 0.3-0.6 deg of rotation out of relativePoseRansac. Every
+// figure below is printed BOTH ways, because the calibration term is several times the noise term and a
+// single number quietly assumes the calibration is exact.
+const CALIB_BAND = { focalPct: 1.3, rotDeg: 0.3, rotAxis: 'y', rotCam: 'zed-r' };
+
 const NOISE_PX = Number(process.env.NOISE_PX || 1.0);
 const FRAMES = Number(process.env.FRAMES || 300);
 const f1 = v => (v == null || !Number.isFinite(v) ? '   -  ' : v.toFixed(1).padStart(6));
@@ -29,6 +35,8 @@ console.log(`${FRAMES} frames of reach / pinch / carry / release, ${NOISE_PX} px
 const rows = [];
 for (const name of Object.keys(LAYOUTS)) {
   const { stats, layout, records } = runSession({ layout: name, frames: FRAMES, noisePx: NOISE_PX, seed: 1 });
+  const banded = runSession({ layout: name, frames: FRAMES, noisePx: NOISE_PX, seed: 1, calibError: CALIB_BAND }).stats;
+  stats.bandTipMm = banded.tipMeanMm; stats.bandEyeMm = banded.eyeMeanMm;
   const cov = coverageSlice(layout.cameras, layout.geometry);
   // A layout that never solved an eye (or a hand) must print a dash, not a zero. A mean over no samples is
   // 0, and 0.0 mm of error reads as "perfect" when it means "never tried".
@@ -55,6 +63,18 @@ console.log('\nall lengths in millimetres; "cover" is the fraction of the hand v
 console.log('"median" the error the geometry predicts there. A dash means that layout does not do that job');
 console.log('at all — a zero would read as "perfect" when it means "never tried".\n');
 
+console.log('The table above assumes the cameras are calibrated EXACTLY. They will not be. With the residual');
+console.log(`this project's own calibration leaves (${CALIB_BAND.focalPct}% scale, ${CALIB_BAND.rotDeg} deg on one ZED eye):\n`);
+console.log('layout               exact tip   banded tip   exact eye   banded eye');
+for (const r of rows) {
+  if (!r.sawHand && !r.sawEye) continue;
+  console.log([r.name.padEnd(18),
+               r.sawHand ? f1(r.stats.tipMeanMm) : '   -  ', r.sawHand ? f1(r.stats.bandTipMm) : '   -  ',
+               r.sawEye ? f1(r.stats.eyeMeanMm) : '   -  ', r.sawEye ? f1(r.stats.bandEyeMm) : '   -  '].join('    '));
+}
+console.log('\nRobustness to calibration error is itself a placement argument: the layout with the extra side');
+console.log('view barely moves under the band, while the ZED pair on its own roughly doubles.\n');
+
 for (const r of rows) {
   console.log(`${r.name} — ${r.label}`);
   console.log(`  cameras: ${r.cameras.map(c => `${c.id} at [${c.position.map(v => v.toFixed(0)).join(', ')}]`).join('; ')}`);
@@ -62,8 +82,9 @@ for (const r of rows) {
 }
 
 // ---------------------------------------------------------------- how far to put the ZED
-console.log('ZED standoff sweep (planned layout, everything else held):');
-console.log('  range   tip mean   tip p95   geomTip   coverage   predicted');
+console.log('ZED standoff sweep (planned layout, everything else held). Read "mono%" first: below the default');
+console.log('the hand leaves one eye\'s frustum during the reach, and a mono frame is ~99 mm, not a gentle loss.');
+console.log('  range   tip mean   tip p95   geomTip   mono%   banded   coverage   predicted');
 for (const mm of [260, 320, 380, 440, 520]) {
   const built = buildLayout('zed-hands', DEFAULT_RIG, { noisePx: NOISE_PX });
   const centre = built.geometry.handVolume.centre;
@@ -73,9 +94,11 @@ for (const mm of [260, 320, 380, 440, 520]) {
     const dx = c.id.endsWith('-r') ? 120 : 0;
     c.setPose({ position: [-60 + dx, centre[1] + 40, mm], target: centre });
   }
-  const { stats } = runSession({ layout: built, frames: FRAMES, noisePx: NOISE_PX, seed: 1 });
+  const { stats, records } = runSession({ layout: built, frames: FRAMES, noisePx: NOISE_PX, seed: 1 });
+  const mono = records.filter(r => r.source === 'mono').length / Math.max(1, records.length);
+  const band = runSession({ layout: built, frames: FRAMES, noisePx: NOISE_PX, seed: 1, calibError: CALIB_BAND }).stats;
   const cov = coverageSlice(built.cameras, built.geometry);
-  console.log(`  ${String(mm).padStart(4)} mm ${f1(stats.tipMeanMm)}    ${f1(stats.tipP95Mm)}   ${f1(stats.geomTipMeanMm)}    ${pct(cov.coveredFraction)}    ${f1(cov.medianMm)}` +
+  console.log(`  ${String(mm).padStart(4)} mm ${f1(stats.tipMeanMm)}    ${f1(stats.tipP95Mm)}   ${f1(stats.geomTipMeanMm)}   ${pct(mono)}  ${f1(band.tipMeanMm)}    ${pct(cov.coveredFraction)}    ${f1(cov.medianMm)}` +
     (mm === ZED_RANGE_MM ? '   <- the default' : ''));
 }
 
@@ -118,4 +141,6 @@ RECOMMENDATION
   `One camera can still do the head on its own
   (${f1(rows.find(r => r.name === 'one-webcam-head').stats.eyeMeanMm).trim()} mm), because head depth comes ` +
   `from eye spacing and barely matters. Two cameras on the head is the
-  safer build; ZED plus a side view is the more accurate one.`);
+  safer build; ZED plus a side view is the more accurate one — and the gap widens once calibration error
+  is counted: ${f1(side.stats.bandTipMm).trim()} mm against ${f1(planned.stats.bandTipMm).trim()} mm under the band,
+  because a third view from a different direction is what stops a small extrinsic error turning into depth.`);

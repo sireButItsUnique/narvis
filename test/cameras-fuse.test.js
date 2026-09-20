@@ -36,6 +36,35 @@ test('a frame that produces nothing still frees the gate, or the camera looks de
   assert.equal(g.done, 0);                       // an aborted frame is not a processed frame
 });
 
+test('a worker that stops answering altogether does not wedge the gate shut for ever', () => {
+  // A worker thread that is killed (memory pressure, a GPU reset taking MediaPipe's delegate down) posts
+  // NO message, so nothing ever calls finish() or abort(). Nothing else in cameras.js has a timeout on
+  // inFlight, so the view stopped sending frames for the life of the page — and on a ZED that ends hand
+  // tracking outright, because startGrabLoop gates both eyes on both gates. It was invisible too: `times`
+  // was pruned only inside finish(), so a dead view kept reporting its last good frame rate.
+  const g = new FrameGate({ maxInFlight: 1, maxAgeMs: 120 });
+  for (let i = 0; i < 30; i++) { g.offer(i * 16, i * 16); g.finish(i * 16, i * 16 + 20); }
+  const t0 = 30 * 16;
+  assert.equal(g.offer(t0, t0), true);
+  assert.equal(g.offer(t0 + 16, t0 + 16), false, 'busy, as designed');
+  assert.equal(g.watchdog(t0 + 100), false, 'and not yet late enough to give up on');
+
+  const late = t0 + 1200;          // well past the watchdog's 4x maxAgeMs, and past the 1 s fps window
+  assert.equal(g.watchdog(late), true, 'the slot is freed once the worker is clearly not coming back');
+  assert.equal(g.inFlight, 0);
+  assert.equal(g.stallDrops, 1);
+  assert.equal(g.strikes, 1);
+  assert.equal(g.offer(late, late), true, 'and the view sends frames again');
+  console.log(`      after ${(late - t0).toFixed(0)} ms of silence: fps reads ${g.fpsAt(late)}, ${g.stallDrops} stall drop(s)`);
+  assert.equal(g.fpsAt(late), 0, 'a wedged view must read 0 fps, not its last good number');
+
+  // repeated strikes are what the caller uses to give the camera up instead of feeding a dead thread
+  g.watchdog(late + 4 * g.maxAgeMs + 1);
+  assert.equal(g.strikes, 2);
+  g.finish(late, late + 20);
+  assert.equal(g.strikes, 0, 'one good answer clears the count');
+});
+
 test('the gate measures frame rate and latency from what actually came back', () => {
   const g = new FrameGate();
   for (let i = 0; i < 30; i++) { g.offer(i * 16, i * 16); g.finish(i * 16, i * 16 + 25); }
@@ -74,14 +103,14 @@ test('hands are paired across two views by handedness and image row', () => {
 test('one view only: depth from palm size puts the hand in front of the camera', () => {
   const calib = defaultCalib(2560, 720);
   const view = makeView({ intr: calib.left, eyeW: calib.eyeW, eyeH: calib.eyeH, label: 'one' });
-  // a hand whose wrist->knuckle span is 100 px: f/scale with f~518 gives about 44 cm
+  // a hand whose wrist->knuckle span is 100 px: f/scale with a real ZED's f~700 gives about 60 cm
   const lm = Array.from({ length: 21 }, () => [0.5, 0.5, 0]);
   lm[0] = [0.5, 0.55, 0]; lm[9] = [0.5, 0.55 - 100 / calib.eyeH, 0];
   lm[5] = [0.52, 0.5, 0]; lm[17] = [0.52 - 40 / calib.eyeW, 0.5, 0];
   const world = monoHandWorld(lm, view);
   assert.equal(world.length, 21);
   const depth = world[0][2];
-  assert.ok(depth > 30 && depth < 60, `depth ${depth}`);
+  assert.ok(depth > 45 && depth < 75, `depth ${depth}`);
   assert.equal(monoHandWorld(Array.from({ length: 21 }, () => [0.5, 0.5, 0]), view), null);   // no scale, no guess
 });
 

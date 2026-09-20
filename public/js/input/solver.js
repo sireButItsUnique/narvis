@@ -88,9 +88,10 @@ export const faceForTracker = face =>
  *
  * @param opts.eye         'center' | 'left' | 'right'  (settings.S.eye)
  * @param opts.ipdMm       the user's interpupillary distance (settings.S.ipdMm)
- * @param opts.eyeYNudgeCm a manual vertical offset on the published eye only. It is applied AFTER publish
- *                         rather than through appTransform, because that transform also moves the hands and
- *                         this nudge is a calibration of where the user's eye is relative to their irises.
+ * @param opts.eyeYNudgeCm a manual vertical offset on the published eye only. It is pushed DOWN into the
+ *                         Tracker and applied inside publish(), where the eye is actually written, rather
+ *                         than through appTransform (which would also move the hands) or after publish
+ *                         (which re-applied it on every frame that published no eye — see publish()).
  */
 export function createSolver(opts = {}) {
   const tracker = new Tracker({
@@ -168,17 +169,20 @@ export function createSolver(opts = {}) {
      * this the Tracker keeps preferring its last payload over the cameras that are still delivering.
      */
     expireBridge(now, maxAgeMs = 250) {
-      if (tracker.bridge && now - bridgeAt > maxAgeMs) { tracker.bridge = null; return true; }
+      // Two-sided: a payload stamped in the FUTURE (a bridge whose clock is not synced yet sends epoch
+      // milliseconds) would otherwise never expire, and the Tracker would prefer that one frozen frame
+      // over every live camera for the rest of the session.
+      if (tracker.bridge && Math.abs(now - bridgeAt) > maxAgeMs) { tracker.bridge = null; return true; }
       return false;
     },
 
     /** Solve and write into the shared input object. Returns the Tracker's frame. */
     step(input, now, { hands = true, eyeYNudgeCm = 0 } = {}) {
       this.expireBridge(now);
+      tracker.eyeNudgeApp = eyeYNudgeCm;   // publish() is the only thing that writes input.eye
       const out = tracker.solve(now);
       lastSolve = out;
       tracker.publish(input, now);
-      if (eyeYNudgeCm && input.eye) input.eye.y += eyeYNudgeCm;
       if (!hands) for (const h of input.hands) { h.active = false; h.pinch = false; }
       return out;
     },

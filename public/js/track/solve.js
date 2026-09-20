@@ -36,17 +36,48 @@ class CameraTrack {
   }
   get latest() { return this.frames[this.frames.length - 1] || null; }
 
-  /** Blend two frames in pixel space. t between 0 and 1 interpolates; t above 1 extrapolates past b. */
+  /**
+   * The newest frame that actually CARRIES what we are looking for ('face' or 'hands').
+   *
+   * The capture layer reports a missed detection as a result, not as silence — landmarks-worker.js always
+   * posts { face: null, hands: [] } — so the newest frame is regularly an empty one sitting on top of a
+   * perfectly good frame 16 ms earlier. Anything that reasons from `latest` alone throws that frame away.
+   */
+  latestWith(what) {
+    for (let i = this.frames.length - 1; i >= 0; i--) {
+      const f = this.frames[i];
+      if (what === 'face' ? !!f.face : !!(f.hands && f.hands.length)) return f;
+    }
+    return null;
+  }
+
+  /**
+   * Blend two frames in pixel space. t between 0 and 1 interpolates; t above 1 extrapolates past b.
+   *
+   * Iterate the NEWER frame and look each hand's partner up in the older one, so blend(a, b, 1) is exactly
+   * b. The other way round silently drops a hand the newest frame HAS found — which is the fresh
+   * detection, the one worth keeping — and resurrects one only the older frame had, stamped with the
+   * current time. staleMs reports the age of anything that came from one side only, so the readout cannot
+   * call a frame of motion a clean fix.
+   */
   static blend(a, b, t, tMs) {
     const face = a.face && b.face && a.face.length === b.face.length
       ? a.face.map((p, k) => lerpPt(p, b.face[k], t)) : (t < 0.5 ? a.face : b.face);
     const hands = [];
-    for (const ha of a.hands || []) {
-      const hb = (b.hands || []).find(h => h.handedness === ha.handedness);
-      hands.push(hb && hb.pts.length === ha.pts.length
-        ? { ...ha, pts: ha.pts.map((p, k) => lerpPt(p, hb.pts[k], t)) } : ha);
+    let oneSidedMs = 0;
+    for (const hb of b.hands || []) {
+      const ha = (a.hands || []).find(h => h.handedness === hb.handedness);
+      if (ha && ha.pts.length === hb.pts.length) hands.push({ ...hb, pts: hb.pts.map((p, k) => lerpPt(ha.pts[k], p, t)) });
+      else { hands.push(hb); oneSidedMs = Math.max(oneSidedMs, Math.abs(tMs - b.tMs)); }
     }
-    return { tMs, face, hands, staleMs: 0, interpolated: true };
+    // A hand only the OLDER frame has is kept while the blend is nearer that frame and dropped after, the
+    // same rule the face branch already uses, so blend is exact at both ends.
+    if (t < 0.5) for (const ha of a.hands || []) {
+      if (!(b.hands || []).some(h => h.handedness === ha.handedness)) {
+        hands.push(ha); oneSidedMs = Math.max(oneSidedMs, Math.abs(tMs - a.tMs));
+      }
+    }
+    return { tMs, face, hands, staleMs: oneSidedMs, interpolated: true };
   }
 
   /**
@@ -58,17 +89,25 @@ class CameraTrack {
    * oldest, so a 30 Hz camera joining a 60 Hz pair adds its accuracy without adding its lag. Extrapolation
    * amplifies landmark noise, so the window is deliberately under one frame period.
    */
-  sampleAt(tMs, interpolate = true, extrapolateMs = 0) {
-    if (!this.frames.length) return null;
-    const f = this.frames;
+  sampleAt(tMs, interpolate = true, extrapolateMs = 0, require = null) {
+    // `require` restricts the ring to frames that actually carry a face (or hands), so one missed detection
+    // falls back to the newest real measurement instead of hiding it behind an empty frame.
+    const f = require
+      ? this.frames.filter(fr => (require === 'face' ? !!fr.face : !!(fr.hands && fr.hands.length)))
+      : this.frames;
+    if (!f.length) return null;
     if (!interpolate) { const l = f[f.length - 1]; return { ...l, staleMs: Math.max(0, tMs - l.tMs), interpolated: false }; }
     if (tMs <= f[0].tMs) return { ...f[0], staleMs: f[0].tMs - tMs, interpolated: false };
     const last = f[f.length - 1], prev = f[f.length - 2];
     if (tMs >= last.tMs) {
-      const gap = tMs - last.tMs, span = prev ? last.tMs - prev.tMs : 0;
+      const gap = tMs - last.tMs;
+      // The camera that DEFINES the reference time asks for its own newest frame; answer it with that
+      // frame, exactly. Going through the blend at t == 1 is both wasted work and lossy.
+      if (gap === 0) return { ...last, staleMs: 0, interpolated: false };
+      const span = prev ? last.tMs - prev.tMs : 0;
       if (!extrapolateMs || !prev || gap > extrapolateMs || span < 1e-6 || span > 120)
         return { ...last, staleMs: gap, interpolated: false };
-      return { ...CameraTrack.blend(prev, last, 1 + gap / span, tMs), staleMs: 0, extrapolated: true };
+      return { ...CameraTrack.blend(prev, last, 1 + gap / span, tMs), extrapolated: true };
     }
     let i = 0;
     while (i < f.length - 2 && f[i + 1].tMs < tMs) i++;
@@ -107,7 +146,8 @@ export class Tracker {
    *                     proportional to it, so a one-off calibration here is worth about +-40 mm at 600 mm.
    */
   constructor({ cameras = [], appScale = 0.1, appTransform = null, ipdMm = IPD.defaultMm, eye = 'center',
-                maxAgeMs = 300, pinch = PINCH, filters = {}, interpolate = true, extrapolateMs = 20 } = {}) {
+                maxAgeMs = 300, pinch = PINCH, filters = {}, interpolate = true, extrapolateMs = 20,
+                maxFusedRmsPx = 8, eyeNudgeApp = 0 } = {}) {
     // Line every camera up to one instant before triangulating. Cameras that are not hardware-synced
     // sample the world at their own phase, and feeding those straight into the geometry bends it.
     this.interpolate = interpolate;
@@ -120,6 +160,12 @@ export class Tracker {
     this.ipdMm = ipdMm;
     this.eyeSide = eye;
     this.maxAgeMs = maxAgeMs;
+    // How far the views of a fused hand may disagree, in pixels, before the group is thrown away and the
+    // single-camera path answers instead. triangulateRobust already rejects individual views at 5 px.
+    this.maxFusedRmsPx = maxFusedRmsPx;
+    // A manual vertical calibration of the eye, in the APP's units. It is applied inside publish(), where
+    // the eye is actually written, so a frame that publishes no eye cannot accumulate it (see publish).
+    this.eyeNudgeApp = eyeNudgeApp;
     this.pinchCfg = { ...PINCH, ...pinch };
     this.eyeFilter = makeEyeFilter();
     if (filters.eye) { this.eyeFilter.minCutoff = filters.eye.minCutoff; this.eyeFilter.beta = filters.eye.beta; }
@@ -184,6 +230,14 @@ export class Tracker {
     return this;
   }
   setBridgeTransform(tr) { this.bridgeTransform = tr; return this; }
+
+  /**
+   * Is the bridge's newest payload still a measurement? The test is TWO-SIDED on purpose. A bridge whose
+   * clock has not been synced yet stamps its frames with epoch milliseconds (~1.76e12), and every
+   * one-sided "now - tMs < maxAgeMs" test passes that for the next fifty years — the hand freezes in
+   * mid-air still holding the model and nothing can ever expire it.
+   */
+  bridgeFresh(nowMs) { return !!this.bridge && Math.abs(nowMs - this.bridge.tMs) < this.maxAgeMs; }
   fromBridge(p) {
     const tr = this.bridgeTransform;
     if (!tr || !p) return p ? p.slice() : null;
@@ -212,10 +266,28 @@ export class Tracker {
    */
   referenceTime(group) {
     if (!group.length) return null;
-    const latest = group.map(t => t.latest.tMs), newest = Math.max(...latest);
+    const latest = group.map(g => g.frame.tMs), newest = Math.max(...latest);
     if (!this.interpolate || group.length < 2) return newest;
     if (this.extrapolateMs > 0) return newest;
     return Math.max(Math.min(...latest), newest - this.lineUpWindowMs);
+  }
+
+  /**
+   * Drop any camera whose newest usable frame is too far behind the group's newest to speak for the same
+   * instant.
+   *
+   * Falling back to an older frame is what rescues a single missed detection, and it is worth a great deal
+   * — it is the difference between a stereo solve and the single-camera guess. But pairing a frame a whole
+   * camera period old with a fresh one from the other eye bends the geometry by however far the subject
+   * moved in between, and on a stereo pair that lands straight in the disparity: measured on a fast target
+   * at 15 fps, two views 60 ms apart put a point at 40 cm at 52 cm. Same window the rest of this file uses
+   * for "how far may a camera be from the reference instant", measured against the GROUP rather than
+   * against now, so pipeline latency does not count toward it.
+   */
+  alignable(group) {
+    if (group.length < 2) return group;
+    const newest = Math.max(...group.map(g => g.frame.tMs));
+    return group.filter(g => newest - g.frame.tMs <= this.lineUpWindowMs);
   }
 
   /** @returns { tMs, tEyeMs, tHandMs, eye, hands, quality } with every length in millimetres. */
@@ -234,10 +306,19 @@ export class Tracker {
     // The head and the hands get their OWN reference time. They are watched by different cameras running
     // at different rates, and making the fast ZED wait for a 30 Hz webcam would add lag to the hands for
     // no reason at all.
-    const faceTracks = tracks.filter(t => t.latest.face);
-    const handTracks = tracks.filter(t => t.latest.hands && t.latest.hands.length);
-    const tFace = this.referenceTime(faceTracks), tHand = this.referenceTime(handTracks);
-    const refT = Math.max(this.bridge ? this.bridge.tMs : -Infinity,
+    //
+    // Group by "this camera has a usable frame inside the staleness bound", NOT by what its newest frame
+    // happens to contain. A missed detection arrives as a frame with hands: [], so grouping on t.latest
+    // evicted a perfectly good camera for one dropped frame and dropped the whole solve to the
+    // single-camera guess. Same bound for grouping and for sampling, so there is one staleness rule.
+    const usable = (t, what) => {
+      const frame = t.latestWith(what);
+      return frame && nowMs - frame.tMs <= this.frameStaleMs(t.camera) ? { track: t, frame } : null;
+    };
+    const faceGroup = this.alignable(tracks.map(t => usable(t, 'face')).filter(Boolean));
+    const handGroup = this.alignable(tracks.map(t => usable(t, 'hands')).filter(Boolean));
+    const tFace = this.referenceTime(faceGroup), tHand = this.referenceTime(handGroup);
+    const refT = Math.max(this.bridgeFresh(nowMs) ? this.bridge.tMs : -Infinity,
                           tFace ?? -Infinity, tHand ?? -Infinity);
     if (!Number.isFinite(refT)) {
       // Nothing fresh from anywhere. Still run the expiry, or a hand that vanished stays pinched for ever.
@@ -249,11 +330,11 @@ export class Tracker {
     q.tMs = refT;
     q.latencyMs = Math.max(0, nowMs - refT);
 
-    const take = (group, t) => group
-      .map(tr => ({ track: tr, sample: tr.sampleAt(t, this.interpolate, this.extrapolateMs) }))
+    const take = (group, t, what) => group
+      .map(g => ({ track: g.track, sample: g.track.sampleAt(t, this.interpolate, this.extrapolateMs, what) }))
       .filter(s => s.sample);
-    const faceSamples = tFace == null ? [] : take(faceTracks, tFace);
-    const handSamples = tHand == null ? [] : take(handTracks, tHand);
+    const faceSamples = tFace == null ? [] : take(faceGroup, tFace, 'face');
+    const handSamples = tHand == null ? [] : take(handGroup, tHand, 'hands');
     const all = [...faceSamples, ...handSamples];
     q.staleMaxMs = Math.max(0, ...all.map(s => s.sample.staleMs || 0));
     q.interpolated = all.filter(s => s.sample.interpolated).length;
@@ -268,7 +349,7 @@ export class Tracker {
 
   solveEye(samples, refT, nowMs, q) {
     const views = samples.filter(s => s.sample.face && s.sample.face.length >= 2);
-    if (this.bridge && this.bridge.eye && nowMs - this.bridge.tMs < this.maxAgeMs) {
+    if (this.bridge && this.bridge.eye && this.bridgeFresh(nowMs)) {
       this.setEye(this.bridge.eye, refT, 'bridge', q);
       q.eyeViews = 1;
       return;
@@ -313,7 +394,7 @@ export class Tracker {
 
   solveHands(samples, refT, nowMs, q) {
     let dets = [];
-    if (this.bridge && this.bridge.hands.length && nowMs - this.bridge.tMs < this.maxAgeMs) {
+    if (this.bridge && this.bridge.hands.length && this.bridgeFresh(nowMs)) {
       dets = this.bridge.hands.map(h => ({ handedness: h.handedness, points: h.points, source: 'bridge',
                                            views: 1, rmsPx: 0 }));
     } else {
@@ -361,12 +442,19 @@ export class Tracker {
           points.push(r.point && (r.ok || !r.behind) ? r.point : null);
           if (Number.isFinite(r.rmsPx)) errs.push(r.rmsPx);
         }
-        if (points.filter(Boolean).length >= HAND.COUNT / 2) {
+        // A fused point is only worth publishing if the views actually agree about it. Without this test
+        // the only check was "did anything come back", so a group built from two DIFFERENT hands fused
+        // into a phantom with a 25-50 px reprojection error and was reported as a clean stereo fix. Above
+        // the threshold, fall through to the single-camera path, which is wrong by millimetres instead.
+        const rmsPx = mean(errs);
+        if (points.filter(Boolean).length >= HAND.COUNT / 2 &&
+            (!Number.isFinite(rmsPx) || rmsPx <= this.maxFusedRmsPx)) {
           q.rejectedViews += rejected; q.degenerate += degenerate;
           out.push({ handedness: group.handedness, points, source: 'stereo',
-                     views: group.views.length, rmsPx: mean(errs) });
+                     views: group.views.length, rmsPx });
           continue;
         }
+        if (Number.isFinite(rmsPx) && rmsPx > this.maxFusedRmsPx) q.fusedRejected++;
       }
       const v = group.views[0];
       const points = monoHandToRig(v.camera, v.pts);
@@ -423,7 +511,12 @@ export class Tracker {
       const q = T ? add(scale(matVec(T.R, p), T.scale ?? 1), T.t) : p;
       return [q[0] * k, q[1] * k, q[2] * k];
     };
-    if (this.eye && input.eye) { const e = toApp(this.eye); input.eye.set(e[0], e[1], e[2]); }
+    // The nudge is applied HERE, inside the one guarded write, and nowhere else. Adding it after publish()
+    // meant every frame with no solved eye added it again to the previous frame's value: with the rig's
+    // own eye-height knob set, input.eye.y ran away at 120 cm/s until the first face was found, and for
+    // ever if none ever was — and view.js builds the off-axis frustum straight from it, so the panel went
+    // black. It goes on AFTER appTransform because it calibrates screen-space eye height, not rig geometry.
+    if (this.eye && input.eye) { const e = toApp(this.eye); input.eye.set(e[0], e[1] + this.eyeNudgeApp, e[2]); }
     if (this.eyeSeenAtMs > -1e8) input.faceSeenAt = this.eyeSeenAtMs;
     // input.mode is a two-valued contract the whole app reads ('camera' or 'mouse' — main.js and
     // interaction.js branch on it), so it must stay that. How many cameras and which source won is in
@@ -467,7 +560,8 @@ export class Tracker {
 function emptyQuality() {
   return { nowMs: 0, tMs: 0, cameras: 0, stale: 0, latencyMs: 0, staleMaxMs: 0, interpolated: 0,
            eyeViews: 0, eyeSource: 'none', eyeRmsPx: 0, eyeSpeedMmS: 0, measuredIpdMm: 0,
-           handsSeen: 0, handViews: 0, handSource: 'none', handRmsPx: 0, rejectedViews: 0, degenerate: 0 };
+           handsSeen: 0, handViews: 0, handSource: 'none', handRmsPx: 0, rejectedViews: 0, degenerate: 0,
+           fusedRejected: 0 };
 }
 
 /**
@@ -496,21 +590,33 @@ export function matchHandsAcrossCameras(withHands) {
       taken.add(ci);
       g.views.push({ camera: entry.camera, pts: cand[ci].pts });
     });
+    // A hand this camera saw that matched nothing gets its OWN group rather than vanishing — but only when
+    // its handedness is one no group already claims, so a failed geometric match cannot invent a second
+    // copy of the same physical hand.
+    cand.forEach((h, ci) => {
+      if (taken.has(ci)) return;
+      if (h.handedness === 'Unknown' || groups.some(g => g.handedness === h.handedness)) return;
+      groups.push({ handedness: h.handedness, views: [{ camera: entry.camera, pts: h.pts }] });
+    });
   }
   return groups;
 }
 
+// Infinity, not a big finite number: the acceptance test in matchHandsAcrossCameras is Number.isFinite,
+// and Number.isFinite(1e6) is true, so a "these cannot be the same hand" sentinel of 1e6 never rejected
+// anything — two different hands seen by two cameras were fused into one phantom point hundreds of
+// millimetres from either of them, reported as a clean two-view stereo fix.
 function pairCost(group, camera, hand) {
   const base = group.views[0];
-  if (group.handedness !== 'Unknown' && hand.handedness !== 'Unknown' && group.handedness !== hand.handedness) return 1e6;
+  if (group.handedness !== 'Unknown' && hand.handedness !== 'Unknown' && group.handedness !== hand.handedness) return Infinity;
   let total = 0, n = 0;
   for (const i of KEY_LANDMARKS) {
     const r = triangulate([{ camera: base.camera, u: base.pts[i].u, v: base.pts[i].v },
                            { camera, u: hand.pts[i].u, v: hand.pts[i].v }], { minAngleDeg: 0.2 });
-    if (!r.point) return 1e6;
+    if (!r.point) return Infinity;
     total += Number.isFinite(r.rmsPx) ? r.rmsPx : 1e3; n++;
   }
-  return n ? total / n : 1e6;
+  return n ? total / n : Infinity;
 }
 
 /**

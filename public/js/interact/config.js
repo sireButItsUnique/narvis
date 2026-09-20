@@ -23,8 +23,12 @@ export const GRAB_CONFIG = {
   regrabLockoutMs: 500,       // after a release, that hand ignores the body it just dropped (Ultraleap 0.5 s)
 
   // ---------- holding ----------
-  dropoutMs: 200,             // the hand may vanish this long without dropping what it holds. It keeps its
+  dropoutMs: 250,             // the hand may vanish this long without dropping what it holds. It keeps its
                               // anchor offset across the gap and eases back in, so nothing snaps or drifts.
+                              // Measured from the last SIGHTING, and it is now the only such window: the
+                              // solver's own staleness grace used to run first and this one after it, so
+                              // the real hold-through was ~450 ms. 250 covers a 180 ms detector dropout
+                              // plus the trailing sample period at 30 Hz, which 200 did not quite do.
   hold: {                     // 1 Euro on the pinch point while holding: steadier than while pointing
     minCutoff: 0.8, beta: 12, dCutoff: 0.8, speedFloor: 0.10,
   },
@@ -55,7 +59,13 @@ export const GRAB_CONFIG = {
   settleMaxMs: 2500,          // give up and snap to rest (a settle must never run forever on the rig)
 
   // ---------- the working volume, in world units ----------
-  // Everything the hands can reach under the acrylic. A dropped body falls to `floorY` and stays inside the box.
+  //
+  // NOT a description of the rig. This is the metre-scale demo box public/grab-demo.html draws and works
+  // in: 30 cm wide, standing on the origin. The rig's own volume is somewhere else entirely (chain.html
+  // works at z 27-53 cm, the simulator at y -36 to -16 cm), and clamping a model into THIS box when it
+  // was somewhere else dragged it 28 cm on the first grab — 156 mm in a single frame — and it could never
+  // be brought forward again. So every caller that has a scene of its own must say where its volume is:
+  // createSceneGrab() in wire.js turns clamping and gravity OFF rather than assume these numbers.
   volume: { minX: -0.15, maxX: 0.15, minY: 0.0, maxY: 0.30, minZ: -0.12, maxZ: 0.12 },
   floorY: 0.0,
   clampToVolume: true,
@@ -70,7 +80,8 @@ export const TUNING_NOTES = [
   ['dropoutMs', 'critical',
    'The single biggest difference between this and a hand tracker built for clean 120 Hz data. MediaPipe on ' +
    'stereo halves drops hands; without a hold-through window the model is released every time a hand flickers, ' +
-   'and no threshold tuning fixes that. 200 ms covers a 6-frame gap at 30 Hz.'],
+   'and no threshold tuning fixes that. 250 ms covers a 180 ms gap at 30 Hz plus the sample period either ' +
+   'side of it, and it is measured from the last sighting, so it means what it says.'],
   ['releaseLagMs', 'critical',
    'Opening the fingers moves the pinch point by centimetres in the wrong direction. Taking the pose from ' +
    '~100 ms earlier is the difference between "put it down" and "flung it". Same idea as Ultraleap\'s throw ' +

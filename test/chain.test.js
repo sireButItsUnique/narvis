@@ -313,6 +313,107 @@ test('the held model lags the hand by a few tens of ms and barely shakes', () =>
   assert.ok(jit.rms * 10 < 3, `jitter ${(jit.rms * 10).toFixed(2)} mm rms`);
 });
 
+// ---------------------------------------------------------------- the eye, and the clocks
+
+test('the eye-height nudge never accumulates on frames that publish no eye', () => {
+  // The rig's eye-height calibration knob (main.js 'p-ynudge', persisted to localStorage). It used to be
+  // added AFTER publish, so every frame that solved no eye added it again to the previous frame's value:
+  // 2 cm of nudge became 120 cm after one second. view.js builds the off-axis frustum straight from
+  // input.eye.y, so the whole scene sheared off the panel and the rig showed black.
+  const solver = createSolver();
+  const input = makeInput();
+  const startY = input.eye.y;
+  for (let f = 1; f <= 600; f++) solver.step(input, f * 16.6667, { eyeYNudgeCm: 2 });
+  console.log(`      10 s with no face ever seen: input.eye.y = ${input.eye.y.toFixed(2)} cm (was ${startY})`);
+  assert.equal(input.eye.y, startY, 'nothing may move the eye while nothing has solved one');
+
+  // ...and when a face does arrive, the nudge is applied exactly once.
+  const src = zedSource({ posCm: [0, 0, 0], rotDeg: [0, 0, 180] });
+  const cams = camerasOf(src);
+  for (const c of cams) solver.addCamera(c);
+  const eyesCm = [[3.15, 9, 45], [-3.15, 9, 45]];          // viewer's right eye first, as observe2D documents
+  let t = 600 * 16.6667;
+  for (let f = 0; f < 10; f++) {
+    t += 16.6667;
+    for (const c of cams) {
+      const seen = eyesCm.map(p => shoot(c, p));
+      if (seen.some(p => !p)) continue;
+      solver.tracker.observe2D({ camId: c.id, tMs: t, face: seen, hands: [], normalized: true });
+    }
+    solver.step(input, t, { eyeYNudgeCm: 2 });
+  }
+  console.log(`      once a face is found: input.eye.y = ${input.eye.y.toFixed(2)} cm (9 cm of eye + 2 cm of nudge)`);
+  assert.ok(Math.abs(input.eye.y - 11) < 0.5, `eye.y ${input.eye.y.toFixed(2)} cm`);
+});
+
+test('a held model is let go one dropout window after the last sighting, not two', () => {
+  // track/solve.js keeps a hand `active` with a FROZEN pose for maxAgeMs (300 ms) after the last sighting;
+  // grab.js then started its own dropoutMs (200 ms) clock only once that grace was up, so the two ran in
+  // series and the model stayed glued to a dead hand for ~450 ms — more than twice what grab.js documents
+  // and what test/grab-hold.test.js asserts against its own harness.
+  const src = zedSource({ posCm: [0, 0, 0], rotDeg: [0, 0, 180] });
+  const cams = camerasOf(src);
+  const solver = createSolver();
+  for (const c of cams) solver.addCamera(c);
+  const input = makeInput();
+  const scene = createSceneGrab({ unitsPerMetre: 100,
+    overrides: { volume: { minX: -25, maxX: 25, minY: -20, maxY: 25, minZ: 20, maxZ: 60 }, floorY: -12 } });
+  const body = { id: 'm', pose: { position: { x: 0, y: 0, z: 40 }, quaternion: { x: 0, y: 0, z: 0, w: 1 }, scale: 1 },
+                 radius: 3.5, restOffset: 2 };
+  let endAt = null, lastSeen = null;
+  scene.grab.on('grabEnd', e => { if (endAt == null) endAt = e.at; });
+
+  const STOP = 1000;
+  for (let t = 16; t < 2200; t += 16) {
+    if (t <= STOP) {
+      const hand = handCm([0, 0, 40], 0);                  // pinched, right on the model
+      for (const c of cams) {
+        const lm = hand.map(p => { const q = shoot(c, p); return q && { x: q.x, y: q.y, z: 0 }; });
+        if (lm.some(p => !p)) continue;
+        solver.tracker.observe2D({ camId: c.id, tMs: t, hands: [{ handedness: 'Right', score: 1, landmarks: lm }], normalized: true });
+      }
+    }
+    solver.step(input, t);
+    if (input.hands[0].active) lastSeen = input.hands[0].seenAt;   // the last frame the solver filled a slot
+    scene.step(input, [body], t);
+  }
+  const held = endAt - lastSeen;
+  console.log(`      last sighting at ${lastSeen.toFixed(0)} ms, let go at ${endAt.toFixed(0)} ms: ` +
+              `held through ${held.toFixed(0)} ms (dropoutMs is ${scene.config.dropoutMs})`);
+  assert.ok(endAt != null, 'the model was eventually let go');
+  assert.ok(held >= scene.config.dropoutMs - 20, `it must still survive a real ${scene.config.dropoutMs} ms blink`);
+  assert.ok(held <= scene.config.dropoutMs * 1.5, `but not twice it (${held.toFixed(0)} ms)`);
+});
+
+test('a scene that does not say where its volume is is not clamped into somebody else\'s', () => {
+  // config.js's default box is grab-demo.html's metre-scale demo volume. The rig works nowhere near it,
+  // and clamping into it dragged a model at z = 40 cm back to z = 12 cm the instant it was grabbed —
+  // 28 cm of travel, 156 mm in a single frame — with no way to bring it forward again.
+  const scene = createSceneGrab({ unitsPerMetre: 100 });
+  assert.equal(scene.config.clampToVolume, false, 'no volume given, so nothing is clamped');
+  assert.equal(scene.config.settleGravity, 0, 'and nothing falls to a floor nobody declared');
+
+  const body = { id: 'm', pose: { position: { x: 0, y: 2, z: 40 }, quaternion: { x: 0, y: 0, z: 0, w: 1 }, scale: 1 },
+                 radius: 3.5, restOffset: 2 };
+  const input = makeInput();
+  const hand = input.hands[0];
+  let worstStep = 0, last = { ...body.pose.position };
+  for (let t = 16; t < 1200; t += 16) {
+    hand.active = true; hand.seenAt = t; hand.pinch = t > 200;
+    hand.gripRaw.set(0, 2, 40); hand.grip.set(0, 2, 40);
+    hand.jointsWorld = null;
+    scene.step(input, [body], t);
+    worstStep = Math.max(worstStep, Math.hypot(body.pose.position.x - last.x, body.pose.position.y - last.y,
+                                               body.pose.position.z - last.z));
+    last = { ...body.pose.position };
+  }
+  const moved = Math.hypot(body.pose.position.x, body.pose.position.y - 2, body.pose.position.z - 40);
+  console.log(`      a model at z = 40 cm, hand parked on it: moved ${moved.toFixed(2)} cm, ` +
+              `worst single frame ${(worstStep * 10).toFixed(1)} mm`);
+  assert.ok(moved < 1, `the model stays where it is (${moved.toFixed(2)} cm)`);
+  assert.ok(worstStep * 10 < 5, `and nothing jumps (${(worstStep * 10).toFixed(1)} mm in one frame)`);
+});
+
 test('the grab survives the cameras dropping frames', () => {
   const r = runChain({ noisePx: 1.0, dropEvery: 7 });       // ~14% of frames see nothing at all
   const ends = r.events.filter(e => e.name === 'grabEnd');

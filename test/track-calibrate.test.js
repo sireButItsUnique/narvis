@@ -54,6 +54,44 @@ test('the essential matrix recovers a known relative pose from noisy corresponde
   near(norm(sol.t), 1, 1e-9, 'translation comes back as a unit vector: scale is unobservable');
 });
 
+test('a fingertip waved in one plane is refused, not answered badly', () => {
+  const rng = mulberry32(21);
+  const a = makeCamera({ id: 'a', position: [-150, 200, 400], target: [0, -100, 0], fovDeg: 78, width: 1920, height: 1080 });
+  const b = makeCamera({ id: 'b', position: [150, 190, 380], target: [0, -100, 0], fovDeg: 78, width: 1920, height: 1080 });
+  const Rtrue = matMul(b.R, transpose(a.R));
+  // A lemniscate traced in a plane, with a controllable amount of motion OUT of that plane. The 8-point
+  // algorithm is degenerate on coplanar points and fails silently: the pose comes back tens of degrees
+  // wrong with a Sampson RMS that looks exactly like a good fit, so the diagnostics cannot be trusted and
+  // the degeneracy has to be tested for.
+  const wave = (depthMm) => {
+    const pairs = [];
+    for (let i = 0; i < 160; i++) {
+      const s = (i / 160) * Math.PI * 2;
+      const p = [140 * Math.sin(2 * s), -100 + 110 * Math.sin(s), depthMm * Math.sin(3 * s)];
+      const pa = a.project(p), pb = b.project(p);
+      if (!pa.inFrame || !pb.inFrame) continue;
+      pairs.push({ a: { u: pa.u + gaussian(rng) * 0.7, v: pa.v + gaussian(rng) * 0.7 },
+                   b: { u: pb.u + gaussian(rng) * 0.7, v: pb.v + gaussian(rng) * 0.7 } });
+    }
+    return pairs;
+  };
+  const flat = relativePoseRansac(a, b, wave(0), { thresholdPx: 2 });
+  console.log(`  flat wave: ok=${flat.ok}${flat.ok ? `, rotation off by ${rotationErrorDeg(flat.R, Rtrue).toFixed(1)} deg` : `, refused: ${flat.reason}`}`);
+  assert.equal(flat.ok, false, 'a coplanar wave is refused');
+  assert.equal(flat.degenerate, true);
+  assert.match(flat.reason, /plane/);
+  // ...and the same gesture with real depth in it still solves.
+  const deep = relativePoseRansac(a, b, wave(90), { thresholdPx: 2 });
+  assert.equal(deep.ok, true, `90 mm of out-of-plane motion solves (${deep.reason || ''})`);
+  const err = rotationErrorDeg(deep.R, Rtrue);
+  console.log(`  90 mm out of plane: rotation off by ${err.toFixed(2)} deg, ${deep.inliers.length} inliers`);
+  assert.ok(err < 3, `rotation recovered (${err.toFixed(2)} deg)`);
+  // and the refusal reaches the user rather than sitting in a return value nobody reads
+  const rep = calibrationReport({ triangulationMm: 4, relativePose: flat });
+  assert.equal(rep.poseDegenerate, true);
+  assert.ok(rep.warnings.some(w => /plane/.test(w)), rep.warnings.join(' | '));
+});
+
 test('gross outliers do not move the essential-matrix answer', () => {
   const rng = mulberry32(11);
   const a = makeCamera({ id: 'a', position: [-150, 200, 400], target: [0, -100, 0], fovDeg: 78, width: 1920, height: 1080 });

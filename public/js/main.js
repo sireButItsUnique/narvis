@@ -38,6 +38,7 @@ $('p-cal').addEventListener('click', () => {
   const med = [...cam.ipdHistory].sort((x, y) => x - y)[Math.floor(cam.ipdHistory.length / 2)];
   const fNew = S.knownDistCm * med / (S.ipdMm / 10);
   S.hfovDeg = 2 * Math.atan((cam.video.videoWidth / 2) / fNew) * 180 / Math.PI;
+  S.hfovCalibrated = true;            // from here on it is a measurement, and cameras.js may believe it
   saveSettings(); syncPanel(); eyeFilt.forEach(fl => fl.reset());
   flash(`Calibrated: webcam FOV ≈ ${S.hfovDeg.toFixed(1)}°`);
 });

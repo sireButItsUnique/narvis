@@ -20,6 +20,7 @@ export function vnorm(a) {
 }
 export const q1 = () => ({ x: 0, y: 0, z: 0, w: 1 });
 export const qcopy = q => ({ x: q.x, y: q.y, z: q.z, w: q.w });
+export const qconj = q => ({ x: -q.x, y: -q.y, z: -q.z, w: q.w });   // the inverse, for a unit quaternion
 export function qmul(a, b) {
   return {
     x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
