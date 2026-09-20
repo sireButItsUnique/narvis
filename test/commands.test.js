@@ -9,7 +9,10 @@ const cases = [
   ['make the handle bigger', { type: 'change', prompt: 'make the handle bigger' }],
   ['make it red', { type: 'color', color: '#d93a3a', prompt: 'make it red' }],   // goes to Fable, naming the pointed-at part; "quick red" is the instant one
   ['add wheels', { type: 'change', prompt: 'add wheels' }],
-  ['remove the handle', { type: 'change', prompt: 'remove the handle' }],
+  // A named delete. Whether "the handle" is a PART to remove or a FEATURE to model away is not in
+  // the words, only in the scene: main.js deletes it when a part answers to that name and hands the
+  // sentence to Fable when none does, which is what it meant before parts had names.
+  ['remove the handle', { type: 'delete', target: 'handle' }],
   ['turn it into a boat', { type: 'change', prompt: 'turn it into a boat' }],
   ['add a cube', { type: 'add', shape: 'box', word: 'cube', fresh: false }],
   ['add another sphere', { type: 'add', shape: 'sphere', word: 'sphere', fresh: false }],

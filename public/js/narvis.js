@@ -73,6 +73,7 @@ const LINES = {
     'Say that again, but as a command.',
   ],
   detail: ['Adding detail. This is the expensive part.', 'More triangles. Your laptop says hello.'],
+  delete: ['Gone. It was not my favourite either.', 'Removed. The scene is lighter already.', 'Deleted. No notes.'],
   export: ['Exported. Do not lose it.', 'Saved to disk, where things go to be forgotten.'],
 };
 
@@ -102,7 +103,7 @@ export function quipFor(cmd, rand = Math.random) {
     make: 'make', change: 'change', color: 'change', mode: 'mode', brush_pick: 'mode',
     brush: 'brush', scale: 'scale', mirror: 'mode', undo: 'undo', redo: 'redo',
     save_version: 'save_version', restore_version: 'restore_version', detail: 'detail',
-    export: 'export',
+    export: 'export', delete: 'delete',
   };
   return byType[cmd.type] ? quip(byType[cmd.type], rand) : '';
 }

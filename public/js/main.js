@@ -8,7 +8,7 @@ import { startCamera, track, drawDebug, eyeFilt, cam } from './input/webcam.js';
 import { updateInteraction, pointedPart, tool, TOOLS, SCULPT_TOOLS, setBrush, setNotify, zoomState } from './interaction.js';
 import * as sculpt from './sculpting.js';
 import { model, parts, showScene, clearScene, scaleBy, setSpin, turnBy, undo, undoDepth, resetPlacement, focusPart,
-         deletePart, duplicatePart, quickColor, quickFinish, layout, update as updateModel } from './model.js';
+         duplicatePart, quickColor, quickFinish, layout, update as updateModel } from './model.js';
 import { fetchScene } from './scene/load.js';
 import { initBuild, build, cancelBuild, work, toggleLog } from './scene/build.js';
 import { initVersions, refreshVersions, noteCurrent, restoreVersion, saveVersion, showVersions } from './scene/versions.js';
@@ -346,7 +346,9 @@ function setClay(on) {
 function runCommand(cmd) {
   if (!started) return;
   switch (cmd.type) {
-    case 'make':   return build(`make ${cmd.prompt}`, 'make');   // a new model: the server keeps the old one as a version, then empties Blender
+    // A make ADDS by default; 'replace' only when the words asked for it ("instead", "on its
+    // own"), in which case the server keeps what is there as a version before emptying Blender.
+    case 'make':   return build(`make ${cmd.prompt}`, cmd.replace ? 'replace' : 'add');
     case 'change': return build(withFocus(cmd.prompt), 'change');
     case 'color':  return build(withFocus(cmd.prompt), 'change');   // looks go to Fable; "quick red" is instant
     case 'quick_color': {
@@ -373,12 +375,7 @@ function runCommand(cmd) {
     case 'add':
       if (cmd.fresh) return build(`make a ${cmd.word}`, 'make');
       return flash(`Ask Fable: say "add a ${cmd.word} to it". Instant shapes come in a later build.`, 5000);
-    case 'delete': {
-      const part = pointedPart();
-      if (!part) return flash('Point at a part, then say "delete that"');
-      deletePart(part);
-      return flash(`Deleted ${part.name} ${LOCAL}`, 3500);
-    }
+    case 'delete': return deleteObject(cmd.target);
     case 'duplicate': {
       const part = pointedPart();
       if (!part) return flash('Point at a part, then say "duplicate that"');
@@ -443,6 +440,42 @@ function runCommand(cmd) {
 // back from Blender as a new rev, which means anything sculpted in the browser and not yet sent
 // back is lost - so say that out loud before doing it rather than after.
 let addingDetail = false;
+// "delete the teapot", or "delete that" for whatever you are pointing at.
+//
+// This deletes it in BLENDER, not just on screen. The page used to hide the part itself, which read
+// as a delete right up until the next revision brought it back - and it was still in the .blend and
+// still in anything exported, because the only program that had ever been told was this one.
+let deleting = false;
+async function deleteObject(target) {
+  if (!model.group) return flash('Nothing to delete yet');
+  if (deleting) return flash('Still deleting; one moment.');
+  // Named, or pointed at. Naming is the only way to reach something hidden behind another part.
+  const part = target ? parts.findByName(target) : pointedPart();
+  if (!part) {
+    if (!target) return flash('Point at a part, then say "delete that"', 4000);
+    // "remove the handle" is a delete when the handle is a part, and a modelling request when it is
+    // a feature of one. Nothing in the words tells them apart - only the scene does - so a name
+    // nobody on screen answers to goes to Fable, which is what it meant before parts had names.
+    return build(`remove the ${target}`, 'change');
+  }
+  deleting = true;
+  flash(`Deleting ${part.name}…`, 6000);
+  try {
+    const res = await fetch('/api/blender/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: [part.id] }),
+    });
+    const r = await res.json().catch(() => ({}));
+    if (!res.ok) return flash(r.message || `Could not delete (${res.status})`, 5000);
+    if (!r.changed) return flash(`${part.name} was not in Blender any more`, 4000);
+    await refreshScene();
+    return flash(`Deleted ${part.name} · ${parts.size} part${parts.size === 1 ? '' : 's'} left`, 3500);
+  } catch (err) {
+    return flash(`Could not delete: ${err.message}`, 5000);
+  } finally {
+    deleting = false;
+  }
+}
+
 // The zoom readout, while a hand is actually zooming. Two jobs: keep the distance on the badge
 // live, and explain the one wall a pull can run into that is not the user's arm - pop-out is off,
 // so the model stops at the screen and cannot come any nearer. That is a setting nobody can see,

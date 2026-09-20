@@ -75,7 +75,8 @@ export async function build(prompt, mode) {
   if (work.job) return hooks.flash(work.job.kind === 'build' ? 'Still building the last one. Say "cancel" to stop it.'
                                                             : 'One moment, still busy with the last job.');
   const controller = new AbortController();
-  startJob('build', `${mode === 'make' ? 'Making' : 'Changing'}: ${prompt}`, controller);
+  const verb = mode === 'change' ? 'Changing' : mode === 'replace' ? 'Starting over' : 'Adding';
+  startJob('build', `${verb}: ${prompt}`, controller);
   $('bp-cost').textContent = '';
   log(`“${prompt}”`, 'request');
   setStatus('Starting…');

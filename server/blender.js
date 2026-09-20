@@ -130,7 +130,15 @@ const sceneBrief = s => (s?.objects || []).map(o => `${o.name} (${o.type}${o.ver
 function userMessage(prompt, mode, scene) {
   const note = mode === 'change'
     ? 'it sounds like a change to something already in the scene, but if the scene makes the other reading clearly right, do that'
-    : 'they asked for something new, and the scene has been emptied for it';
+    : mode === 'replace'
+      ? 'they asked for something new, and the scene has been emptied for it'
+      // Additive is the default, and it needs saying twice: the scene is NOT empty, and the new
+      // thing goes BESIDE what is there rather than on top of it. A model built at the origin
+      // because nobody mentioned the others is a model inside the last one.
+      : 'they asked for something NEW to stand alongside what is already in the scene. Do not delete, '
+        + 'move or alter anything that is already there. Build the new object clear of the others - '
+        + 'look at what is in the scene, work out where there is room, and put it there - and keep it '
+        + 'to a similar size and triangle count, because everything on the table shares one budget';
   return `The user said: "${prompt}"\n(This came from speech recognition, so a word may be misheard; ${note}.)`
     + `\n\nThe scene right now: ${sceneBrief(scene)}.`;
 }

@@ -88,6 +88,10 @@ const CHANGE_TAIL = new RegExp(`\\b(?:(?!(?:${ER_NOUNS})$)[a-z]{2,}(?:er|ier)|mo
   + `rounded|spiky|fluffy|furry|symmetrical|visible|invisible|bald|open|closed|upright|sideways|`
   + `into .+|look .+|(?:dark |light |bright )?(?:${Object.keys(COLORS).join('|')}))$`);
 const THAT_WORDS = 'it|this|that|this part|that part|this one|that one';
+// The words that mean "and get rid of what is there", as people actually say them. Without one of
+// these a "make" adds to the scene, because asking for a second thing and losing the first is the
+// one outcome nobody means.
+const REPLACE_WORDS = /\s*\b(?:instead(?: of (?:this|that|it|the \w+))?|on its own|by itself|from scratch|starting over|and clear the (?:rest|scene)|replacing (?:this|that|it|everything))\b\s*/;
 const THAT = `(?:${THAT_WORDS})`;
 
 // "version three", "version 3", "version to" (a misheard two), "version twenty one"
@@ -313,6 +317,12 @@ export function parseCommand(text) {
     return { type: 'clear' };
   }
   if (new RegExp(`^(?:delete|remove|erase|get rid of)(?: (?:${THAT_WORDS}|the model|the object))?$`).test(t)) return { type: 'delete' };
+  // "delete the teapot", "get rid of the second cube": name the thing instead of pointing at it,
+  // which is the only way to do it at all when the thing you mean is behind something else.
+  if ((m = t.match(/^(?:delete|remove|erase|get rid of|take away)(?: the| that| this)? ([a-z0-9_ -]+?)(?: please)?$/))
+      && !/^(?:everything|all|it|this|that|model|object|scene)$/.test(m[1])) {
+    return { type: 'delete', target: m[1].trim() };
+  }
   if (new RegExp(`^(?:duplicate|copy|clone)(?: ${THAT})?$`).test(t)) return { type: 'duplicate' };
   if (/^(?:(?:export|save|download)(?: (?:it|this|that|the model|model))?(?: (?:to|for) blender)?|send (?:it |this )?to blender)$/.test(t)) {
     return { type: 'export' };
@@ -347,7 +357,13 @@ export function parseCommand(text) {
 
   if ((m = t.match(/^(make|create|build|generate|design|model|draw|give me|show me|i want|i need)(?: me)? (.+)$/))) {
     if (m[1] === 'make' && (REFERS.test(m[2]) || (/^the\b/.test(m[2]) && CHANGE_TAIL.test(m[2])))) return { type: 'change', prompt: t };
-    return { type: 'make', prompt: m[2] };
+    // Every "make" ADDS to the scene. Asking for a second thing and losing the first is the one
+    // outcome nobody means, so emptying the scene has to be asked for in words - "instead", "on its
+    // own", "start over" - and those words are how people say it when they do mean it.
+    // `replace` is only present when it was asked for. Adding is the default, so the default shape
+    // is the plain one and nothing downstream has to remember which way round the flag reads.
+    const prompt = m[2].replace(REPLACE_WORDS, ' ').replace(/\s+/g, ' ').trim();
+    return REPLACE_WORDS.test(m[2]) ? { type: 'make', prompt, replace: true } : { type: 'make', prompt };
   }
   if (/^(?:change|modify|edit|adjust|update|alter|tweak|replace|swap|recolou?r|colou?r|paint|turn (?:it|this|that) into|give (?:it|this|that)|add|attach|put|place|remove|delete|take (?:off|away)|get rid of|move|raise|lower|widen|stretch|flatten|round|thicken|lengthen|shorten|rotate|tilt|flip|mirror|resize|scale|duplicate|copy|double) .+/.test(t)) {
     return { type: 'change', prompt: t };

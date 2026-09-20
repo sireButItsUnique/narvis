@@ -121,6 +121,40 @@ async function blenderDetail(req, res) {
   }
 }
 
+// Delete objects, in Blender, for good. The page could hide a part on its own - it did, and that was
+// the problem: the thing came back on the next revision, it was still in the .blend, and it was
+// still in anything exported. A delete somebody asked for out loud has to be the real one.
+const DELETE_PY = (ids) => `
+ids = ${JSON.stringify(ids)}
+gone = []
+for o in [o for o in bpy.data.objects if o.get('holo_id') in ids]:
+    gone.append(o.name)
+    bpy.data.objects.remove(o, do_unlink=True)
+print('deleted: %s' % (', '.join(gone) if gone else 'nothing'))
+`;
+
+async function blenderDelete(req, res) {
+  let body;
+  try { body = await readJson(req); } catch (err) { return sendJson(res, 400, { error: 'bad_request', message: err.message }); }
+  const ids = Array.isArray(body.ids) ? body.ids.filter(s => typeof s === 'string').slice(0, 40) : [];
+  if (!ids.length) return sendJson(res, 400, { error: 'bad_request', message: 'which part?' });
+  const release = lock('detail');
+  if (!release) return sendJson(res, 409, { error: 'busy', message: busyMessage() });
+  try {
+    const r = await bridge('exec', { code: DELETE_PY(ids), label: 'Delete' }, { timeout: 60000 });
+    if (!r.ok) return sendJson(res, 502, { error: 'blender', message: r.error || 'delete failed' });
+    const note = String(r.output || '').trim().split('\n').pop() || '';
+    if (/nothing/.test(note)) return sendJson(res, 200, { ok: true, changed: false, message: 'nothing to delete' });
+    const state = await publish('deleted');
+    return sendJson(res, 200, { ok: true, changed: true, message: note, rev: state.rev });
+  } catch (err) {
+    const status = err instanceof BridgeError || err instanceof SceneError ? 502 : 500;
+    return sendJson(res, status, { error: 'blender', message: err.message });
+  } finally {
+    release();
+  }
+}
+
 // The sculpt stream (server/edits.js): the only copy of a brush stroke that exists anywhere, since
 // Blender never sees one. GET reads a revision's strokes back in order, POST appends one, DELETE
 // takes the newest off (undo) or the lot (?all=1).
@@ -171,13 +205,16 @@ async function blenderBuild(req, res) {
     send(ev);
   };
   const t0 = Date.now();
-  const mode = body.mode === 'change' ? 'change' : 'make';
+  // 'add' a new object beside what is there (the default), 'replace' the lot, or 'change' what exists
+  const mode = ['change', 'replace', 'add'].includes(body.mode) ? body.mode : 'add';
   let published = false;   // also "tried": a failed export is not worth a second go in the finally
   let cleared = false;     // Blender was emptied, so the page's rev is stale even if the build then did nothing
   try {
-    // "make a ___" is a new model, not an addition: keep what's there as a version and empty Blender first,
-    // or every build piles onto the last one and shares the triangle budget with it
-    if (mode === 'make') {
+    // A "make" ADDS to the scene. Asking for a second thing and losing the first is the one outcome
+    // nobody means, so the scene is only emptied when the words asked for it ("instead", "on its
+    // own", "start over"), which is how people say it when they do mean it. The cost of being
+    // additive is that every object shares the triangle budget, which is what the brief tells Fable.
+    if (mode === 'replace') {
       send({ type: 'status', text: 'Clearing the scene…' });
       const kept = await checkpointIfChanged('before a new model');
       if (kept) send({ type: 'saved', version: kept, kept: true });
@@ -375,6 +412,9 @@ http.createServer((req, res) => {
   }
   if (pathname === '/api/blender/detail') {
     return req.method === 'POST' ? blenderDetail(req, res) : sendJson(res, 405, { error: 'method_not_allowed', message: 'POST only' });
+  }
+  if (pathname === '/api/blender/delete') {
+    return req.method === 'POST' ? blenderDelete(req, res) : sendJson(res, 405, { error: 'method_not_allowed', message: 'POST only' });
   }
   if (pathname === '/api/edits') return editsRoute(req, res);
   if (pathname === '/api/history' || pathname.startsWith('/api/history/')) return historyRoute(req, res, pathname);
