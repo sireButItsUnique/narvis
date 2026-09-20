@@ -89,9 +89,10 @@ for (const key of brushKeys()) {
       if (ok) moved++;
     }
     const record = engine.endStroke();
-    if (record) { dirty = record.idx.length; engine.applyHistory(record, 'undo'); }
-    // Mask moves no positions, so it has no undo record and applyDab reports "nothing moved".
-    // Count what it actually did and reset the channel instead.
+    // A whole-part record drops the index array, so its size is in `after` instead.
+    if (record) { dirty = record.whole ? record.after.length / 3 : (record.idx?.length ?? 0); engine.applyHistory(record, 'undo'); }
+    // Mask moves no positions, so applyDab reports "nothing moved". Count what it actually did and
+    // reset the channel instead (its record is a mask record, which applyHistory has just undone).
     if (brush.key === 'mask') {
       const m = handle.proxy.getMask();
       for (let i = 0; i < m.length; i++) if (m[i] > 0) { dirty++; m[i] = 0; }

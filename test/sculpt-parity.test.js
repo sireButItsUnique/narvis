@@ -38,6 +38,10 @@ const PLANE_LIKE = new Set(['clay', 'clay_strips', 'plane', 'snake_hook']);
 // is close to it today (the worst is clay_strips at 0.70%), which is what makes it a useful net:
 // a real regression in a kernel moves the whole field, not three vertices.
 const RMS_TOLERANCE = 0.01;
+// One case earns a bigger RMS budget, with the measurement that justifies it; see TRIM below.
+const CASE_RMS_TOLERANCE = {
+  trim_invert: 0.025,
+};
 
 // Some cases get their own budget, each with the measurement that justifies it.
 //
@@ -123,6 +127,33 @@ const CASE_TOLERANCE = {
   pinch: 0.03,
   mask: 0.05,
   mask_face: 0.035,
+  // TRIM, and the inverted half of the Plane family. These cases are new: every fixture used to be
+  // recorded with mode='NORMAL', which is how a completely dead inverted mode went unnoticed for
+  // the whole Plane family, and Plateau and Trim had no fixture at all. Plateau lands at 2.49%
+  // (1.51% inverted) on the ordinary 5% plane budget. Trim does not, and the reason is the mesh,
+  // not the kernel - the same story as clay_strips above, only sharper:
+  //
+  //                          2,562-vertex sphere    10,242-vertex sphere
+  //   trim                   6.76%  (rms 0.35%)     5.59%  (rms 0.25%)
+  //   trim_invert           39.49%  (rms 1.97%)     7.96%  (rms 0.32%)
+  //   scrape_invert          5.31%  (rms 0.39%)     3.81%  (rms 0.26%)
+  //
+  // Trim carries hardness 0.6, so its weight is a flat top with a very sharp shoulder, and the
+  // Plane kernel multiplies that weight by the vertex's OWN distance to the brush plane - so a
+  // vertex that lands a hair inside or outside the shoulder swings by a large fraction of the
+  // deepest cut in the stroke (7.4 cm). Inverted it is worse again, because the swap turns off the
+  // side above the plane, and the surviving side is bounded by the plane itself: on the coarse
+  // sphere the whole 39% is four adjacent vertices (1046-1049), 109 of the 114 vertices Blender
+  // moved are ours too, and refining the mesh once takes it to 7.96% with the RMS back to 0.32%.
+  // Blender's own maths is reproduced exactly (apply_hardness_to_distances, calc_local_distances
+  // and the PLANE brush_strength row were each checked line by line against 5.2.1); the dense
+  // variants are the honest test of the kernel, and the coarse ones are kept because they are what
+  // the other Plane cases use.
+  trim: 0.07,
+  trim_dense: 0.06,
+  trim_invert: 0.42,
+  trim_invert_dense: 0.09,
+  scrape_invert: 0.06,
 };
 
 await loadPresets();
@@ -148,6 +179,10 @@ function replay(ref) {
   engine.setPressureEnabled(true);
   engine.setRadiusWorld(ref.radius);
   engine.setSymmetry({ x: !!ref.mirror_x });
+  // Ctrl-held strokes. The dumper recorded mode='NORMAL' for everything until the Plane family's
+  // dead inverted mode turned up, so a fixture without a mode is a normal stroke; the invert has to
+  // be set BEFORE the first dab, because Blender fixes the stroke's direction at stroke start.
+  engine.setInvert(ref.mode === 'INVERT');
 
   for (const dab of ref.dabs) {
     engine.applyDab({
@@ -218,9 +253,10 @@ test('Blender parity', { skip: files.length === 0 ? 'no fixtures: run npm run pa
         `  rms ${r.rms.toExponential(2)} (${rmsPercent.toFixed(2)}%)`,
       );
       assert.ok(r.maxDisp > 0, 'the reference stroke changed nothing');
+      const rmsTol = CASE_RMS_TOLERANCE[ref.case] ?? RMS_TOLERANCE;
       assert.ok(
-        rmsPercent <= RMS_TOLERANCE * 100,
-        `${ref.case}: RMS ${rmsPercent.toFixed(2)}% of Blender's max displacement, over the ${(RMS_TOLERANCE * 100).toFixed(0)}% budget`,
+        rmsPercent <= rmsTol * 100,
+        `${ref.case}: RMS ${rmsPercent.toFixed(2)}% of Blender's max displacement, over the ${(rmsTol * 100).toFixed(1)}% budget`,
       );
       assert.ok(
         r.percent <= tol * 100,

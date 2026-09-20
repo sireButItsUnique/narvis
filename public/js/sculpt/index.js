@@ -17,7 +17,9 @@
 //       worldRay: {origin:[x,y,z]|Vector3, direction:[x,y,z]|Vector3}. Drives the brush ring.
 //
 //   beginStroke(input) / sampleStroke(input) / endStroke(input?)
-//       input: {worldRay, point3D, pressure, timeMs, part}
+//       input: {worldRay, point3D, pressure, timeMs, part}. A sample carrying a non-finite number
+//       (MediaPipe dropping a landmark, a divide by a zero-length gaze vector) is REJECTED whole:
+//       the stroke stays alive and the mesh is untouched.
 //         worldRay  - eye -> fingertip ray, used to place each dab on the surface
 //         point3D   - the 3D pinch point (world). The grab family deforms by ITS delta; other
 //                     brushes fall back to the surface point under the ray.
@@ -31,8 +33,12 @@
 //       Brush keys come from brushes/registry.js ('draw', 'smooth', 'grab', 'inflate', ...).
 //       Radius is in WORLD units (metres in the box), never pixels.
 //
-//   applyHistory(record, 'undo'|'redo')   put a stroke record back, exactly
-//   filter(name, options) / maskOp(name, options)   whole-part operations (filled in by set-b)
+//   applyHistory(record, 'undo'|'redo')   put a stroke or mask record back, exactly
+//   drainRecords()   records orphaned by a re-fired beginStroke, a cross-part applyDab or a
+//                    filter() run mid-stroke; the page's timeline must pick these up or the
+//                    interrupted stroke becomes un-undoable
+//   filter(name, options) / maskOp(name, options)   whole-part operations (filled in by set-b);
+//                    both return an undo record (or null)
 //   registerFilter(name, fn) / registerMaskOp(name, fn)   how set-b plugs them in
 //   applyDab(input)   one dab exactly as given, no spacing and no stabiliser (parity replay,
 //                     scripted edits); input adds {overlap, first, settings}
@@ -47,16 +53,49 @@ import { intersectionRayTriangle } from './vendor/SculptorUtils.js';
 import { createBinding } from './binding.js';
 import { calcFactors } from './factors.js';
 import {
-  createCache, brushStrength, brushFlip, calcAreaNormalAndCenter, radiusLocalFromWorld, accumulateFor,
+  createCache, brushStrength, brushFlip, calcAreaNormalAndCenter, calcStabilizedPlane,
+  radiusLocalFromWorld, accumulateFor,
 } from './cache.js';
 import { StrokeStepper, NO_LAZY_BRUSHES, NEEDS_STROKE_DIRECTION, DAB_BUDGET_MS } from './stroke.js';
 import { applySymmetryPass, symmetryFlags, symmetryPasses, flipVec, symmetryFeather, routeMirrorPass } from './symmetry.js';
 import { smoothDab } from './smooth.js';
 import { getBrush, getBrushForPreset, brushKeys } from './brushes/registry.js';
 import { brushSettings, loadPresets, clampRadius, RADIUS_DEFAULT_M } from './presets.js';
-import { buildRecord, applyRecord } from './undo.js';
+import { buildRecord, buildMaskRecord, applyRecord } from './undo.js';
 
 const _v = (a) => (Array.isArray(a) ? a.slice() : [a.x, a.y, a.z]);
+
+// ---------------------------------------------------------------- input sanity
+//
+// The hand is an input device that lies. MediaPipe drops a landmark, the page divides by a
+// zero-length gaze vector, and a NaN arrives at 30 Hz. Nothing downstream survives one: a NaN
+// position poisons the octree's AABBs, after which a sphere query stops pruning and returns EVERY
+// face, so the NEXT clean dab writes NaN to the whole part and the mesh vanishes (measured: one bad
+// sample plus twenty clean ones took a 60k-triangle part to 89406/89406 non-finite floats). So the
+// numbers are checked once, at the API boundary, and a bad sample is dropped whole.
+
+function finiteVec(v) {
+  if (!v) return false;
+  if (typeof v.x === 'number') return Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
+  return v.length >= 3 && Number.isFinite(v[0]) && Number.isFinite(v[1]) && Number.isFinite(v[2]);
+}
+
+function finiteRay(ray) {
+  if (!ray) return false;
+  return finiteVec(ray.origin ?? ray.o) && finiteVec(ray.direction ?? ray.dir ?? ray.d);
+}
+
+/** True when every number the engine will read from this sample is finite. */
+function finiteInput(input) {
+  if (!input) return false;
+  if (input.worldRay != null && !finiteRay(input.worldRay)) return false;
+  if (input.point3D != null && !finiteVec(input.point3D)) return false;
+  // Pressure looks harmless only because it is forced to 1 while setPressureEnabled(false); with
+  // pressure on, one NaN sample poisons Draw through the ordinary stroke API and spreads.
+  if (input.pressure != null && !Number.isFinite(input.pressure)) return false;
+  if (input.timeMs != null && !Number.isFinite(input.timeMs)) return false;
+  return true;
+}
 
 function uniformScaleOf(matrix) {
   if (!matrix) return 1;
@@ -99,17 +138,78 @@ function gatherVerts(proxy, center, radius) {
   return proxy.getVerticesFromFaces(faces);
 }
 
-function allVerts(proxy) {
+/**
+ * Every vertex of the part, cached on the handle. Elastic Grab and the filters ask for this on
+ * every dab and every symmetry pass, and building a fresh 200k-entry Uint32Array each time was
+ * megabytes of garbage a second next to a WebGL render loop.
+ */
+function allVerts(handleOrProxy) {
+  const handle = handleOrProxy.proxy ? handleOrProxy : null;
+  const proxy = handle ? handle.proxy : handleOrProxy;
   const n = proxy.getNbVertices();
+  if (handle && handle._allVerts && handle._allVerts.length === n) return handle._allVerts;
   const out = new Uint32Array(n);
   for (let i = 0; i < n; i++) out[i] = i;
+  if (handle) handle._allVerts = out;
   return out;
+}
+
+/**
+ * The per-dab scratch, grown on demand and reused across dabs and symmetry passes. Allocating
+ * these inside the dab loop cost 0.6-11 MB of garbage per dab, which showed up as GC pauses of
+ * 30-47 ms in the middle of a stroke.
+ */
+function dabBuffers(handle, n) {
+  const b = handle._buf;
+  if (b.n < n) {
+    b.n = Math.max(n, b.n * 2);
+    b.factors = new Float32Array(b.n);
+    b.distances = new Float32Array(b.n);
+    b.translations = new Float32Array(b.n * 3);
+    b.smoothFactors = new Float32Array(b.n);
+    b.smoothPositions = new Float32Array(b.n * 3);
+  }
+  return b;
+}
+
+/**
+ * A stamped set of vertex ids: the same job as `new Set()` with no allocation and no hashing.
+ * The stamp starts at 0 and the tick at 1, so the mark array never has to be cleared.
+ */
+function makeVertSet(n) {
+  return {
+    mark: new Int32Array(n),
+    list: new Uint32Array(n),
+    tick: 0,
+    size: 0,
+    begin() { this.tick++; this.size = 0; },
+    add(v) {
+      if (this.mark[v] === this.tick) return;
+      this.mark[v] = this.tick;
+      this.list[this.size++] = v;
+    },
+    verts() { return this.list.subarray(0, this.size); },
+  };
+}
+
+/** A Uint32Array view of the proxy's touched list, reusing one buffer per part. */
+function touchedView(handle, touched) {
+  let a = handle._touchedBuf;
+  if (!a || a.length < touched.length) {
+    a = new Uint32Array(Math.max(touched.length, 256));
+    handle._touchedBuf = a;
+  }
+  for (let i = 0; i < touched.length; i++) a[i] = touched[i];
+  return a.subarray(0, touched.length);
 }
 
 export function createSculptEngine(engineOptions = {}) {
   const parts = new Map();
   const filters = new Map();
   const maskOps = new Map();
+  // Undo records for strokes that were interrupted rather than ended; drainRecords() hands them to
+  // the page's timeline. Without this they were simply dropped, and the edits became permanent.
+  const pendingRecords = [];
 
   const state = {
     brushKey: 'draw',
@@ -200,6 +300,7 @@ export function createSculptEngine(engineOptions = {}) {
     proxy.initFromWelded(binding.positions, binding.triangles, binding.triRenderMap, binding.faceMaterial);
 
     const matrixWorld = options.matrixWorld ?? part?.matrixWorld ?? new THREE.Matrix4();
+    const nbVerts = proxy.getNbVertices();
     const handle = {
       id,
       object: part && part.isObject3D ? part : null,
@@ -210,9 +311,18 @@ export function createSculptEngine(engineOptions = {}) {
       scale: uniformScaleOf(matrixWorld),
       selfSymmetric: options.selfSymmetric !== false,
       rootMatrixWorld: options.rootMatrixWorld ?? null,
+      // The matrix this handle's inverse and scale were derived from, so frame() can tell when the
+      // object has moved under us without the page having to say so.
+      _mwSnapshot: new THREE.Matrix4().copy(matrixWorld),
+      _buf: { n: 0, factors: null, distances: null, translations: null, smoothFactors: null, smoothPositions: null },
+      _dirty: makeVertSet(nbVerts),
+      _allVerts: null,
+      _touchedBuf: null,
       sync() {
+        handle._mwSnapshot.copy(handle.matrixWorld);
         handle.worldToLocal.copy(handle.matrixWorld).invert();
         handle.scale = uniformScaleOf(handle.matrixWorld);
+        return handle;
       },
       detach() { parts.delete(id); },
     };
@@ -220,12 +330,57 @@ export function createSculptEngine(engineOptions = {}) {
     return handle;
   }
 
+  // The part's matrixWorld is a LIVE reference to the object's own matrix, so three.js keeps it
+  // current while the inverse and the scale we derived from it go stale the moment the user turns
+  // or moves the model - and hover() then transformed the ray with the stale inverse and the hit
+  // point with the live matrix, so the brush landed 100 mm from the ring on a 200 mm cube, or the
+  // raycast missed entirely and sculpting silently stopped. Sixteen float compares per call is
+  // nothing next to the octree raycast that follows, and the page should not have to know.
+  function frame(handle) {
+    if (!handle._mwSnapshot.equals(handle.matrixWorld)) handle.sync();
+    return handle;
+  }
+
+  const _relMatrix = new THREE.Matrix4();
+  const _invMatrix = new THREE.Matrix4();
+  const IDENTITY = new THREE.Matrix4().elements.slice();
+
+  /**
+   * createBinding reads every child's position attribute verbatim and scatters straight back into
+   * it, while the handle's world matrix is the PARENT's - so a child carrying its own transform is
+   * welded, raycast and written back in the wrong space, and (because the weld key is the
+   * child-local position) cross-welded with its siblings into one body. GLTFLoader keeps the
+   * primitives of one multi-material object at identity, which is the case attach() documents;
+   * anything else fails silently in both directions, so refuse it instead.
+   */
+  function assertChildInPartSpace(part, child) {
+    if (!part?.matrixWorld || !child?.matrixWorld) return;
+    _relMatrix.copy(child.matrixWorld).premultiply(_invMatrix.copy(part.matrixWorld).invert());
+    const e = _relMatrix.elements;
+    for (let i = 0; i < 16; i++) {
+      if (Math.abs(e[i] - IDENTITY[i]) <= 1e-6) continue;
+      throw new Error(
+        `holosculpt: attach() cannot bind "${child.name || child.uuid}": it carries its own transform ` +
+        'inside the part. Bake it into the geometry, or attach it as its own part.',
+      );
+    }
+  }
+
   function collectGeometries(part) {
     if (!part) throw new Error('holosculpt: attach() needs a part');
     if (Array.isArray(part) || part.isBufferGeometry || part.geometries) return part.geometries ?? part;
+    // A Mesh IS the part; never sweep up its children. The page hangs an identity fresnel overlay
+    // that SHARES the part's geometry on the hovered part (scene/highlight.js), and binding that
+    // too doubles the proxy and perturbs the smooth brush.
+    if (part.isMesh) return [part];
     const out = [];
-    if (part.isMesh) out.push(part);
-    if (part.children) for (const c of part.children) if (c.isMesh) out.push(c);
+    if (part.children) {
+      for (const c of part.children) {
+        if (!c.isMesh) continue;
+        assertChildInPartSpace(part, c);
+        out.push(c);
+      }
+    }
     if (out.length === 0) throw new Error('holosculpt: attach() found no mesh on the part');
     return out;
   }
@@ -245,6 +400,7 @@ export function createSculptEngine(engineOptions = {}) {
   const _n3 = new THREE.Matrix3();
 
   function rayToLocal(handle, worldRay) {
+    frame(handle);
     const o = _v(worldRay.origin ?? worldRay.o);
     const d = _v(worldRay.direction ?? worldRay.dir ?? worldRay.d);
     _p.set(o[0], o[1], o[2]).applyMatrix4(handle.worldToLocal);
@@ -254,12 +410,14 @@ export function createSculptEngine(engineOptions = {}) {
   }
 
   function pointToLocal(handle, world) {
+    frame(handle);
     const w = _v(world);
     _p.set(w[0], w[1], w[2]).applyMatrix4(handle.worldToLocal);
     return [_p.x, _p.y, _p.z];
   }
 
   function pointToWorld(handle, local) {
+    frame(handle);
     _p.set(local[0], local[1], local[2]).applyMatrix4(handle.matrixWorld);
     return [_p.x, _p.y, _p.z];
   }
@@ -267,6 +425,9 @@ export function createSculptEngine(engineOptions = {}) {
   // ---------------------------------------------------------------- hover
 
   function hover(worldRay, partRef) {
+    // hover() runs every frame to place the brush ring, so it is the first thing a half-built ray
+    // reaches: before the hand tracker's first sample, or when a landmark drops out.
+    if (!finiteRay(worldRay)) return { hit: false, radiusWorld: state.radiusWorld };
     const candidates = partRef ? [partOf(partRef)].filter(Boolean) : [...parts.values()];
     let best = null;
     for (const handle of candidates) {
@@ -291,12 +452,17 @@ export function createSculptEngine(engineOptions = {}) {
 
   // ---------------------------------------------------------------- one dab
 
-  function dabContext(handle, settings, verts) {
+  function dabContext(handle, settings, verts, dirty) {
     const proxy = handle.proxy;
-    const factors = new Float32Array(verts.length);
-    const distances = new Float32Array(verts.length);
-    const translations = new Float32Array(verts.length * 3);
-    const dirty = new Set();
+    const b = dabBuffers(handle, verts.length);
+    // Length-correct views: draw.js and friends iterate factors.length, so handing a brush the
+    // over-sized backing buffer would run the kernel past the end of `verts`.
+    const factors = b.factors.subarray(0, verts.length);
+    const distances = b.distances.subarray(0, verts.length);
+    const translations = b.translations.subarray(0, verts.length * 3);
+    // commit() reads every entry, and clay-strips and plane only write some of them, so a reused
+    // buffer would leak the previous dab's displacement into vertices this dab never touched.
+    translations.fill(0);
     const ctx = {
       proxy,
       handle,
@@ -352,9 +518,12 @@ export function createSculptEngine(engineOptions = {}) {
    * {worldRay, point3D, pressure, overlap, first, settings}.
    */
   function applyDab(input, partRef) {
+    if (!finiteInput(input)) return false;
     const handle = partOf(partRef ?? state.stroke?.part);
     if (!handle) throw new Error('holosculpt: no part attached');
     const started = state.stroke && state.stroke.handle === handle;
+    // A dab aimed at a different part re-points the stroke, so the old part's edits have to be
+    // banked first or they can never be undone (beginStrokeInternal flushes).
     if (!started) beginStrokeInternal(handle, input, true);
     const t0 = (globalThis.performance?.now?.() ?? Date.now());
     const moved = dabOnPart(handle, input);
@@ -365,6 +534,7 @@ export function createSculptEngine(engineOptions = {}) {
   function dabOnPart(handle, input) {
     const proxy = handle.proxy;
     const cache = handle._cache;
+    frame(handle); // elastic.js reads handle.worldToLocal directly; make sure it is current
     const settings = input.settings ? { ...input.settings } : settingsFor();
     const brush = input.brush || state.brush;
     const type = settings.sculpt_brush_type || brush.type;
@@ -402,7 +572,11 @@ export function createSculptEngine(engineOptions = {}) {
     cache.location = location;
     cache.pressure = state.pressureEnabled ? (input.pressure ?? 1) : 1;
     cache.hardness = settings.hardness || 0;
-    cache.radius = radiusLocalFromWorld(state.radiusWorld, handle.scale);
+    // The part's scale is pinned to the stroke start: a model rotated or moved mid-stroke re-frames
+    // (frame() above), but resizing it must not change the local radius under a running stroke,
+    // whose cached radius, anchor and stroke-start snapshot are all part-local. Blender pins
+    // cache->initial_radius the same way.
+    cache.radius = radiusLocalFromWorld(state.radiusWorld, cache.strokeScale || handle.scale);
     cache.radiusSquared = cache.radius * cache.radius;
 
     // Hand delta, Blender's brush_delta_update in 3D: total from the stroke start for the grab
@@ -428,8 +602,39 @@ export function createSculptEngine(engineOptions = {}) {
     }
     cache.oldGrabLocation = grabPoint.slice();
 
+    const nrf = settings.normal_radius_factor ?? 0.5;
+    const arf = settings.area_radius_factor ?? nrf;
+    const gatherScale = Math.max(1, nrf, brush.needsAreaCenter ? arf : 0);
+
     if (brush.needsStrokeDirection || NEEDS_STROKE_DIRECTION.has(type)) {
-      if (cache.firstTime) { cache.firstTime = false; return false; } // no direction yet
+      if (cache.firstTime) {
+        if (brush.needsAreaNormal || brush.needsAreaCenter) {
+          applySymmetryPass(cache, 0);
+          cache._origPositions = proxy.getOrigPositions();
+          cache._origNormals = proxy.getOrigNormals();
+          const first = gatherVerts(proxy, cache.locationSymm, cache.radius * gatherScale);
+          if (first.length > 0) {
+            for (let k = 0; k < first.length; k++) proxy.stampOriginal(first[k]);
+            // Blender runs update_sculpt_normal BEFORE the cube-tip first-step return
+            // (sculpt.cc:3523 against :3529), so a brush that drops this dab still leaves the
+            // stroke holding THIS dab's area normal - the one "original normal" freezes. It never
+            // reaches calc_brush_plane, so last_center keeps its zero init, and that is what
+            // "original plane" freezes such a brush to.
+            //
+            // The PLANE brush is the exception, and it matters. BKE_brush_has_cube_tip is true
+            // only for Multiplane Scrape or a tip_roundness below 1 (or a tip_scale_x off 1), and
+            // all five Essentials Plane presets are round: Blender does NOT skip their first step.
+            // plane::calc_node_mask runs the whole plane calculation there, stabiliser included,
+            // and only do_plane_brush's own zero-grab-delta check stops it depositing. Skipping it
+            // cost the rolling average its first sample, which is invisible while stabilize_* is 0
+            // (Flatten, Scrape, Fill) and 34-78% of Blender's displacement when it is 1 (Trim,
+            // Plateau).
+            updateAreaData(handle, settings, brush, first, { normalOnly: type !== 'PLANE' });
+          }
+        }
+        cache.firstTime = false;
+        return false; // no direction yet
+      }
     }
 
     // Restore the stroke-start shape first (grab family), so the total delta is applied once.
@@ -449,15 +654,21 @@ export function createSculptEngine(engineOptions = {}) {
       planeInversionMode: settings.plane_inversion_mode,
     });
     cache.bstrength = cache.baseStrength * feather;
-    if (cache.firstTime) cache.initialDirectionFlipped = flip < 0;
+    // (cache.initialDirectionFlipped is seeded once in beginStrokeInternal, where Blender sets it.)
 
-    const dirty = new Set();
+    // Second belt for the finite check at the API boundary: a poisoned cache or a kernel bug would
+    // otherwise write NaN into the proxy, and once ONE position is non-finite the octree's AABBs
+    // stop pruning, so the next dab is a whole-part wipe whatever its source.
+    if (!finiteVec(cache.location) || !finiteVec(cache.grabDelta) || !Number.isFinite(cache.bstrength)) {
+      cache.firstTime = false;
+      return false;
+    }
+
+    const dirty = handle._dirty;
+    dirty.begin();
     const useOriginalData = !!brush.usesOriginalData;
     cache._origPositions = proxy.getOrigPositions();
     cache._origNormals = proxy.getOrigNormals();
-    const nrf = settings.normal_radius_factor ?? 0.5;
-    const arf = settings.area_radius_factor ?? nrf;
-    const gatherScale = Math.max(1, nrf, brush.needsAreaCenter ? arf : 0);
 
     for (const pass of symmetryPasses(state.symmetry)) {
       applySymmetryPass(cache, pass);
@@ -472,7 +683,7 @@ export function createSculptEngine(engineOptions = {}) {
       if (target !== handle) continue; // cross-part routing lands in M3 with the part registry
 
       const verts = brush.allVertices
-        ? allVerts(proxy)
+        ? allVerts(handle)
         : gatherVerts(proxy, cache.locationSymm, cache.radius * gatherScale);
       if (verts.length === 0) continue;
       for (let k = 0; k < verts.length; k++) proxy.stampOriginal(verts[k]);
@@ -483,7 +694,7 @@ export function createSculptEngine(engineOptions = {}) {
       if (brush.needsAreaNormal) cache.sculptNormalSymm = flipVec(cache.sculptNormal, pass);
       if (brush.needsAreaCenter) cache.areaCenterSymm = flipVec(cache.areaCenter, pass);
 
-      const ctx = dabContext(handle, settings, verts);
+      const ctx = dabContext(handle, settings, verts, dirty);
       ctx.useOriginal = useOriginalData;
       // True only for the very first brush action of the stroke (see smooth.js frozenBase).
       ctx.firstBrushAction = cache.strokeStep === 0 && pass === 0;
@@ -502,20 +713,22 @@ export function createSculptEngine(engineOptions = {}) {
         const inversePressure = settings.use_inverse_smooth_pressure ?? settings.use_smooth_pressure;
         const strength = inversePressure ? autoSmooth * (1 - cache.pressure) : autoSmooth;
         if (strength > 0) {
+          const b = handle._buf;
           smoothDab(proxy, verts, {
             strength,
+            factors: b.smoothFactors,
+            newPositions: b.smoothPositions,
             computeFactors: (out) => calcFactors(proxy, verts, factorParams(cache, settings, false), out, ctx.distances),
-            onTouch: (v) => { proxy.stampOriginal(v); ctx.dirty.add(v); },
+            onTouch: (v) => { proxy.stampOriginal(v); dirty.add(v); },
           });
         }
       }
-      for (const v of ctx.dirty) dirty.add(v);
     }
 
     cache.firstTime = false;
     cache.strokeStep++;
     if (dirty.size === 0) return false;
-    refresh(handle, Uint32Array.from(dirty));
+    refresh(handle, dirty.verts());
     return true;
   }
 
@@ -527,45 +740,92 @@ export function createSculptEngine(engineOptions = {}) {
     return settings.use_pressure_area_radius ? arf * cache.pressure : arf;
   }
 
-  function updateAreaData(handle, settings, brush, verts) {
+  /**
+   * Blender keeps these two apart and so must we. update_sculpt_normal (sculpt.cc:2755) owns the
+   * area NORMAL and skips it for the Grab family and for "original normal"; calc_brush_plane
+   * (sculpt.cc:3077) owns the area CENTRE and recomputes it every step unless "original plane" is
+   * on as WELL. Both flags are ignored outright for the Plane brush type. Freezing the two together
+   * meant "original normal" also pinned the brush plane's centre to one dab, so a Clay Strips
+   * stroke was laid on the plane of its first dab for the rest of the stroke.
+   *
+   * `o.normalOnly` is the dab a direction-needing brush drops: Blender runs update_sculpt_normal
+   * there but returns before any brush reaches calc_brush_plane.
+   */
+  function updateAreaData(handle, settings, brush, verts, o = {}) {
     const cache = handle._cache;
     const proxy = handle.proxy;
-    // Grab-like brushes freeze the direction at stroke start; so does "original normal".
-    const freeze = brush.anchoredOrigin || settings.use_original_normal;
-    if (!cache.firstTime && freeze && cache.sculptNormal) return;
-    const useOriginal = !accumulateFor(settings.sculpt_brush_type || brush.type, settings);
-    const plane = settings.sculpt_plane || 'AREA';
-    if (plane !== 'AREA') {
-      const axis = { VIEW: cache.viewNormal, X: [1, 0, 0], Y: [0, 1, 0], Z: [0, 0, 1] }[plane];
-      cache.sculptNormal = axis.slice();
-      if (!brush.needsAreaCenter) return;
+    const type = settings.sculpt_brush_type || brush.type;
+    const isPlaneBrush = type === 'PLANE';
+    const origNormal = !isPlaneBrush && !!settings.use_original_normal;
+    const origPlane = !isPlaneBrush && !!settings.use_original_plane;
+    // Blender's stroke_is_first_brush_step_of_symmetry_pass. NOT cache.firstTime: a brush that
+    // needs a stroke direction clears firstTime on the dab it drops, so keying the freeze off it
+    // froze data that had never been computed (and left cache.areaCenter undefined).
+    const first = !cache.areaDataValid;
+    // The Grab family's frozen direction stands in for update_sculpt_normal's own exception list.
+    const keepNormal = !first && (brush.anchoredOrigin || origNormal);
+    const keepCenter = !first && origPlane;
+    const wantNormal = !!brush.needsAreaNormal && !keepNormal;
+    const wantCenter = !o.normalOnly && !!brush.needsAreaCenter && !keepCenter;
+
+    if (wantNormal || wantCenter) {
+      const plane = settings.sculpt_plane || 'AREA';
+      const areaNormal = wantNormal && plane === 'AREA';
+      if (wantNormal && !areaNormal) {
+        const axis = { VIEW: cache.viewNormal, X: [1, 0, 0], Y: [0, 1, 0], Z: [0, 0, 1] }[plane];
+        cache.sculptNormal = axis.slice();
+      }
+      if (areaNormal || wantCenter) {
+        const useOriginal = !accumulateFor(type, settings);
+        const nrf = settings.normal_radius_factor ?? 0.5;
+        // area_radius_factor sizes the AREA CENTRE, but Blender applies it only to the Plane brush
+        // ("the Layer brush produces artifacts with normal and area radius"); every other brush
+        // sizes the centre with normal_radius_factor as well. Clay Strips is where this shows: its
+        // factors are 1.2 and 0.5, so the wrong one moves the plane and reshapes the whole strip.
+        const arf = areaRadiusFactor(settings, brush, cache, nrf);
+        const { normal, center } = calcAreaNormalAndCenter(proxy, {
+          verts,
+          positions: useOriginal ? proxy.getOrigPositions() : undefined,
+          // Always the STROKE-START normals, even with accumulate on. Measured against Blender
+          // 5.2.1: replaying the golden strokes with live normals here puts an accumulating Draw
+          // 24.9% out and Crease Sharp 8.5% out, while stroke-start normals with live positions
+          // bring them to 1.3% and 2.0%. Blender reads these through the evaluated mesh's normal
+          // cache, which the brush loop does not refresh between dabs, so the area normal keeps
+          // weighing the shape the stroke began with while the dab lands on the live surface.
+          normals: proxy.getOrigNormals(),
+          location: cache.locationSymm,
+          viewNormal: cache.viewNormalSymm,
+          normalRadius: cache.radius * nrf,
+          positionRadius: cache.radius * (brush.needsAreaCenter ? arf : nrf),
+          falloffShape: settings.falloff_shape || 'SPHERE',
+          needNormal: areaNormal,
+          needCenter: wantCenter,
+        });
+        let outNormal = normal;
+        let outCenter = center;
+        // Blender stabilises the Plane brush's plane inside calc_area_normal_and_center
+        // (sculpt.cc:2226), not inside the kernel - a rolling average over up to 20 steps so a
+        // shaky hand does not make the plane wobble. It therefore runs on EVERY step of the
+        // stroke, including the first one, where do_plane_brush deposits nothing because the grab
+        // delta is still zero. Doing it in the kernel instead meant the first step never entered
+        // the average.
+        if (isPlaneBrush && areaNormal && outNormal && outCenter) {
+          const stabilized = calcStabilizedPlane(
+            cache, outNormal, outCenter,
+            settings.stabilize_normal ?? 0,
+            settings.stabilize_plane ?? 0,
+          );
+          outNormal = stabilized.normal;
+          outCenter = stabilized.center;
+        }
+        if (areaNormal && outNormal) cache.sculptNormal = outNormal;
+        if (wantCenter && outCenter) { cache.areaCenter = outCenter; cache.lastCenter = outCenter; }
+      }
     }
-    const nrf = settings.normal_radius_factor ?? 0.5;
-    // area_radius_factor sizes the AREA CENTRE, but Blender applies it only to the Plane brush
-    // ("the Layer brush produces artifacts with normal and area radius"); every other brush sizes
-    // the centre with normal_radius_factor as well. Clay Strips is where this shows: its factors
-    // are 1.2 and 0.5, so using the wrong one moves the brush plane and reshapes the whole strip.
-    const arf = areaRadiusFactor(settings, brush, cache, nrf);
-    const { normal, center } = calcAreaNormalAndCenter(proxy, {
-      verts,
-      positions: useOriginal ? proxy.getOrigPositions() : undefined,
-      // Always the STROKE-START normals, even with accumulate on. Measured against Blender 5.2.1:
-      // replaying the golden strokes with live normals here puts an accumulating Draw 24.9% out
-      // and Crease Sharp 8.5% out, while stroke-start normals with live positions bring them to
-      // 1.3% and 2.0%. Blender reads these through the evaluated mesh's normal cache, which the
-      // brush loop does not refresh between dabs, so the area normal keeps weighing the shape the
-      // stroke began with while the dab itself lands on the live surface.
-      normals: proxy.getOrigNormals(),
-      location: cache.locationSymm,
-      viewNormal: cache.viewNormalSymm,
-      normalRadius: cache.radius * nrf,
-      positionRadius: cache.radius * (brush.needsAreaCenter ? arf : nrf),
-      falloffShape: settings.falloff_shape || 'SPHERE',
-      needNormal: plane === 'AREA',
-      needCenter: !!brush.needsAreaCenter,
-    });
-    if (plane === 'AREA' && normal) cache.sculptNormal = normal;
-    if (center) { cache.areaCenter = center; cache.lastCenter = center; }
+    // "Original plane" hands back the plane the stroke froze. For a brush that dropped its first
+    // dab that is Blender's zero-initialised last_center - a plane through the object origin.
+    if (keepCenter && brush.needsAreaCenter) cache.areaCenter = cache.lastCenter.slice();
+    cache.areaDataValid = true;
   }
 
   function restoreStrokeStart(handle) {
@@ -580,7 +840,7 @@ export function createSculptEngine(engineOptions = {}) {
       positions[i3 + 1] = orig[i3 + 1];
       positions[i3 + 2] = orig[i3 + 2];
     }
-    refresh(handle, Uint32Array.from(touched));
+    refresh(handle, touchedView(handle, touched));
   }
 
   /** Face normals, vertex normals, octree and the render buffers, for the touched vertices only. */
@@ -595,9 +855,23 @@ export function createSculptEngine(engineOptions = {}) {
 
   // ---------------------------------------------------------------- stroke
 
+  /**
+   * Bank whatever stroke is still live before anything resets the proxy's stroke snapshot.
+   * beginStrokeSnapshot() bumps the stroke stamp and clears the touched list, so without this a
+   * second beginStroke (a pinch FSM re-firing after a dropped frame), a cross-part applyDab, or a
+   * filter() run mid-stroke lost the first half's stroke-start positions for good.
+   */
+  function flushLiveStroke() {
+    if (!state.stroke) return;
+    const record = endStroke();
+    if (record) pendingRecords.push(record);
+  }
+
   function beginStrokeInternal(handle, input, silent) {
+    flushLiveStroke();
     const settings = input?.settings ? { ...input.settings } : settingsFor();
     const brush = input?.brush || state.brush;
+    frame(handle);
     handle.proxy.beginStrokeSnapshot();
     const radiusLocal = radiusLocalFromWorld(state.radiusWorld, handle.scale);
     handle._cache = createCache({
@@ -608,6 +882,14 @@ export function createSculptEngine(engineOptions = {}) {
       hardness: settings.hardness || 0,
       firstTime: true,
       invert: state.invert,
+      // Blender sets cache->initial_direction_flipped once in stroke_cache_init, independently of
+      // first_time (sculpt.cc:5478). Writing it inside the dab never ran for the brushes that need
+      // a stroke direction - the Plane family among them - because they clear firstTime on the dab
+      // they drop, so the whole family's inverted mode (Contrast, Fill, Deepen, inverted Trim and
+      // Plateau) silently did the un-inverted thing at half strength.
+      initialDirectionFlipped: brushFlip({ dirIn: !!settings.use_negative_direction, invert: state.invert }) < 0,
+      // The part's world scale at the stroke start; a resize mid-stroke must not move the brush.
+      strokeScale: handle.scale,
     });
     const type = settings.sculpt_brush_type || brush.type;
     state.stroke = {
@@ -634,8 +916,35 @@ export function createSculptEngine(engineOptions = {}) {
     return state.stroke;
   }
 
+  /**
+   * The part whose surface is nearest a world point, within one brush radius. beginStroke's
+   * documented ray-less form (point3D alone, for the grab family) had no way to resolve a part
+   * once more than one was attached - partOf(undefined) returns null there - and fell into
+   * hover(undefined), which threw. A Fable build is multi-part by default.
+   */
+  function nearestPartTo(worldPoint) {
+    if (!finiteVec(worldPoint)) return null;
+    let best = null;
+    let bestDist = Infinity;
+    for (const handle of parts.values()) {
+      const local = pointToLocal(handle, worldPoint);
+      const r = radiusLocalFromWorld(state.radiusWorld, handle.scale);
+      const faces = handle.proxy.intersectSphere(local, r * r);
+      if (faces.length === 0) continue;
+      const verts = handle.proxy.getVerticesFromFaces(faces);
+      const p = handle.proxy.getVertices();
+      for (let k = 0; k < verts.length; k++) {
+        const i3 = 3 * verts[k];
+        const d = Math.hypot(p[i3] - local[0], p[i3 + 1] - local[1], p[i3 + 2] - local[2]) * handle.scale;
+        if (d < bestDist) { bestDist = d; best = handle; }
+      }
+    }
+    return best;
+  }
+
   function beginStroke(input) {
-    const handle = partOf(input.part) || hover(input.worldRay).handle;
+    if (!finiteInput(input)) return null;
+    const handle = partOf(input.part) || hover(input.worldRay).handle || nearestPartTo(input.point3D);
     if (!handle) return null;
     const stroke = beginStrokeInternal(handle, input, false);
     const point = strokePoint(handle, input);
@@ -648,6 +957,10 @@ export function createSculptEngine(engineOptions = {}) {
   function sampleStroke(input) {
     const stroke = state.stroke;
     if (!stroke) return 0;
+    // Drop a bad sample whole and keep the stroke alive. The stepper's own arithmetic is no guard:
+    // lazyStep latches a NaN aim point permanently (Math.hypot(NaN) < ignore is false), after which
+    // every later sample emits zero dabs and the stroke is silently dead.
+    if (!finiteInput(input)) return 0;
     const point = strokePoint(stroke.handle, input);
     if (!point) return 0;
     const dabs = stroke.stepper.advance(
@@ -663,9 +976,25 @@ export function createSculptEngine(engineOptions = {}) {
     const stroke = state.stroke;
     if (!stroke) return null;
     if (input) sampleStroke(input);
-    const record = buildRecord(stroke.part, stroke.handle.proxy);
+    const handle = stroke.handle;
+    const record = buildRecord(stroke.part, handle.proxy);
     state.stroke = null;
+    // Last line of defence. If something did get a non-finite value into the proxy, the part is
+    // invisible and un-aimable from here on; rolling the stroke back turns "the model is gone" into
+    // "the last stroke was discarded". One scan of what the stroke touched, once per stroke.
+    if (record && !finiteRecord(record)) {
+      applyHistory(record, 'undo');
+      return null;
+    }
     return record;
+  }
+
+  function finiteRecord(record) {
+    if (record.type === 'multi') return record.records.every(finiteRecord);
+    if (record.type !== 'stroke') return true;
+    const a = record.after;
+    for (let i = 0; i < a.length; i++) if (!Number.isFinite(a[i])) return false;
+    return true;
   }
 
   /** The aim point the stepper walks: the 3D pinch point for grab, else the surface under the ray. */
@@ -711,10 +1040,12 @@ export function createSculptEngine(engineOptions = {}) {
   // ---------------------------------------------------------------- undo / filters
 
   function applyHistory(record, direction = 'undo') {
+    if (!record) return false;
     const handle = partOf(record.part);
     if (!handle) return false;
     const verts = applyRecord(record, handle.proxy, direction);
-    refresh(handle, verts);
+    // A mask-only record changes no geometry, and the binding never scatters the mask.
+    if (verts.length > 0) refresh(handle, verts);
     return true;
   }
 
@@ -725,18 +1056,32 @@ export function createSculptEngine(engineOptions = {}) {
     const fn = filters.get(name);
     const handle = partOf(options.part);
     if (!fn || !handle) return null;
+    flushLiveStroke(); // beginStrokeSnapshot below would otherwise eat a live stroke's undo record
     handle.proxy.beginStrokeSnapshot();
-    const verts = fn({ engine: api, handle, proxy: handle.proxy, settings: settingsFor(), options }) || allVerts(handle.proxy);
-    refresh(handle, Uint32Array.from(verts));
+    const verts = fn({ engine: api, handle, proxy: handle.proxy, settings: settingsFor(), options }) || allVerts(handle);
+    refresh(handle, verts instanceof Uint32Array ? verts : Uint32Array.from(verts));
     return buildRecord(handle.id, handle.proxy);
   }
 
+  /**
+   * A mask op changes protection, not geometry, so it used to fall out of the record stream
+   * entirely and the next "undo" ate the previous SCULPT stroke instead. Blender pushes
+   * undo::Type::Mask for every one of these (paint_mask.cc), so we return a record too. grow,
+   * shrink and blur only touch a boundary band, so the diff is far smaller than the whole array.
+   */
   function maskOp(name, options = {}) {
     const fn = maskOps.get(name);
     const handle = partOf(options.part);
     if (!fn || !handle) return null;
+    const before = Float32Array.from(handle.proxy.getMask());
     fn({ engine: api, handle, proxy: handle.proxy, options });
-    return true;
+    return buildMaskRecord(handle.id, handle.proxy, before);
+  }
+
+  /** Records orphaned by a re-fired beginStroke, a cross-part applyDab or a mid-stroke filter. */
+  function drainRecords() {
+    if (pendingRecords.length === 0) return [];
+    return pendingRecords.splice(0, pendingRecords.length);
   }
 
   // ---------------------------------------------------------------- settings
@@ -752,6 +1097,7 @@ export function createSculptEngine(engineOptions = {}) {
     endStroke,
     applyDab,
     applyHistory,
+    drainRecords,
     filter,
     maskOp,
     registerFilter,

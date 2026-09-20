@@ -267,6 +267,12 @@ export function createBinding(source, options = {}) {
     proxyGroups,
     usedVid,
 
+    // Scratch for scatterNormals' one-ring expansion, reused across every refresh. The stamp
+    // starts at 0 and the tick at 1, so the mark array never has to be cleared.
+    _ringMark: new Int32Array(proxyCount),
+    _ringList: new Uint32Array(proxyCount),
+    _ringTick: 0,
+
     /** Copy proxy positions (and the normals of the groups around them) into the render meshes. */
     scatter(proxy, verts) {
       scatterPositions(binding, proxy, verts);
@@ -312,14 +318,23 @@ function scatterPositions(binding, proxy, verts) {
 // neighbours change too, because their faces moved.
 function scatterNormals(binding, proxy, verts) {
   const ring = proxy.getVerticesRingVert();
-  const seen = new Set();
-  const stack = [];
+  // A Set plus a JS array here was the single biggest allocation of a dab on a large part
+  // (Elastic Grab touches every vertex, so it built a 200k-entry Set per refresh). A stamped mark
+  // array and a dense list do the same job with no garbage at all.
+  const mark = binding._ringMark;
+  const list = binding._ringList;
+  const tick = ++binding._ringTick;
+  let n = 0;
   for (let k = 0; k < verts.length; k++) {
     const v = verts[k];
-    if (!seen.has(v)) { seen.add(v); stack.push(v); }
+    if (mark[v] !== tick) { mark[v] = tick; list[n++] = v; }
     const nb = ring[v];
-    for (let j = 0; j < nb.length; j++) if (!seen.has(nb[j])) { seen.add(nb[j]); stack.push(nb[j]); }
+    for (let j = 0; j < nb.length; j++) {
+      const u = nb[j];
+      if (mark[u] !== tick) { mark[u] = tick; list[n++] = u; }
+    }
   }
+  const stack = list.subarray(0, n);
   const proxyNormals = proxy.getRenderNormals();
   const positions = proxy.getVertices();
   const faces = proxy.getFaces();
@@ -375,17 +390,25 @@ function scatterNormals(binding, proxy, verts) {
   }
 }
 
+// three.js ACCUMULATES updateRanges and merges them all in WebGLAttributes.updateBuffer, then
+// clears them itself once they are on the GPU. Clearing them here instead dropped every refresh
+// but the last one in a frame, and more than one dab per frame is the normal case at 30 Hz: a 2.5
+// cm brush at 10% spacing steps 5 mm, so any hand faster than ~30 cm/s emits two dabs a sample,
+// and the grab family flushes twice per dab anyway (restoreStrokeStart). Measured against r170's
+// own updateBuffer on a 60k part, stroking across the index-major axis: 2 dabs/frame left 766
+// vertices showing their old position (16.3 mm out) and 4 dabs/frame left 2475 (26.7 mm), and they
+// never healed, because nothing re-uploads once the stroke ends.
 function flushRanges(binding) {
   for (const p of binding.prims) {
     if (p.dirtyMax >= p.dirtyMin) {
       const a = p.position;
-      if (a.addUpdateRange) { a.clearUpdateRanges?.(); a.addUpdateRange(3 * p.dirtyMin, 3 * (p.dirtyMax - p.dirtyMin + 1)); }
+      if (a.addUpdateRange) a.addUpdateRange(3 * p.dirtyMin, 3 * (p.dirtyMax - p.dirtyMin + 1));
       a.needsUpdate = true;
       p.dirtyMin = Infinity; p.dirtyMax = -Infinity;
     }
     if (p.normal && p.dirtyNormalMax >= p.dirtyNormalMin) {
       const a = p.normal;
-      if (a.addUpdateRange) { a.clearUpdateRanges?.(); a.addUpdateRange(3 * p.dirtyNormalMin, 3 * (p.dirtyNormalMax - p.dirtyNormalMin + 1)); }
+      if (a.addUpdateRange) a.addUpdateRange(3 * p.dirtyNormalMin, 3 * (p.dirtyNormalMax - p.dirtyNormalMin + 1));
       a.needsUpdate = true;
       p.dirtyNormalMin = Infinity; p.dirtyNormalMax = -Infinity;
     }

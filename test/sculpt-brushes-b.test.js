@@ -446,7 +446,8 @@ test('mesh filters run over the whole part and respect the mask', () => {
     assert.ok(close(after[3 * locked], before[3 * locked], 1e-12)
       && close(after[3 * locked + 1], before[3 * locked + 1], 1e-12)
       && close(after[3 * locked + 2], before[3 * locked + 2], 1e-12), `${name} moved a masked vertex`);
-    assert.ok(record && record.idx.length > 0, `${name} produced an undo record`);
+    // A filter that moves every vertex gets the compact whole-part record shape (no index array).
+    assert.ok(record && record.bytes > 0, `${name} produced an undo record`);
     assert.ok(engine.applyHistory(record, 'undo'), `${name} undo`);
     const undone = handle.proxy.getVertices();
     let worst = 0;
@@ -517,8 +518,17 @@ test('installSetB plugs the whole-part operations into an engine', () => {
   assert.equal(engine.maskOp('invert', {}), null);
   assert.equal(installSetB(engine), engine, 'it returns the engine so it chains');
   handle.proxy.getMask().fill(0);
-  assert.equal(engine.maskOp('invert', {}), true);
+  // A mask op returns an undo record of its own, so "mask the handle" then "undo" removes the mask
+  // instead of eating the previous sculpt stroke (Blender pushes undo::Type::Mask here).
+  const inverted = engine.maskOp('invert', {});
+  assert.equal(inverted.type, 'mask');
   assert.ok(handle.proxy.getMask().every((m) => m === 1));
-  assert.equal(engine.maskOp('clear', {}), true);
+  assert.ok(engine.applyHistory(inverted, 'undo'));
+  assert.ok(handle.proxy.getMask().every((m) => m === 0), 'undoing a mask op restores the mask');
+  engine.applyHistory(inverted, 'redo');
+  const cleared = engine.maskOp('clear', {});
+  assert.equal(cleared.type, 'mask');
   assert.ok(handle.proxy.getMask().every((m) => m === 0));
+  // A no-op mask operation has nothing to record.
+  assert.equal(engine.maskOp('clear', {}), null);
 });

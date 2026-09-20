@@ -34,7 +34,15 @@ export function createCache(init = {}) {
     grabDeltaSymm: [0, 0, 0],
     origGrabLocation: [0, 0, 0],
     oldGrabLocation: [0, 0, 0],
+    // Blender's StrokeCache::last_center is zero-initialised and only written by calc_brush_plane,
+    // which a cube-tip brush never reaches on the step it drops - so "original plane" really does
+    // freeze such a brush to a plane through the object origin. areaCenter mirrors r_area_co.
+    areaCenter: [0, 0, 0],
+    areaCenterSymm: [0, 0, 0],
     lastCenter: [0, 0, 0],
+    // Blender's stroke_is_first_brush_step_of_symmetry_pass, kept as its own flag: firstTime is
+    // cleared on the dab a direction-needing brush drops, long before any area data exists.
+    areaDataValid: false,
     planeBrush: { firstTime: true, normals: [], centers: [], normalIndex: 0, centerIndex: 0, lastNormal: null, lastCenter: null },
     radius: 0.05,
     radiusSquared: 0.0025,
@@ -90,6 +98,16 @@ export function radiusLocalFromWorld(radiusWorld, partScale) {
   return radiusWorld / (partScale || 1);
 }
 
+/**
+ * Blender's C enum is BRUSH_PLANE_SWAP_HEIGHT_AND_DEPTH, but the RNA identifier reverses the two
+ * words to "SWAP_DEPTH_AND_HEIGHT" (rna_brush.cc, brush_plane_inversion_mode_items), and the RNA
+ * spelling is what the Essentials dump wrote into presets.json. Comparing against the C name looks
+ * right and never matches, so both readers share one helper instead.
+ */
+export function isPlaneSwapMode(mode) {
+  return mode === 'SWAP_DEPTH_AND_HEIGHT';
+}
+
 /** Blender's brush_flip: the "subtract" direction flag times the invert (Ctrl) toggle. */
 export function brushFlip({ dirIn = false, invert = false } = {}) {
   return (dirIn ? -1 : 1) * (invert ? -1 : 1);
@@ -128,7 +146,7 @@ export function brushStrength(type, o = {}) {
     case 'MULTIPLANE_SCRAPE':
       return alpha * flip * p * half;
     case 'PLANE':
-      if (flip > 0 || o.planeInversionMode === 'SWAP_HEIGHT_AND_DEPTH') return alpha * p * half;
+      if (flip > 0 || isPlaneSwapMode(o.planeInversionMode)) return alpha * p * half;
       return 0.5 * alpha * p * ov;
     case 'SMOOTH':
       return flip * alpha * p;

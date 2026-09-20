@@ -33,13 +33,8 @@
 // around the cursor.
 
 import { localFrame, gatherSphere, projectToPlane, baseFactor } from './brush-frame.js';
-import { planeOffsetGet, calcStabilizedPlane } from '../cache.js';
+import { planeOffsetGet, isPlaneSwapMode } from '../cache.js';
 import { applyHardness, curveStrength } from '../factors.js';
-
-/** Blender's BRUSH_PLANE_SWAP_HEIGHT_AND_DEPTH; the RNA identifier reads "SWAP_DEPTH_AND_HEIGHT". */
-function isSwapMode(mode) {
-  return typeof mode === 'string' && mode.includes('SWAP');
-}
 
 export const plane = {
   key: 'plane',
@@ -51,26 +46,11 @@ export const plane = {
   lazy: true,
   apply(ctx) {
     const { proxy, cache, settings } = ctx;
+    // Blender's do_plane_brush bails here, AFTER plane::calc_node_mask has already computed and
+    // stabilised the brush plane for this step (the engine does that in updateAreaData, which is
+    // where calc_area_normal_and_center has it).
     const direction = cache.grabDeltaSymm;
     if (direction[0] === 0 && direction[1] === 0 && direction[2] === 0) return;
-
-    // Blender stabilises the plane inside calc_area_normal_and_center, and only for this brush
-    // type: a rolling average over up to 20 frames so a shaky hand does not make the plane wobble.
-    // It runs on the main symmetry pass only; the mirrored passes reuse the result, mirrored, so
-    // we write it back into the cache before the other passes read it.
-    if (cache.mirrorSymmetryPass === 0 && cache.areaCenter) {
-      const stabilized = calcStabilizedPlane(
-        cache,
-        cache.sculptNormal,
-        cache.areaCenter,
-        settings.stabilize_normal ?? 0,
-        settings.stabilize_plane ?? 0,
-      );
-      cache.sculptNormal = stabilized.normal;
-      cache.areaCenter = stabilized.center;
-      cache.sculptNormalSymm = stabilized.normal;
-      cache.areaCenterSymm = stabilized.center;
-    }
 
     const radius = cache.radius;
     const normal = cache.sculptNormalSymm;
@@ -87,7 +67,7 @@ export const plane = {
     let height = settings.plane_height ?? 0;
     let depth = settings.plane_depth ?? 0;
     if (flip) {
-      if (isSwapMode(settings.plane_inversion_mode)) {
+      if (isPlaneSwapMode(settings.plane_inversion_mode)) {
         const swap = height; height = depth; depth = swap;
       } else {
         strength = -strength; // invert displacement: push away from the plane instead

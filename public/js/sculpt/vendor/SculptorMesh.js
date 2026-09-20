@@ -13,6 +13,10 @@
  *  4. Per-face material id, so a merged multi-material part can still be split on export.
  *  5. Angle-weighted vertex normals, which is what Blender's mesh normals are; the upstream
  *     area-weighted average moved parity by more than the whole brush tolerance.
+ *  6. The octree root is sized for DEFORMATION, not for the rest pose (see _computeOctree): a pull
+ *     that leaves the root box costs a full synchronous rebuild inside the dab.
+ *  7. Both octree walks reject a non-finite query up front, so a NaN from the hand tracker degrades
+ *     to "no hit" instead of collecting every face in the mesh.
  */
 
 import {
@@ -21,10 +25,19 @@ import {
 	getMemory
 } from './SculptorUtils.js';
 
-const OCTREE_MAX_DEPTH = 8;
+// HOLOMODEL: 8 upstream. The root split box now spans OCTREE_ROOT_REACH half-diagonals rather than
+// the rest-pose bounding box (see _computeOctree), which costs about two levels of resolution, so
+// the depth limit goes up by two to keep leaves the same size.
+const OCTREE_MAX_DEPTH = 10;
 const OCTREE_MAX_FACES = 100;
 // A depth-first walk retains at most seven siblings for each level.
 const OCTREE_STACK = new Array( 1 + 7 * OCTREE_MAX_DEPTH ).fill( null );
+// HOLOMODEL: how far past the rest-pose centre the root split box reaches, in half-diagonals.
+// Anything a face centre can be dragged to inside this box is re-filed incrementally; outside it,
+// addFace fails and the whole octree is rebuilt synchronously inside the dab (measured: 26 ms at
+// 150k faces, 260 ms at 400k, against a 6 ms dab budget). Pulling clay a third of the model's own
+// size out of it is the product's core gesture, so the rest-pose box is far too tight.
+const OCTREE_ROOT_REACH = 3;
 const RELATIVE_WELD_TOLERANCE = 1e-7;
 
 function queueLeaf( leaves, leaf ) {
@@ -471,7 +484,20 @@ class OctreeCell {
 	collectIntersectRay( vNear, eyeDir, collectFaces, leavesHit ) {
 
 		const vx = vNear[ 0 ], vy = vNear[ 1 ], vz = vNear[ 2 ];
-		const irx = 1.0 / eyeDir[ 0 ], iry = 1.0 / eyeDir[ 1 ], irz = 1.0 / eyeDir[ 2 ];
+		const dirX = eyeDir[ 0 ], dirY = eyeDir[ 1 ], dirZ = eyeDir[ 2 ];
+		// HOLOMODEL: a NaN anywhere in the ray makes every slab comparison below false, so the walk
+		// descends into all eight children at every level and hands back the whole mesh to be
+		// brute-force ray-tested (measured: 40 ms per hover at 400k faces, 750x a good ray). The
+		// test has to be on the INPUTS: `tmax < 0 || tmin > tmax` must keep falling through on NaN,
+		// because a legitimate axis-aligned ray produces 0 * Infinity = NaN whenever it grazes a
+		// cell plane, and failing closed there loses real hits.
+		if ( dirX !== dirX || dirY !== dirY || dirZ !== dirZ || vx !== vx || vy !== vy || vz !== vz ) {
+
+			return collectFaces.slice( 0, 0 );
+
+		}
+
+		const irx = 1.0 / dirX, iry = 1.0 / dirY, irz = 1.0 / dirZ;
 		let acc = 0;
 		const stack = OCTREE_STACK;
 		stack[ 0 ] = this;
@@ -511,6 +537,14 @@ class OctreeCell {
 	collectIntersectSphere( vert, radiusSquared, collectFaces, leavesHit ) {
 
 		const vx = vert[ 0 ], vy = vert[ 1 ], vz = vert[ 2 ];
+		// HOLOMODEL: same guard as collectIntersectRay. A NaN radius returns every face; a NaN in
+		// the centre silently leaves that axis' distance at 0 and degrades the query to two axes.
+		if ( vx !== vx || vy !== vy || vz !== vz || ! ( radiusSquared >= 0 ) ) {
+
+			return collectFaces.slice( 0, 0 );
+
+		}
+
 		let acc = 0;
 		const stack = OCTREE_STACK;
 		stack[ 0 ] = this;
@@ -698,6 +732,7 @@ class SculptorMesh {
 		this._mask = null;            // Float32Array, 0 = fully sculptable (Blender's .sculpt_mask)
 		this._origP = null;           // stroke-start positions, filled lazily on first touch
 		this._origN = null;           // stroke-start normals, same
+		this._origMask = null;        // stroke-start mask, same (so a mask stroke can be undone)
 		this._origStamp = null;       // Int32Array: which stroke stamped this vertex
 		this._strokeStamp = 0;
 		this._touched = [];           // vertices stamped during the current stroke (undo record)
@@ -917,6 +952,7 @@ class SculptorMesh {
 		this._mask = new Float32Array( vertexCount );
 		this._origP = new Float32Array( vertexDataLength );
 		this._origN = new Float32Array( vertexDataLength );
+		this._origMask = new Float32Array( vertexCount );
 		this._origStamp = new Int32Array( vertexCount );
 		this._strokeStamp = 0;
 		this._touched = [];
@@ -1177,10 +1213,16 @@ class SculptorMesh {
 		const octree = new OctreeCell();
 		octree.resetNbFaces( this._nbFaces );
 		octree._setAabbLoose( xmin, ymin, zmin, xmax, ymax, zmax );
-		octree._setAabbSplit(
-			xmin - dx * 0.3, ymin - dy * 0.3, zmin - dz * 0.3,
-			xmax + dx * 0.3, ymax + dy * 0.3, zmax + dz * 0.3
-		);
+		// HOLOMODEL: upstream anchors the root split box to the rest pose (bbox + 30% of each
+		// extent). The split box is what decides WHERE a face is filed, and a face centre that
+		// leaves it makes addFace fail, which rebuilds the whole octree synchronously inside the
+		// dab. A 9 cm pull out of a 30 cm ball is enough to cross the upstream box. Queries test
+		// _aabbLoose, which grows on its own, so a roomier split box costs nothing but depth: give
+		// the root a cube of OCTREE_ROOT_REACH half-diagonals about the rest centre. Not Infinity -
+		// _constructChildren halves (min + max), which would be NaN.
+		const cx = ( xmin + xmax ) * 0.5, cy = ( ymin + ymax ) * 0.5, cz = ( zmin + zmax ) * 0.5;
+		const reach = Math.max( Math.hypot( dx, dy, dz ) * 0.5 * OCTREE_ROOT_REACH, thickness, 1e-6 );
+		octree._setAabbSplit( cx - reach, cy - reach, cz - reach, cx + reach, cy + reach, cz + reach );
 		octree.build( this );
 
 		this._octree = octree;
@@ -1265,6 +1307,11 @@ class SculptorMesh {
 
 			if ( newLeaf === undefined ) {
 
+				// The face centre left the root split box: nothing incremental can file it, so the
+				// whole octree is rebuilt. Returning early is only safe because _computeOctree
+				// re-files EVERY face (and clears _leavesToUpdate), including the ones this loop
+				// has not reached yet. HOLOMODEL: with the roomier root box above this is now the
+				// unbounded-stroke backstop rather than something an ordinary pull hits.
 				this._computeOctree();
 				return;
 
@@ -1583,6 +1630,7 @@ class SculptorMesh {
 		this._mask = new Float32Array( vertexCount );
 		this._origP = new Float32Array( vertexCount * 3 );
 		this._origN = new Float32Array( vertexCount * 3 );
+		this._origMask = new Float32Array( vertexCount );
 		this._origStamp = new Int32Array( vertexCount );
 		this._strokeStamp = 0;
 		this._touched = [];
@@ -1607,6 +1655,13 @@ class SculptorMesh {
 	getOrigNormals() {
 
 		return this._origN;
+
+	}
+	// HOLOMODEL: the stroke-start mask of every stamped vertex, so a Mask stroke gets a real undo
+	// record instead of none at all (Blender pushes undo::Type::Mask there, sculpt.cc:3393).
+	getOrigMask() {
+
+		return this._origMask;
 
 	}
 	getTouched() {
@@ -1651,6 +1706,7 @@ class SculptorMesh {
 		this._origN[ i3 ] = n[ i3 ];
 		this._origN[ i3 + 1 ] = n[ i3 + 1 ];
 		this._origN[ i3 + 2 ] = n[ i3 + 2 ];
+		this._origMask[ iVert ] = this._mask[ iVert ];
 		this._touched.push( iVert );
 		return true;
 

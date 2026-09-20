@@ -19,7 +19,7 @@ def mesh_setup(subdiv=5):
     for v in ob.data.vertices:  # deterministic bumps so smooth/flatten/crease have work to do
         v.co *= 1.0 + 0.03 * noise.noise(v.co * 4.0)
     return ob
-def case(name, brush, dx=12.0, n=16, x0=-90.0, y0=0.0, usize=0.6, mirror_x=False, pressure=1.0, subdiv=5):
+def case(name, brush, dx=12.0, n=16, x0=-90.0, y0=0.0, usize=0.6, mirror_x=False, pressure=1.0, subdiv=5, mode='NORMAL'):
     ob = mesh_setup(subdiv)
     ob.data.use_mirror_x = mirror_x
     before = [c for v in ob.data.vertices for c in v.co]
@@ -49,7 +49,7 @@ def case(name, brush, dx=12.0, n=16, x0=-90.0, y0=0.0, usize=0.6, mirror_x=False
                            "time":i*0.033, "is_start": i==0, "x_tilt":0.0, "y_tilt":0.0})
         settings = {f: (getattr(br, f) if not hasattr(getattr(br, f, None), '__len__') or isinstance(getattr(br,f),str) else list(getattr(br,f))) for f in FIELDS if hasattr(br, f)}
         t = time.perf_counter()
-        r = bpy.ops.sculpt.brush_stroke(stroke=stroke, mode='NORMAL', override_location=True)
+        r = bpy.ops.sculpt.brush_stroke(stroke=stroke, mode=mode, override_location=True)
         ms = (time.perf_counter()-t)*1000
         bpy.ops.object.mode_set(mode='OBJECT')
     after = [c for v in ob.data.vertices for c in v.co]
@@ -59,7 +59,7 @@ def case(name, brush, dx=12.0, n=16, x0=-90.0, y0=0.0, usize=0.6, mirror_x=False
     disp = [math.dist(before[3*k:3*k+3], after[3*k:3*k+3]) for k in range(len(before)//3)]
     view_dir = list((rv3d.view_rotation @ Vector((0,0,-1))).normalized())
     json.dump({"case": name, "brush": brush, "blender": bpy.app.version_string, "radius": usize/2, "pressure": pressure,
-               "mirror_x": mirror_x, "view_dir": view_dir, "view_perspective": rv3d.view_perspective, "settings": settings,
+               "mode": mode, "mirror_x": mirror_x, "view_dir": view_dir, "view_perspective": rv3d.view_perspective, "settings": settings,
                "dabs": dabs, "triangles": tris, "before": [round(x,7) for x in before], "after": [round(x,7) for x in after],
                "mask": mask, "result": str(r), "ms": ms}, open(os.path.join(OUT, name + '.json'), 'w'))
     print(f"{name:18s} {brush:18s} moved={sum(1 for d in disp if d>1e-7):5d} max={max(disp):.5f} {ms:6.1f} ms {r}")
@@ -114,3 +114,25 @@ for _n, _b in [("crease_face", "Crease Sharp"), ("blob_face", "Blob"), ("pinch_f
                ("elastic_face", "Elastic Grab"), ("mask_face", "Mask")]:
     try: case(_n, _b, x0=0.0)
     except Exception as e: print("FAIL", _n, e)
+# INVERTED strokes (Ctrl held). Every case above records mode='NORMAL', which is how a dead
+# inverted mode went unnoticed for the whole Plane family: cache.initial_direction_flipped was
+# never set, so "Contrast", "Fill", "Deepen" and inverted Trim/Plateau all quietly did the
+# un-inverted thing at reduced strength. The Plane brush is in Blender's own
+# bke::brush::supports_inverted_direction list, and the two plane_inversion_mode branches
+# (INVERT_DISPLACEMENT and SWAP_DEPTH_AND_HEIGHT) behave completely differently when inverted, so
+# both are covered. Plateau and Trim had no fixture at all.
+for _n, _b in [("plateau", "Plateau"), ("trim", "Trim")]:
+    try: case(_n, _b, n=6, x0=0.0)
+    except Exception as e: print("FAIL", _n, e)
+for _n, _b in [("flatten_invert", "Flatten/Contrast"), ("plateau_invert", "Plateau"),
+               ("scrape_invert", "Scrape/Fill"), ("fill_invert", "Fill/Deepen"), ("trim_invert", "Trim"),
+               ("draw_invert", "Draw"), ("inflate_invert", "Inflate/Deflate")]:
+    try: case(_n, _b, n=6, x0=0.0, mode='INVERT')
+    except Exception as e: print("FAIL", _n, e)
+# Trim's hardness is 0.6, so its weight is a flat top with a very sharp shoulder, and the Plane
+# kernel multiplies that weight by the vertex's own distance to the plane - which on the
+# 2,562-vertex sphere makes a single vertex's side of the shoulder worth a large slice of a 7 cm
+# cut. Same argument as clay_strips_dense: the resolved mesh is the honest test of the kernel.
+case("trim_dense", "Trim", n=6, x0=0.0, subdiv=6)
+case("trim_invert_dense", "Trim", n=6, x0=0.0, mode='INVERT', subdiv=6)
+case("scrape_invert_dense", "Scrape/Fill", n=6, x0=0.0, mode='INVERT', subdiv=6)

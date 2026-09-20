@@ -73,10 +73,11 @@ export function filterSmooth({ proxy, options = {} }) {
   const positions = proxy.getVertices();
   const n = proxy.getNbVertices();
   const touched = [];
+  const avg = [0, 0, 0];
   for (let it = 0; it < iterations; it++) {
     const next = new Float32Array(n * 3);
     for (let v = 0; v < n; v++) {
-      const avg = neighborAverage(proxy, v, positions);
+      neighborAverage(proxy, v, positions, avg);
       next[3 * v] = avg[0]; next[3 * v + 1] = avg[1]; next[3 * v + 2] = avg[2];
     }
     for (let v = 0; v < n; v++) {
@@ -124,9 +125,10 @@ export function filterSharpen({ proxy, options = {} }) {
   const positions = proxy.getVertices();
   const n = proxy.getNbVertices();
   const dirs = new Float32Array(n * 3);
+  const avg = [0, 0, 0];
   for (let v = 0; v < n; v++) {
     if (interiorNeighbors(proxy, v).length === 0) continue;
-    const avg = neighborAverage(proxy, v, positions);
+    neighborAverage(proxy, v, positions, avg);
     dirs[3 * v] = positions[3 * v] - avg[0];
     dirs[3 * v + 1] = positions[3 * v + 1] - avg[1];
     dirs[3 * v + 2] = positions[3 * v + 2] - avg[2];

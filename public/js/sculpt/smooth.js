@@ -51,17 +51,26 @@ export function interiorNeighbors(proxy, v) {
   return out;
 }
 
-/** Average of the interior neighbours, or the vertex itself when it has none (loose vertex). */
-export function neighborAverage(proxy, v, positions) {
+/**
+ * Average of the interior neighbours, or the vertex itself when it has none (loose vertex).
+ * `out` is written in place when given: a smoothing pass calls this once per vertex per pass, so
+ * returning a fresh [x,y,z] made it one of the hottest allocation sites in the engine.
+ */
+export function neighborAverage(proxy, v, positions, out) {
   const nb = interiorNeighbors(proxy, v);
   const p = positions || proxy.getVertices();
-  if (nb.length === 0) return [p[3 * v], p[3 * v + 1], p[3 * v + 2]];
+  const o = out || [0, 0, 0];
+  if (nb.length === 0) {
+    o[0] = p[3 * v]; o[1] = p[3 * v + 1]; o[2] = p[3 * v + 2];
+    return o;
+  }
   let x = 0, y = 0, z = 0;
   for (let i = 0; i < nb.length; i++) {
     const u = nb[i];
     x += p[3 * u]; y += p[3 * u + 1]; z += p[3 * u + 2];
   }
-  return [x / nb.length, y / nb.length, z / nb.length];
+  o[0] = x / nb.length; o[1] = y / nb.length; o[2] = z / nb.length;
+  return o;
 }
 
 /**
@@ -80,12 +89,16 @@ export function neighborAverage(proxy, v, positions) {
  *
  * @param {object} proxy
  * @param {Uint32Array} verts
- * @param {object} o {strength, frozenBase, computeFactors(factorsOut), onTouch(v)}
+ * @param {object} o {strength, frozenBase, computeFactors(factorsOut), onTouch(v), factors,
+ *                    newPositions}  the last two are scratch buffers the caller may lend us,
+ *                    because auto-smooth runs this on every dab of every brush.
  */
 export function smoothDab(proxy, verts, o) {
   const positions = proxy.getVertices();
-  const factors = new Float32Array(verts.length);
-  const newPositions = new Float32Array(verts.length * 3);
+  const factors = o.factors && o.factors.length >= verts.length
+    ? o.factors.subarray(0, verts.length) : new Float32Array(verts.length);
+  const newPositions = o.newPositions && o.newPositions.length >= verts.length * 3
+    ? o.newPositions.subarray(0, verts.length * 3) : new Float32Array(verts.length * 3);
   const strengths = iterationStrengths(o.strength);
 
   if (o.frozenBase) {
@@ -102,13 +115,15 @@ export function smoothDab(proxy, verts, o) {
   }
 }
 
+const _avg = [0, 0, 0];
+
 function applyPass(proxy, verts, positions, factors, newPositions, strength, o) {
   o.computeFactors(factors);
   for (let k = 0; k < verts.length; k++) {
-    const avg = neighborAverage(proxy, verts[k], positions);
-    newPositions[3 * k] = avg[0];
-    newPositions[3 * k + 1] = avg[1];
-    newPositions[3 * k + 2] = avg[2];
+    neighborAverage(proxy, verts[k], positions, _avg);
+    newPositions[3 * k] = _avg[0];
+    newPositions[3 * k + 1] = _avg[1];
+    newPositions[3 * k + 2] = _avg[2];
   }
   for (let k = 0; k < verts.length; k++) {
     const f = factors[k] * strength;
