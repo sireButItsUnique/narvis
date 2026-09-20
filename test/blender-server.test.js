@@ -25,7 +25,7 @@ function fakeBlender() {
   const fp = () => `fp:${objects.join(',')}`;
   const commands = {
     ping: () => ({ ok: true, blender: 'fake', objects: objects.length,
-                   env: { anthropic: 'ANTHROPIC_API_KEY' in process.env, home: process.env.HOLOMODEL_HOME,
+                   env: { anthropic: 'OPENAI_API_KEY' in process.env, home: process.env.HOLOMODEL_HOME,
                           pyc: process.env.PYTHONDONTWRITEBYTECODE, port: process.env.HOLO_BRIDGE_PORT },
                    argvHasToken: process.argv.some(a => a.includes(token)) }),
     scene: () => ({ ok: true, object_count: objects.length, objects: objects.map(name => ({ name })) }),
@@ -99,7 +99,7 @@ else await tests();
 async function tests() {
   const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'holo-server-test-'));
   process.env.HOLOMODEL_HOME = HOME;   // before the imports: history.js reads it once
-  process.env.ANTHROPIC_API_KEY = 'sk-test-not-for-blender';
+  process.env.OPENAI_API_KEY = 'sk-test-not-for-blender';
   delete process.env.MONGODB_URI;
   const { BlenderProcess, blender } = await import('../server/blender-process.js');
   const { bridge, BridgeError } = await import('../server/blender.js');

@@ -14,7 +14,6 @@
 //     size    '1024x1024' | '1536x1024' | '1024x1536'  (square, landscape, portrait)
 //   -> Promise<Buffer> of PNG bytes
 //
-// OPENAI_API_KEY is already in process.env (from .env) when this runs.
 // When it works, set IMPLEMENTED to true and restart the server; Fable is only offered the tool after that.
 // Test it on its own first:  node scripts/try-texture.js "a red and gold persian rug, top-down"
 

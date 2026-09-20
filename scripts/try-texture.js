@@ -10,7 +10,7 @@ try { process.loadEnvFile(path.join(root, '.env')); } catch {}
 const { IMPLEMENTED, generateTextureImage } = await import('../server/textures.js');
 
 const prompt = process.argv.slice(2).join(' ') || 'The Mona Lisa, front-on, no frame, even museum lighting';
-console.log(`IMPLEMENTED = ${IMPLEMENTED}, OPENAI_API_KEY ${process.env.OPENAI_API_KEY ? 'set' : 'missing'}`);
+console.log(`IMPLEMENTED = ${IMPLEMENTED}`);
 const t0 = Date.now();
 const png = await generateTextureImage({ prompt, size: '1024x1024' });
 const out = path.join(os.homedir(), 'Downloads', `texture-test-${Date.now()}.png`);

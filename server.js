@@ -22,7 +22,7 @@ const PORT = Number(process.env.PORT) || 8765;
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css',
                 '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
                 '.glb': 'model/gltf-binary', '.wasm': 'application/wasm' };
-const hasKey = () => !!(process.env.ANTHROPIC_API_KEY || '').trim();
+const hasKey = () => !!(process.env.OPENAI_API_KEY || '').trim();
 
 function sendJson(res, status, body) {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -420,7 +420,7 @@ http.createServer((req, res) => {
   serveStatic(req, pathname, res);
 }).listen(PORT, '127.0.0.1', () => {
   console.log(`serving on http://localhost:${PORT}  (open it in Edge for voice)`);
-  console.log(hasKey() ? `Builds: ${blenderModel()} in a hidden Blender` : 'Builds: no ANTHROPIC_API_KEY in .env yet, so "make a ___" is off; local commands still work');
+  console.log(hasKey() ? `Builds: ${blenderModel()} in a hidden Blender` : 'Builds: no OPENAI_API_KEY in .env yet, so "make a ___" is off; local commands still work');
   console.log(`Voice: ${voiceAvailable() ? 'ElevenLabs (Scribe v2 in, Flash voice out)' : "the browser's (add ELEVENLABS_API_KEY for ElevenLabs)"}`);
   if (!fs.existsSync(path.join(root, 'vendor'))) console.log('Warning: no public/vendor, so three.js and MediaPipe come from jsDelivr; run "npm run vendor" to work offline');
   blender.start();

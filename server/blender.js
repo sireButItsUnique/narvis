@@ -219,9 +219,9 @@ export async function buildInBlender({ prompt, mode = 'make', emit, signal }) {
 }
 
 async function runBuild({ prompt, mode, emit, signal, model }) {
-  if (!env('ANTHROPIC_API_KEY')) throw new Error('Building in Blender needs ANTHROPIC_API_KEY in .env.');
+  if (!env('OPENAI_API_KEY')) throw new Error('Building in Blender needs OPENAI_API_KEY in .env.');
   const { default: Anthropic } = await import('@anthropic-ai/sdk');
-  const client = new Anthropic({ apiKey: env('ANTHROPIC_API_KEY') });
+  const client = new Anthropic({ apiKey: env('OPENAI_API_KEY') });
   const tools = toolsForThisBuild();
 
   const scene = await bridge('scene', {}, { timeout: 15000 });   // also checks Blender is there before spending anything

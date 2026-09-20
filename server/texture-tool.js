@@ -8,7 +8,7 @@ import { IMPLEMENTED, generateTextureImage } from './textures.js';
 const DIR = path.join(process.env.HOLOMODEL_HOME || path.join(os.homedir(), '.holomodel'), 'textures');
 const SIZES = { square: '1024x1024', landscape: '1536x1024', portrait: '1024x1536' };
 
-export const textureToolAvailable = () => IMPLEMENTED && !!(process.env.OPENAI_API_KEY || '').trim();
+export const textureToolAvailable = () => IMPLEMENTED;
 
 export const TEXTURE_TOOL = {
   name: 'generate_texture',

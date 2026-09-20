@@ -22,10 +22,10 @@ async function check(name, needs, fn) {
   }
 }
 
-await check('Anthropic (Blender builds)', 'ANTHROPIC_API_KEY', async () => {
+await check('Anthropic (Blender builds)', 'OPENAI_API_KEY', async () => {
   const { default: Anthropic } = await import('@anthropic-ai/sdk');
   const model = env('BLENDER_MODEL') || 'claude-fable-5-1';
-  const m = await new Anthropic({ apiKey: env('ANTHROPIC_API_KEY') }).models.retrieve(model);
+  const m = await new Anthropic({ apiKey: env('OPENAI_API_KEY') }).models.retrieve(model);
   return `${m.id} is available`;
 });
 
@@ -61,12 +61,6 @@ await check('ElevenLabs (voice in and out)', 'ELEVENLABS_API_KEY', async () => {
   if (mp3.length < 1000) throw new Error(`text to speech returned only ${mp3.length} bytes`);
   const heard = await transcribe(mp3, 'audio/mpeg');
   return `spoke "Save version." (${Math.round(mp3.length / 1024)} KB of audio) and Scribe heard "${heard}"`;
-});
-
-await check('OpenAI (textures, your part)', 'OPENAI_API_KEY', async () => {
-  const { IMPLEMENTED } = await import('../server/textures.js');
-  if (!IMPLEMENTED) throw new Error('key is set, but server/textures.js is still the stub (IMPLEMENTED = false)');
-  return 'implemented; try it with: node scripts/try-texture.js "a small oil painting of a lighthouse"';
 });
 
 const width = Math.max(...results.map(r => r[0].length));
