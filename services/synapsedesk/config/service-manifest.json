@@ -3,9 +3,27 @@
   "version": "0.1.0",
   "target": "Windows 10/11 x64, Python 3.12, Edge/Chrome",
   "working_directory": "services/synapsedesk",
-  "launch": [".venv\\Scripts\\python.exe", "-m", "synapsedesk", "serve"],
-  "demo": [".venv\\Scripts\\python.exe", "-m", "synapsedesk", "serve", "--demo"],
-  "camera_worker": [".venv\\Scripts\\python.exe", "-m", "synapsedesk", "track", "--backend", "dshow"],
+  "launch": [
+    ".venv\\Scripts\\python.exe",
+    "-m",
+    "synapsedesk",
+    "serve"
+  ],
+  "demo": [
+    ".venv\\Scripts\\python.exe",
+    "-m",
+    "synapsedesk",
+    "serve",
+    "--demo"
+  ],
+  "camera_worker": [
+    ".venv\\Scripts\\python.exe",
+    "-m",
+    "synapsedesk",
+    "track",
+    "--backend",
+    "dshow"
+  ],
   "listen": "127.0.0.1:8765",
   "health": "/api/health",
   "transport": "HTTP JSON + latest-state SSE",
@@ -13,5 +31,52 @@
   "model_file": "models/hand_landmarker.task",
   "artifacts": ".runtime/",
   "shutdown": "Ctrl+C; stop camera worker separately",
-  "notes": "Descriptive manifest. CLI arguments configure the service; this JSON is not loaded at runtime."
+  "notes": "Descriptive manifest. CLI arguments configure the service; this JSON is not loaded at runtime.",
+  "optional_agent_provider": {
+    "flags": [
+      "--model-endpoint",
+      "--model-name"
+    ],
+    "api_key_env": "SYNAPSEDESK_API_KEY",
+    "legacy_api_key_env": "SYNASEDESK_API_KEY",
+    "default": "stub; live-agent gate blocked until an endpoint, model and key are supplied"
+  },
+  "routes": {
+    "editor": "/",
+    "projection": "/display",
+    "vendored_react": "/vendored/*",
+    "sse": "/events"
+  },
+  "state": {
+    "authoritative": ".runtime/synapsedesk.db",
+    "tables": [
+      "projects",
+      "revisions",
+      "events",
+      "positions",
+      "conversations",
+      "tasks"
+    ],
+    "exports": [
+      "graph.json",
+      "triage-report.json",
+      "pipeline.json",
+      "interaction-bounds.json"
+    ],
+    "working_copies": ".runtime/workingcopies/task_<id>/",
+    "restored_on_restart": [
+      "latest graph revision",
+      "job status",
+      "node positions"
+    ]
+  },
+  "optional_extras": [
+    "tracking",
+    "rust",
+    "ts",
+    "cfamily",
+    "jvm",
+    "go",
+    "polyglot"
+  ]
 }

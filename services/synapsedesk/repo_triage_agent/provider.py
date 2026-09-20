@@ -24,7 +24,7 @@ class StubProvider:
 class ChatCompletionsProvider:
     """Server-side Chat Completions-compatible endpoint. Key from env only."""
     name = "chat-completions"
-    def __init__(self, endpoint, model, key_env="SYNASEDESK_API_KEY", timeout=30, retries=2):
+    def __init__(self, endpoint, model, key_env="SYNAPSEDESK_API_KEY", timeout=30, retries=2):
         if not endpoint or not model:
             raise ProviderError("endpoint and model are required")
         self.endpoint = endpoint.rstrip("/")
@@ -33,7 +33,8 @@ class ChatCompletionsProvider:
         self.timeout = timeout
         self.retries = retries
     def _key(self):
-        key = os.environ.get(self.key_env, "")
+        # Accept the historical SYNASEDESK_ spelling so existing setups keep working.
+        key = os.environ.get(self.key_env, "") or os.environ.get(self.key_env.replace("SYNAPSE", "SYNASE"), "")
         if not key:
             raise ProviderError(f"missing API key in {self.key_env}")
         return key

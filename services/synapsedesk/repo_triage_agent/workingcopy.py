@@ -3,7 +3,8 @@
 - Snapshot includes current uncommitted working-tree files (copy, not git HEAD).
 - Original checkout is never modified.
 - Malformed patches, outside-snapshot escapes, and conflicting changes are errors.
-- Checkpoints record diffs; rollback restores; patch export returns unified diff.
+- Checkpoints record a unified diff plus the prior content, so rollback restores it.
+- Prior content over RESTORE_LIMIT is not retained; that checkpoint reports restorable=False.
 """
 import difflib
 import os
@@ -13,6 +14,7 @@ import time
 from pathlib import Path
 
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".runtime", "dist", "build"}
+RESTORE_LIMIT = 200_000
 
 
 def snapshot_source(source: Path, dest: Path):
@@ -51,24 +53,32 @@ def write_file(snapshot: Path, rel: str, content: str):
     if len(content) > 256_000:
         raise ValueError("file exceeds 256 KB budget")
     target.parent.mkdir(parents=True, exist_ok=True)
-    before = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
+    existed = target.exists()
+    before = target.read_text(encoding="utf-8", errors="replace") if existed else ""
     target.write_text(content, encoding="utf-8")
     diff = "".join(difflib.unified_diff(before.splitlines(True), content.splitlines(True),
                                         fromfile="before/" + rel, tofile="after/" + rel))
-    return {"checkpoint": time.time(), "diff": diff[:20000], "bytes": len(content)}
+    restorable = len(before) <= RESTORE_LIMIT
+    return {"checkpoint": time.time(), "path": rel, "diff": diff[:20000], "bytes": len(content),
+            "existed": existed, "restorable": restorable, "before": before if restorable else ""}
 
 
-def snapshot_diff(snapshot: Path, before_manifest: dict):
-    """Diff current snapshot files vs manifest taken at snapshot time. Manifest: {rel: mtime/size}."""
-    out = []
-    for folder, dirs, files in os.walk(snapshot, followlinks=False):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-        for fn in files:
-            p = Path(folder) / fn
-            rel = p.relative_to(snapshot).as_posix()
-            if rel not in before_manifest:
-                out.append({"path": rel, "change": "added"})
-    return out
+def restore_checkpoint(snapshot: Path, checkpoint: dict):
+    """Undo one write_file checkpoint. Returns a result record; never raises on a missing file."""
+    rel = checkpoint.get("path")
+    if not rel:
+        return {"path": "", "restored": False, "message": "checkpoint predates path tracking"}
+    if not checkpoint.get("restorable", False):
+        return {"path": rel, "restored": False, "message": "prior content exceeded the retention limit"}
+    target = _guarded(snapshot, rel)
+    if checkpoint.get("existed"):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(checkpoint.get("before", ""), encoding="utf-8")
+        return {"path": rel, "restored": True, "message": "previous content restored"}
+    if target.exists():
+        target.unlink()
+        return {"path": rel, "restored": True, "message": "file created by the task removed"}
+    return {"path": rel, "restored": False, "message": "nothing to roll back"}
 
 
 def run_checks(snapshot: Path, commands, timeout=60):

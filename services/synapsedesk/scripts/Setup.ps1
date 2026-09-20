@@ -1,4 +1,5 @@
-param([switch]$Tracking, [switch]$Rust, [switch]$Polyglot)
+param([switch]$Tracking, [switch]$Rust, [switch]$Polyglot,
+      [switch]$Ts, [switch]$CFamily, [switch]$Jvm, [switch]$Go)
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 py -3.12 -m venv .venv
@@ -7,7 +8,13 @@ $Python = Join-Path (Get-Location) ".venv\Scripts\python.exe"
 $Extras = @()
 if ($Tracking) { $Extras += "tracking" }
 if ($Polyglot) { $Extras += "polyglot" }
-elseif ($Rust) { $Extras += "rust" }
+else {
+  if ($Rust) { $Extras += "rust" }
+  if ($Ts) { $Extras += "ts" }
+  if ($CFamily) { $Extras += "cfamily" }
+  if ($Jvm) { $Extras += "jvm" }
+  if ($Go) { $Extras += "go" }
+}
 if ($Extras.Count -gt 0) { $Spec = ".[" + ($Extras -join ",") + "]" } else { $Spec = "." }
 & $Python -m pip install -e $Spec
 if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed." }

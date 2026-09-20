@@ -15,7 +15,7 @@
   <div class="row"><input id="search" placeholder="Search all components" autocomplete="off"><button id="searchGo">Find</button></div>
   <div id="searchResults" class="muted"></div>
   <div class="tools"><button id="calibrate">Calibrate · C</button><button id="wire">Wire · W</button><button id="fullscreen">Fullscreen · F</button><button id="projector">Projection · H</button></div>
-  <div class="row"><a href="/display" style="color:inherit">Open display route →</a><span id="rev" class="muted"></span></div>
+  <div class="row"><a href="/display" class="plain">Open display route →</a><span id="rev" class="muted"></span></div>
  <details><summary>Interaction workspace</summary><p>Normalized camera coordinates. These limits disable gestures outside the rectangle.</p><form id="bounds"><div class="bounds"><label>X min<input name="xmin" type="number" value="0" min="0" max="1" step=".01"></label><label>X max<input name="xmax" type="number" value="1" min="0" max="1" step=".01"></label><label>Y min<input name="ymin" type="number" value="0" min="0" max="1" step=".01"></label><label>Y max<input name="ymax" type="number" value="1" min="0" max="1" step=".01"></label></div><button>Apply workspace</button></form><button id="resetCalibration">Reset calibration</button></details>
  <div id="demo" hidden><label for="fault">Simulated tracking fault</label><select id="fault"><option value="none">Healthy hand</option><option value="lost">Hand lost</option><option value="stale">Stale camera frame</option><option value="boundary">Outside workspace</option></select></div>
   <div class="section-title">EVIDENCE & CONFLICTS <span id="findingCount">0</span></div>

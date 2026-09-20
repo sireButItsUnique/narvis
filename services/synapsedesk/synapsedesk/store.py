@@ -93,6 +93,34 @@ class Store:
                                (limit,)).fetchall()
         return [{"id": r[0], "status": r[1], "detail": json.loads(r[2]), "updated": r[3]} for r in rows]
 
+    # Conversations: the agent exchange behind each task, replayable after a restart.
+    def append_conversation(self, scope, messages, limit=200):
+        if not isinstance(messages, list):
+            raise ValueError("messages must be a list")
+        existing = self.get_conversation(scope)
+        merged = (existing + [m for m in messages if isinstance(m, dict)])[-limit:]
+        payload = json.dumps(merged, allow_nan=False)
+        row = self.db.execute("SELECT id FROM conversations WHERE project_id=1 AND scope=?", (scope,)).fetchone()
+        if row:
+            self.db.execute("UPDATE conversations SET messages_json=?, updated=? WHERE id=?",
+                            (payload, time.time(), row[0]))
+        else:
+            self.db.execute("INSERT INTO conversations(project_id,scope,messages_json,updated) VALUES(1,?,?,?)",
+                            (scope, payload, time.time()))
+        self.db.commit()
+        return len(merged)
+
+    def get_conversation(self, scope):
+        row = self.db.execute("SELECT messages_json FROM conversations WHERE project_id=1 AND scope=?",
+                              (scope,)).fetchone()
+        if not row:
+            return []
+        try:
+            value = json.loads(row[0])
+        except ValueError:
+            return []
+        return value if isinstance(value, list) else []
+
     # Positions persist across refresh/restart; localStorage mirrors for instant paint.
     def get_positions(self):
         rows = self.db.execute("SELECT node_id,x,y,z FROM positions").fetchall()

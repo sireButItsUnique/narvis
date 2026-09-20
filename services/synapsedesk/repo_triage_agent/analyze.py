@@ -145,6 +145,7 @@ def analyze(path):
             count += 1
             size = source_path.stat().st_size
             total_bytes += size
+            rel = source_path.relative_to(root).as_posix()
             if count > 800 or total_bytes > 20_000_000:
                 # Monorepos stream: publish a partial graph with an explicit
                 # finding instead of rejecting the whole repository.
@@ -152,7 +153,6 @@ def analyze(path):
                 note_truncated(f"Scan budget reached at {count} files / {total_bytes // 1000000} MB; "
                                "publishing a partial graph (refine scope or shard by subdirectory).", rel)
                 continue
-            rel = source_path.relative_to(root).as_posix()
             if size > 256_000:
                 findings.append(dict(kind="scan_skipped", severity="info", message="File exceeds 256 KB scan limit", evidence=[dict(path=rel, line=1)]))
                 continue

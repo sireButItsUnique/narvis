@@ -130,6 +130,9 @@ class Handler(BaseHTTPRequestHandler):
             if len(rest)==2 and rest[1]=="patch":
                 self.json({"id":tid,"patch":self.server.state.task_patch(tid)})
                 return
+            if len(rest)==2 and rest[1]=="conversation":
+                self.json(self.server.state.task_conversation(tid))
+                return
             if len(rest)==1:
                 self.json(task)
                 return

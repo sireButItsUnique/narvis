@@ -15,6 +15,21 @@ All traffic stays on `127.0.0.1:8765`. No static IP, Cat6, UDP listener, firewal
 | `/api/wires` | POST | `{source: "node-id", target: "node-id", revision: 1}`; stale revision rejected |
 | `/api/bounds` | POST | `{xmin:0, xmax:1, ymin:0, ymax:1}`; normalized interaction rectangle |
 | `/api/demo` | POST | `{fault: "none" | "lost" | "stale" | "boundary"}`; demo mode only |
+| `/api/events` | GET | `?since=<revision>`; the durable revision log, at most 200 entries |
+| `/api/positions` | GET | `{positions: {node-id: {x, y, z}}}` saved node placements |
+| `/api/positions` | POST | `{positions: {node-id: {x, y, z}}}`; at most 2,000 entries, returns `{saved}` |
+| `/api/provider/status` | GET | `{name, endpoint, model, live}` for the agent provider |
+| `/api/provider/test` | GET | Probes the configured endpoint; 400 while the gate is blocked |
+| `/api/agent/explain` | POST | `{node_id}` → the indexed node, its citations, and its edges |
+| `/api/agent/tasks` | GET | `{tasks: [...]}`, newest first, at most 50 |
+| `/api/agent/tasks` | POST | `{source, description, node_id?}` → `{id}`; local directory only |
+| `/api/agent/tasks/{id}` | GET | `{id, status, detail, updated}` |
+| `/api/agent/tasks/{id}/patch` | GET | Concatenated unified diffs, at most 40 KB |
+| `/api/agent/tasks/{id}/conversation` | GET | `{id, messages}` — the persisted provider exchange |
+| `/api/agent/tasks/{id}/cancel` | POST | Cooperative cancel; only a `running` task is affected |
+| `/api/agent/tasks/{id}/rollback` | POST | Undoes the task's writes inside its working copy |
+| `/` and `/display` | GET | Editor page and chrome-free projection page, same bundle |
+| `/vendored/*` | GET | Vendored React build; explicit 404 JSON while none is vendored |
 
 POSTs require `Content-Type: application/json`, Content-Length, and at most 64 KB. Success is `{ok:true}`; errors use `{error:"..."}` with 400/403/404/500 status. Accepted analysis returns immediately; observe `job.status` (`running`, `complete`, `error`). Graph revision advances on publication and wiring. Invalid analysis leaves the last valid graph available.
 
@@ -49,6 +64,37 @@ The service derives pinch; it never trusts an upstream pinch boolean. It publish
 ```
 
 The adapter must fit the desk plane, transform camera points into desk coordinates, and subsample to at most 1,000 points. Values are finite; X/Y must lie on the normalized desk to survive filtering. Height between 0.03 and 1 metre is retained. At least three samples in a 0.05-by-0.05 cell form a visual obstacle; median height suppresses isolated depth noise. Frames older than 250 ms produce no cells; input expires after 500 ms. The adapter contract does not implement a Kinect driver, infer depth from hand Z, or authorize an actuator.
+
+## Persistence
+
+`.runtime/synapsedesk.db` (SQLite, WAL) is authoritative. It holds graph revisions, an append-only event log,
+node positions, agent tasks, and the agent conversation per task. A restart restores the latest revision, its
+job status, and saved positions; an existing `.runtime/graph.json` from an older build is imported once and
+left in place. The JSON files under `.runtime/` remain exports, not inputs. They are written with a temp-file
+replace, so each file is individually atomic; several files are not one transaction.
+
+Node positions are shared state: the editor saves a placement about 800 ms after a drag or pinch release, and
+`/display` re-reads them every 1.5 s and on every revision change, which is how the two views stay in step.
+Calibration stays in that browser's local storage and is never sent to the service.
+
+## Agent tasks
+
+`POST /api/agent/tasks` accepts a **local directory only** — no URL, no file. The service copies the working
+tree into `.runtime/workingcopies/task_<id>/`, skipping symlinks, files over 1 MB, and generated directories.
+Every subsequent file operation is confined to that copy; the original checkout is never modified.
+
+A task calls the configured provider once, writes `PROPOSAL.md` into the working copy, runs the check commands
+of whichever language dominates the copy, and re-indexes it for a graph delta. The check step is the only place
+the service executes repository code: analysis never does, but `cargo test` / `npm test` / `python -m unittest`
+and friends do. At most five commands run, each capped at 60 seconds, with output truncated to 4 KB per stream. Each write records a checkpoint
+with a unified diff and the prior content, so rollback restores it; content over 200 KB is not retained and its
+checkpoint reports `restorable: false`. Cancellation is cooperative and is tested between stages — it cannot
+interrupt a check already running. A failed task stays visible with its error and a recoverable checkpoint.
+
+Without `--model-endpoint` and `--model-name`, the provider is a stub that refuses every call: the live-agent
+gate is blocked and says so rather than pretending to reason. The API key is read from `SYNAPSEDESK_API_KEY`
+in the environment (the earlier `SYNASEDESK_` spelling is still accepted) and never appears in a response,
+an artifact, or the index.
 
 ## Graph artifacts
 
