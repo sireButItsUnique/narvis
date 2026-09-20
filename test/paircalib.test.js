@@ -16,8 +16,9 @@ import assert from 'node:assert/strict';
 import {
   CAPTURE, SOLVE, CALIB_LANDMARKS, IRIS, makeCapture, binOf, solvePair, solveLines, captureLines,
   cameraFromExt, lensOnly, rotFromDeg, degFromRot, packLm, lmAt, headUV, faceCentre,
-  makeHoldCheck, angleBetweenDeg,
+  makeHoldCheck, angleBetweenDeg, rotationDeltaDeg, HOLD,
 } from '../public/js/rig/paircalib.js';
+import { matMul, transpose } from '../public/js/track/linalg.js';
 import {
   mergeSetup, saveSetup, loadSetup, SETUP_KEY, pairCameras, pairAngles, solvedPose, poseStatus,
   applySolvedPose, aimCheck, DEFAULT_SETUP,
@@ -184,6 +185,45 @@ test('the capture refuses frames the two cameras cannot both speak for', () => {
     'two frames 10 ms apart are the same pose twice');
 });
 
+test('a full buffer still takes a direction it has never seen', () => {
+  // The cap used to be checked BEFORE the bin, so once maxFrames frames were in, no new part of the volume
+  // could ever be recorded. A user who filled the buffer without leaning back was then asked forever for
+  // the one movement the capture was silently throwing away, behind a progress bar reading 100%.
+  const cams = trueCams(), rng = mulberry32(51);
+  const cap = makeCapture({ maxFrames: 40 });
+  let t = 0;
+  const feed = at => {
+    const s = shoot(cams, headAt(at, 0, 0), rng, 0.3);
+    t += 200;
+    return s ? cap.add({ tA: t, tB: t, a: s[0], b: s[1] }) : { ok: false };
+  };
+  // fill up without ever moving back: a seated person leaning about in front of their chair
+  for (let i = 0; i < 200 && cap.frames.length < 40; i++)
+    feed([[-16, -8, 0, 8, 16][i % 5], [33, 40, 47][(i >> 2) % 3], [36, 45][(i >> 1) % 2]]);
+  assert.equal(cap.frames.length, 40, 'the buffer is full');
+  const stuck = cap.progress();
+  assert.ok(stuck.missing.includes('move further back'), `it asks for the missing band: ${stuck.missing}`);
+  assert.ok(stuck.fraction < 1, 'and the progress bar does not claim to be finished while it does');
+
+  // the user does exactly what it asks
+  let taken = 0;
+  for (const x of [-16, -8, 0, 8, 16]) for (const y of [33, 40, 47]) if (feed([x, y, 54]).ok) taken++;
+  assert.ok(taken > 0, 'the frames it asked for are recorded, not discarded');
+  assert.equal(cap.frames.length, 40, 'without growing past the cap');
+  const now = cap.progress();
+  assert.equal(now.missing.includes('move further back'), false, 'and the instruction stops');
+  assert.ok(now.evicted > 0 && now.binsFilled >= stuck.binsFilled, 'old views made room, none of the volume lost');
+});
+
+test('a capture that is enough to solve says so even while a direction is missing', () => {
+  const poses = volumePoses().filter(p => p.at[2] < 54);        // never leans back
+  const cap = session({ poses, seed: 53 });
+  const p = cap.progress();
+  assert.equal(p.ready, false, 'it is not a complete capture');
+  assert.ok(p.solvable, 'but there is enough of it to solve');
+  assert.match(captureLines(p).join(' '), /press Solve/, 'and the flag on the glass says so');
+});
+
 // ---------------------------------------------------------------- the solve
 
 test('the pair is recovered to within a degree, and the head to within millimetres', () => {
@@ -266,17 +306,121 @@ test('the scale comes from the measured baseline and scales everything with it',
   near(twice.report.medianDepthCm, one.report.medianDepthCm * 2, 0.15, 'so does where the head lands');
 });
 
-test('bundleAdjust can polish the answer without moving it', () => {
-  // The polish minimises real reprojection error rather than Sampson's approximation of it. It is optional
-  // because it is a dense solve; what it must never do is hand back a different rig.
+test('the answer is measured against the truth, not against itself', () => {
+  // The old version of this test compared one solve against another at a tolerance of 1.0 degrees - wider
+  // than the 1.4 degrees of error the whole feature exists to remove, so it could not have failed. Every
+  // seed is checked against the pose the synthetic rig was BUILT with instead.
+  const trueToe = (TRUTH.right.rotDeg[1] - TRUTH.left.rotDeg[1]) / 2;
+  const trueRel = relRotDeg(TRUTH.left.rotDeg, TRUTH.right.rotDeg);
+  for (const seed of [7, 11, 21, 29]) {
+    const cap = session({ noisePx: 0.5, seed });
+    const [ca, cb] = lenses();
+    const res = solvePair({ frames: cap.frames, camA: ca, camB: cb, baselineCm: TRUTH.baselineCm, typed: TYPED });
+    assert.ok(res.ok, `seed ${seed} solves: ${solveLines(res).join(' | ')}`);
+    near(res.pose.toeInDeg, trueToe, 0.25, `seed ${seed} toe-in against the truth`);
+    // The toe-in is only the MEAN of the two yaws, so it can be right while the pair is wrong. The whole
+    // relative rotation is what the essential matrix actually measures, and it is what moves the head.
+    const rel = relRotDeg(res.pose.left.rotDeg, res.pose.right.rotDeg);
+    assert.ok(rotationDeltaDeg(rel, trueRel) < 0.6,
+      `seed ${seed}: relative rotation ${rotationDeltaDeg(rel, trueRel).toFixed(3)} deg from the truth`);
+  }
+});
+
+test('there is no polish knob, because no setting of it ever helped', () => {
+  // bundleAdjust over two views has 6 pose degrees of freedom against 3 per point and nothing to pin them,
+  // so it walked back toward the answer refineRelativePose already had at best and overfitted a handful of
+  // points at worst - 2x to 22x worse than not running it on every seed tried - while reporting a SMALLER
+  // reprojection number than the Sampson one, because it was fitted to fewer points. Unknown opts are
+  // ignored, so an old call site cannot quietly turn it back on.
+  assert.equal('polish' in SOLVE, false, 'the option is gone from the defaults');
   const cap = session({ noisePx: 0.5, seed: 21 });
   const [ca, cb] = lenses();
   const plain = solvePair({ frames: cap.frames, camA: ca, camB: cb, baselineCm: TRUTH.baselineCm, typed: TYPED });
-  const polished = solvePair({ frames: cap.frames, camA: ca, camB: cb, baselineCm: TRUTH.baselineCm,
-                               typed: TYPED, opts: { polish: true, polishPoints: 24 } });
-  assert.ok(polished.ok, 'the polished solve still passes');
-  near(polished.pose.toeInDeg, plain.pose.toeInDeg, 1.0, 'and agrees with the plain one');
-  assert.ok(polished.report.bundleRmsPx != null, 'and reports its own reprojection error');
+  const asked = solvePair({ frames: cap.frames, camA: ca, camB: cb, baselineCm: TRUTH.baselineCm,
+                            typed: TYPED, opts: { polish: true, polishPoints: 24 } });
+  assert.deepEqual(asked.pose.left.rotDeg, plain.pose.left.rotDeg, 'asking for it changes nothing');
+  assert.equal(asked.report.bundleRmsPx, undefined, 'and nothing claims a better number than the fit');
+});
+
+// The relative rotation of a pair: what two cameras watching one face can actually measure, and what the
+// mean toe-in throws half of away.
+function relRotDeg(leftDeg, rightDeg) {
+  return matMul(rotFromDeg(rightDeg), transpose(rotFromDeg(leftDeg)));
+}
+
+test('the epipolar residual is reported as consistency, with its own ceiling beside it', () => {
+  // It is an RMS over the INLIERS, and an inlier is by definition under thresholdPx - so this number
+  // cannot exceed the ceiling whatever the pose is, and calling it "the accuracy" was the problem.
+  const cap = session({ noisePx: 0.5, seed: 7 });
+  const [ca, cb] = lenses();
+  const res = solvePair({ frames: cap.frames, camA: ca, camB: cb, baselineCm: TRUTH.baselineCm, typed: TYPED,
+                          expectedDepthCm: 60 });
+  assert.ok(res.report.residualCeilingMm > res.report.residualMm, 'the ceiling is reported and is above it');
+  near(res.report.residualCeilingMm,
+       SOLVE.thresholdPx / res.report.sampsonRmsPx * res.report.residualMm, 0.02, 'and it is the same scale');
+  const text = solveLines(res).join('\n');
+  assert.match(text, /epipolar fit/, 'the line does not call it the residual');
+  assert.match(text, /NOT accuracy/, 'and says what it is not');
+  assert.ok(res.report.depthVsNamedPct != null, 'the depth is compared with the spot the user named');
+  assert.match(text, /lens fov/, 'and the lens is named as what that comparison is for');
+  // The differential YAW is measured and used to be thrown away, leaving a pair that is a degree out on
+  // one side alone reading as a pair that is bang on.
+  near(res.report.asymmetryYawDeg,
+       Math.abs(TRUTH.right.rotDeg[1] + TRUTH.left.rotDeg[1]), 0.5, 'the yaw asymmetry is reported');
+  assert.match(text, /deg in yaw/);
+});
+
+test('the pose records the lens it was fitted with, and stops being used when that changes', () => {
+  // A focal error does not just scale depth: it bends the toe-in, and the anchoring carries that into the
+  // rig as a real rotation. The fov is therefore an input exactly like the baseline, and a pose fitted at
+  // one fov and decoded at another describes a pair of cameras that does not exist.
+  const cap = session({ noisePx: 0.5, seed: 7 });
+  const [ca, cb] = lenses();
+  const res = solvePair({ frames: cap.frames, camA: ca, camB: cb, baselineCm: TRUTH.baselineCm, typed: TYPED });
+  assert.ok(res.ok);
+  assert.deepEqual(res.pose.dfovDeg.map(Math.round), [TRUTH.dfovDeg, TRUTH.dfovDeg], 'the lens travels with the pose');
+
+  const setup = mergeSetup(null);
+  setup.pair.baselineCm = TRUTH.baselineCm;
+  setup.pair.dfovDeg = TRUTH.dfovDeg;
+  applySolvedPose(setup, res.pose);
+  assert.equal(poseStatus(setup).inUse, true);
+  setup.pair.dfovDeg = 70;                            // the user reads the real number off the datasheet
+  const st = poseStatus(setup);
+  assert.equal(st.inUse, false, 'a pose fitted with another lens is not this pair');
+  assert.equal(st.stale, true);
+  assert.match(st.reason, /lens/i);
+  assert.equal(pairAngles(setup).source, 'aimed', 'so the derived angles come back rather than a stale pose');
+
+  // A pose saved before the lens was recorded cannot be checked, and is left alone rather than condemned.
+  const old = { ...res.pose };
+  delete old.dfovDeg;
+  setup.pair.solved = old; setup.pair.useSolved = true;
+  assert.equal(poseStatus(setup).stale, false, 'an older pose with no lens on it still works');
+});
+
+test('a wrong lens bends the toe-in, and the fit reports itself as fine anyway', () => {
+  // The reason the checks above have to exist: this is what a 2 degree datasheet error does, and no
+  // residual or inlier number can see it, because a wrong K is self-consistent in BOTH cameras.
+  const trueToe = (TRUTH.right.rotDeg[1] - TRUTH.left.rotDeg[1]) / 2;
+  const cap = session({ noisePx: 0.5, seed: 7 });               // shot through a real 78 degree lens
+  const told = 76;
+  const [ca, cb] = [lensOnly({ ...TRUTH, dfovDeg: told, id: 'L' }), lensOnly({ ...TRUTH, dfovDeg: told, id: 'R' })];
+  const solve = (cams, expected) => solvePair({ frames: cap.frames, camA: cams[0], camB: cams[1],
+    baselineCm: TRUTH.baselineCm, typed: TYPED, expectedDepthCm: expected });
+  const right = solve(lenses(), 60);
+  const res = solve([ca, cb], 60);
+  assert.ok(res.ok, 'it is accepted, which is the whole trouble');
+  assert.ok(Math.abs(res.pose.toeInDeg - trueToe) > 0.5,
+    `2 degrees of lens moved the toe-in by ${(res.pose.toeInDeg - trueToe).toFixed(2)} deg`);
+  assert.ok(res.report.inlierRatio > 0.9, 'with the inliers still perfect');
+  // ...and the residual gets SMALLER as the pose gets worse, because a wrong K is self-consistent
+  assert.ok(res.report.residualMm <= right.report.residualMm,
+    `residual ${res.report.residualMm} mm against ${right.report.residualMm} mm at the right lens`);
+  // The depth is the only number that moves in step with the error, which is why it is reported beside
+  // the spot the user named and why the hold check chases it.
+  assert.ok(Math.abs(res.report.depthVsNamedPct - right.report.depthVsNamedPct) > 2,
+    `depth moved ${right.report.depthVsNamedPct}% -> ${res.report.depthVsNamedPct}% against the named spot`);
 });
 
 // ---------------------------------------------------------------- the refusals
@@ -438,4 +582,55 @@ test('the hold-still check says how far the solve puts you from where you say yo
   near(r.distanceCm, Math.hypot(0.8, 0.2, 0.4), 0.15, 'distance from the named spot');
   assert.ok(r.wobbleMm.every(w => w < 10), 'and it reports how still you were');
   assert.match(r.message, /from the spot you named/);
+});
+
+test('the walk to the spot is not part of the measurement', () => {
+  // It used to average everything since the button was pressed, with the clock started on the first sample
+  // - so walking to the spot over two seconds reported 16 cm that was entirely the walk, and standing
+  // still afterwards only dragged it slowly toward the truth.
+  const h = makeHoldCheck({ expectedCm: [0, 40, 45], ms: 1000 });
+  let r = null, t = 0;
+  const walk = [[-20, 40, 70], [-15, 40, 63], [-10, 40, 57], [-5, 40, 51], [0, 40, 45]];
+  for (const p of walk) { r = h.feed(p, t); t += 500; }
+  assert.equal(r.done, false, 'a walk is never a measurement, however long it takes');
+  const rng = mulberry32(61);
+  for (let i = 0; i < 40; i++)
+    r = h.feed([gaussian(rng) * 0.05, 40 + gaussian(rng) * 0.05, 45 + gaussian(rng) * 0.05], t + i * 50);
+  assert.equal(r.done, true, 'standing still for a second is');
+  assert.ok(r.distanceCm < 0.5, `and it is the spot, not the walk: ${r.distanceCm} cm`);
+
+  // and it stays that way while the user walks back to the keyboard to read it
+  const kept = r.distanceCm;
+  for (let i = 0; i < 20; i++) r = h.feed([-8 - i, 40, 60 + i], t + 2000 + i * 50);
+  assert.equal(r.distanceCm, kept, 'a finished measurement does not turn back into a running average');
+  assert.equal(r.frozen, true, 'and says it is finished');
+});
+
+test('a hold that is not a hold is not reported as one', () => {
+  const h = makeHoldCheck({ expectedCm: [0, 40, 45], ms: 1000 });
+  let r = null;
+  // a head wandering over 4 cm: the mean would look fine, and it is not a measurement of anything
+  for (let i = 0; i < 60; i++) r = h.feed([2 * Math.sin(i / 3), 40 + 2 * Math.cos(i / 4), 45], i * 50);
+  assert.equal(r.done, false, `wobble ${r.wobbleMm} mm is not holding still`);
+  assert.match(r.message, /still moving/);
+  assert.ok(HOLD.spreadMm > 0 && HOLD.stepMm > 0, 'the thresholds are named, not buried');
+});
+
+test('the hold check hands back the lens fov, which is the one thing the solve cannot measure', () => {
+  // A focal error is a radial scale about the tracker's own origin, so a head that is consistently too far
+  // from the PAIR is a lens error, not an angle error. f scales with that ratio, so one round trip fixes
+  // the number the solve was told.
+  const origin = [0, 12, 8], spot = [0, 40, 45];
+  const h = makeHoldCheck({ expectedCm: spot, originCm: origin, ms: 500,
+                            lens: { dfovDeg: 78, width: 1280, height: 720 } });
+  const want = Math.hypot(spot[0] - origin[0], spot[1] - origin[1], spot[2] - origin[2]);
+  const k = 1.05;                          // the pair puts the head 5% further out than it really is
+  const far = [0, 1, 2].map(i => origin[i] + (spot[i] - origin[i]) * k);
+  let r = null;
+  for (let i = 0; i < 30; i++) r = h.feed(far, i * 50);
+  assert.equal(r.done, true);
+  near(r.lens.ratio, k, 0.01, 'it measures the scale error');
+  assert.ok(r.lens.dfovDeg < 78, `and a head that is too far means a narrower lens: ${r.lens.dfovDeg} deg`);
+  assert.match(r.message, /lens fov/, 'and says so where the user can act on it');
+  assert.ok(want > 0);
 });

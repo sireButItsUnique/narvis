@@ -237,14 +237,20 @@
       further, higher and lower. The flag on the glass says what is still missing. Then press Solve.
       <b class="warn">The scale cannot come from your face</b> — two cameras watching a face can only see
       their pose relative to each other, never how big the world is — so it comes from the baseline you
-      measured in step 2. Measure that one with a tape.</p>
+      measured in step 2. Measure that one with a tape.
+      <b class="warn">And the lens fov in step 2 is an input, not a measurement.</b> A focal error does not
+      just move you nearer or further: it bends the toe-in, by roughly a degree and a half for every two
+      degrees of diagonal fov, and at about that much the solved pose is no better than the guess it
+      replaces. Nothing in the solve report can see this — a wrong lens is self-consistent in both cameras,
+      so the residual gets <i>smaller</i> as the pose gets worse. The hold check below is what sees it: it
+      compares how far the pair puts you from itself with how far you said you were, and hands back a fov
+      to type in. Webcam datasheet numbers are nominal and change with the crop the browser picks, so it is
+      worth one round trip.</p>
     <div class="row" style="margin-top:0">
       <button id="calStart" class="primary">Start capture</button>
       <button id="calStop">Stop</button>
       <button id="calSolve">Solve</button>
       <button id="calClear">Throw the capture away</button>
-      <label class="f" style="margin:0;flex:0 0 auto"><input type="checkbox" id="calPolish" style="width:auto">
-        <span>polish with bundle adjustment (slower)</span></label>
     </div>
     <div class="mono" id="calProgress" style="margin-top:10px"></div>
     <div class="mono" id="calResult" style="margin-top:10px"></div>
@@ -257,8 +263,12 @@
     <h2 style="margin-top:20px">Then prove it, without taking anything on faith</h2>
     <p class="note">Put your head at the spot you told the page about in step 2 (<span id="holdSpot"></span>),
       hold still, and this reports how far the measured pair thinks you are from it. A calibration that
-      cannot survive that is not a calibration. Whatever constant offset is left is what step 4's trim is
-      for — the trim still exists, and it still does the same job.</p>
+      cannot survive that is not a calibration. The clock only runs while you are actually still, so
+      walking to the spot does not count toward the answer, and the reading freezes once it is a
+      measurement — you can lean over and read it without changing it.
+      Whatever offset is the SAME wherever you stand is what step 4's trim is for. To find out whether
+      yours is, measure it again from a different spot: an offset that moves is an angle or a lens error,
+      and no trim can take that out.</p>
     <div class="row" style="margin-top:0">
       <button id="holdStart" class="primary">Hold still at the spot</button>
       <button id="holdStop">Stop</button>
@@ -303,7 +313,7 @@ let source = { ok: false, reason: 'none', message: '' };
 let rc = null, check = null, viewport = null;
 let droppedName = '';
 // step 5: measuring the pair instead of guessing it
-let capture = null, capturing = false, calibResult = null, hold = null;
+let capture = null, capturing = false, calibResult = null, hold = null, holdFrozen = null;
 let lastMesh = { a: -1, b: -1 };
 
 // ---------------------------------------------------------------- renderer
@@ -656,6 +666,10 @@ function pick(d, side) {
     setup.cameras[side] = info;
   }
   save();
+  // Which camera is "left" is the geometry the capture is measuring, so a swap invalidates every frame in
+  // the buffer. Keeping them is what made the page's own "swap left and right, then capture again" advice
+  // impossible to follow.
+  dropCapture('Left and right changed');
   renderCamPicker();
   if (cams.running) flash('Press Start cameras again to use the new choice');
 }
@@ -731,6 +745,10 @@ async function start() {
     await startCameras({ prefs, ext, extById, faceMesh: true, status: m => { if (m) flash(m); },
                          detector: params.get('detector') || 'auto', allowBlob: params.get('allowBlob') === '1' });
   } catch (e) { flash('Cameras failed: ' + (e?.message || e)); }
+  // A camera that has been closed and reopened may have been knocked, re-seated or replugged in between -
+  // that is usually WHY it was reopened. Frames from before and after are two different rigs in one solve,
+  // so the buffer goes, for the same reason a re-measured baseline drops the pose.
+  dropCapture('The cameras were reopened');
   paintCams();
 }
 
@@ -912,12 +930,33 @@ function newestMesh(src) {
   return null;
 }
 
+// Which two physical cameras, marked which way round, the frames in the buffer came from. Every frame in
+// one buffer has to describe the same rig: mixing frames from before and after a swap (or a re-seated
+// camera) is two incompatible epipolar geometries in one solve, and what comes out is a refusal blaming
+// the cameras the user has just fixed.
+const captureStamp = () => `${setup.cameras.left?.deviceId || '-'}|${setup.cameras.right?.deviceId || '-'}`;
+// Throw the buffer away. Anything that changes what the buffer is measuring calls this.
+function dropCapture(why) {
+  const had = capture?.frames.length || 0;
+  capture = null; calibResult = null;
+  if (capturing) setCapture(false);
+  if (had && why) flash(`${why} — the ${had} views captured so far were thrown away`);
+  paintCalib();
+}
+
 function setCapture(on) {
   capturing = !!on;
   if (on) {
     if (trimMode) setTrim(false);                 // one flag on the glass at a time
-    if (!capture) capture = PC.makeCapture();
+    // Start capture STARTS a capture. It used to append to whatever was already in the buffer, so the
+    // page's own advice ("swap left and right, then capture again") could not work: the second capture
+    // was solved together with the first, which described the other marking. Starting over is the safe
+    // default, and it is said out loud rather than done quietly.
+    const had = capture?.frames.length || 0;
+    capture = PC.makeCapture({ stamp: captureStamp() });
+    calibResult = null;
     lastMesh = { a: -1, b: -1 };
+    if (had) flash(`Starting a new capture — the ${had} views from the last one were thrown away`);
     if (!calibSources()) flash('Start both cameras in step 1 first');
   }
   $('calflag').classList.toggle('hidden', !on);
@@ -927,8 +966,19 @@ function setCapture(on) {
 function calibTick(now) {
   if (hold && source.usable && !mouseMode) { hold.feed(eyeRig, now); paintHold(); }
   if (!capturing || !capture) return;
+  // Every frame in one buffer has to have come from the same two cameras marked the same way round. The
+  // places that change that already throw the buffer away; this makes the invariant enforced rather than
+  // remembered, so a path anyone adds later cannot quietly mix two rigs into one solve.
+  if (capture.stamp !== captureStamp()) { dropCapture('The cameras changed'); return; }
   const s = calibSources();
-  if (!s) return;
+  // A camera that goes away mid-capture used to be silent here: the flag froze with its last count and its
+  // last "still missing" advice while the user went on moving about for nothing.
+  if (!s) {
+    const gone = ['left', 'right'].filter(k => !cams.sources.some(x => x.deviceId === setup.cameras[k]?.deviceId));
+    setCapture(false);
+    flash(`The ${gone.join(' and ') || 'second'} camera is gone — the capture has stopped`);
+    return;
+  }
   const a = newestMesh(s.L), b = newestMesh(s.R);
   if (!a || !b) return;
   if (a.seq === lastMesh.a && b.seq === lastMesh.b) return;   // the same two frames as last time
@@ -941,14 +991,22 @@ function calibTick(now) {
 
 function calibSolve() {
   if (!capture || capture.frames.length < 2) { flash('Capture something first'); return null; }
+  // The lens is an input to the solve and it comes from the running cameras' own pictures, so refusing
+  // here is not pedantry: solving with a lens no camera is using is how a pose gets fitted at one focal
+  // and decoded at another. (rebuild() pushes a fov edit to the running cameras, so they cannot drift
+  // apart while both are up.)
+  if (!calibSources()) { flash('Start both cameras in step 1 first — the solve needs their pictures'); return null; }
   const used = RT.pairAngles(setup);
   const [camA, camB] = calibLenses();
+  const o = RT.trackerOriginRig(setup), h = setup.head.positionCm;
   calibResult = PC.solvePair({
     frames: capture.frames, camA, camB, baselineCm: setup.pair.baselineCm,
     // The angles being replaced are the sanity check AND the one degree of freedom a face cannot show:
     // rolling the whole pair about its own baseline is invisible, so the common tilt stays as it was.
     typed: { toeInDeg: used.toeInDeg, tiltUpDeg: used.tiltUpDeg },
-    opts: { polish: $('calPolish').checked },
+    // How far the user says they sit from the pair: reported beside the depth the solve found, because a
+    // wrong lens fov shows up there and nowhere else.
+    expectedDepthCm: Math.hypot(h[0] - o[0], h[1] - o[1], h[2] - o[2]),
   });
   if (calibResult.ok) { RT.applySolvedPose(setup, calibResult.pose); save(); rebuild(); }
   paintCalib();
@@ -959,12 +1017,15 @@ function calibSolve() {
 
 // A pose is only real once the running cameras are using it. Reopening them would mean several seconds of
 // MediaPipe reloading while the user waits to find out whether the answer was any good.
+// The lens goes with it. A running camera used to keep the focal length it was OPENED with, so correcting
+// "lens diagonal fov" in step 2 after pressing Start left the solve using the new number and the rays
+// using the old one - two different cameras, no warning, and the tracked head up to 10 cm out.
 function pushExtrinsics() {
   if (!cams.running) return;
   const pc = RT.pairCameras(setup);
   for (const [side, i] of [['left', 0], ['right', 1]]) {
     const id = setup.cameras[side]?.deviceId;
-    if (id) setExtrinsics(id, { posCm: pc[i].posCm, rotDeg: pc[i].rotDeg });
+    if (id) setExtrinsics(id, { posCm: pc[i].posCm, rotDeg: pc[i].rotDeg }, { dfovDeg: setup.pair.dfovDeg });
   }
 }
 
@@ -990,9 +1051,12 @@ function paintCalib(p = null) {
     ? [`${prog.frames} usable views (want ${prog.minFrames}+, cap ${prog.maxFrames})`,
        `${prog.binsFilled} of ${prog.binsTotal} parts of the volume seen (want ${prog.minBins}+)`,
        `left/right ${prog.axes.lateral.join(' ')}   ·   near/far ${prog.axes.depth.join(' ')}   ·   up/down ${prog.axes.height.join(' ')}`,
-       prog.missing.length ? 'still missing: ' + prog.missing.join(', ')
-                           : (prog.ready ? 'spread is good — press Solve' : 'keep moving'),
-       `dropped: ${prog.skipped.skew} out of step, ${prog.skipped.soon} too soon, ${prog.skipped.binFull} from a full bin, ${prog.skipped.noFace} with no face`,
+       prog.missing.length
+         ? 'still missing: ' + prog.missing.join(', ')
+           + (prog.solvable ? ' — or press Solve, there is already enough' : '')
+         : (prog.ready ? 'spread is good — press Solve' : 'keep moving'),
+       `dropped: ${prog.skipped.skew} out of step, ${prog.skipped.soon} too soon, ${prog.skipped.binFull} from a full bin, ${prog.skipped.noFace} with no face`
+         + (prog.evicted ? `  ·  ${prog.evicted} old views made room for new directions` : ''),
       ].join('\n')
     : 'nothing captured yet';
   $('calResult').textContent = calibResult ? PC.solveLines(calibResult).join('\n')
@@ -1014,21 +1078,28 @@ function paintCalib(p = null) {
 function paintHold() {
   if (!setupVisible()) return;
   const st = cams.running ? camerasStatus() : null;
-  const r = hold ? hold.result(performance.now()) : null;
+  const r = (hold ? hold.result(performance.now()) : null) || holdFrozen;
   const ang = RT.pairAngles(setup);
   const lines = [
     source.usable && !mouseMode
       ? `tracked head now ${eyeRig.map(n => n.toFixed(1).padStart(6)).join(' ')} cm`
         + (st?.eyeResidualCm != null ? `   ·   the two rays miss by ${(st.eyeResidualCm * 10).toFixed(1)} mm` : '')
       : `not tracking your head: ${mouseMode ? 'the mouse stand-in is on (press M)' : (source.message || 'waiting for both cameras')}`,
+    // "residual" is the epipolar fit against itself and is capped by the inlier threshold; the ray miss on
+    // the line above is the number that actually moves when the pose is wrong.
     ang.source === 'measured' && ang.solved.report
-      ? `the solve that posed this pair: ${ang.solved.report.residualMm} mm residual over `
-        + `${ang.solved.report.inliers} matched points` : '',
+      ? `the solve that posed this pair: ${ang.solved.report.residualMm} mm epipolar fit — consistency, not `
+        + `accuracy — over ${ang.solved.report.inliers} matched points` : '',
     '',
-    r ? r.message : 'press "Hold still at the spot" when you are standing where you said you sit',
+    r ? (r.frozen && !hold ? r.message + '\n(measurement kept; press "Hold still at the spot" to take another)'
+                           : r.message)
+      : 'press "Hold still at the spot" when you are standing where you said you sit',
     r?.n ? `average ${r.meanCm.join(', ')} cm   ·   you said ${setup.head.positionCm.map(n => n.toFixed(1)).join(', ')} cm` : '',
     r?.n ? `off by ${r.offsetCm.join(', ')} cm   ·   ${r.distanceCm} cm in all   ·   you held to ${r.wobbleMm.join('/')} mm` : '',
-    r?.done ? 'whatever is left over and CONSTANT is what step 4\'s trim is for; what changes as you move is not.' : '',
+    // The honest version: a trim removes the part that is the same everywhere. An angle or lens error is
+    // not the same everywhere, and this check only sees ONE spot, so it cannot tell you which you have.
+    r?.done ? 'a trim removes the part of this that is the SAME wherever you stand. Measure it again from a '
+      + 'different spot: if the offset moves, that part is an angle or a lens error and no trim can take it out.' : '',
   ];
   $('holdOut').textContent = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
@@ -1036,15 +1107,28 @@ function paintHold() {
 $('calStart').onclick = () => setCapture(true);
 $('calStop').onclick = () => setCapture(false);
 $('calSolve').onclick = () => { setCapture(false); calibSolve(); };
-$('calClear').onclick = () => { capture = PC.makeCapture(); calibResult = null; paintCalib(); };
+$('calClear').onclick = () => { capture = null; calibResult = null; paintCalib(); };
 $('calUse').onclick = () => { if (setup.pair.solved) useSolved(true); else flash('Nothing measured yet'); };
 $('calRevert').onclick = () => useSolved(false);
 $('calForget').onclick = () => {
   if (!confirm('Throw the measured pose away and go back to the angles worked out from where your head sits?')) return;
   setup.pair.solved = null; calibResult = null; save(); rebuild(); paintCalib();
 };
-$('holdStart').onclick = () => { hold = PC.makeHoldCheck({ expectedCm: setup.head.positionCm.slice() }); paintHold(); };
-$('holdStop').onclick = () => { hold = null; paintHold(); };
+// The hold check needs the pair's own origin as well as the named spot: a focal error is a radial scale
+// about the TRACKER, so how far it puts you from the cameras is the one metric measurement on the page,
+// and it is what turns "your lens fov is wrong" from a guess into a number to type into step 2.
+$('holdStart').onclick = () => {
+  const s = calibSources();
+  holdFrozen = null;
+  hold = PC.makeHoldCheck({
+    expectedCm: setup.head.positionCm.slice(), originCm: RT.trackerOriginRig(setup),
+    lens: { dfovDeg: setup.pair.dfovDeg, width: s?.L.layout.eyeW || 1280, height: s?.L.layout.eyeH || 720 },
+  });
+  paintHold();
+};
+// Stop leaves the reading on screen. It used to wipe it, on a check whose whole job is to resolve a
+// centimetre or two - which cannot be read from the spot you are standing on.
+$('holdStop').onclick = () => { holdFrozen = hold?.result(performance.now()) || holdFrozen; hold = null; paintHold(); };
 
 // ---------------------------------------------------------------- input
 
@@ -1068,6 +1152,11 @@ addEventListener('drop', async e => {
 addEventListener('keydown', e => {
   const typing = ['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName);
   const k = e.key.toLowerCase();
+  // Plain keys only. Ctrl+C to copy something during a demo used to START a calibration capture over the
+  // hologram, and Ctrl+S used to throw the whole setup page across the rig view; Alt+Left is the browser's
+  // Back and Ctrl+Left is a word jump, so the trim nudges have to be inside this guard too. Shift is NOT
+  // tested: it is the fine step in the trim block. Same guard as js/main.js.
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (trimMode && !typing) {
     const step = e.shiftKey ? 0.1 : 0.5;
     if (k === 'arrowleft') return nudge(0, -step), e.preventDefault();
@@ -1156,7 +1245,9 @@ window.rigtest2 = {
   calib: {
     start: () => { setCapture(true); return !!capture; },
     stop: () => { setCapture(false); return capture ? capture.frames.length : 0; },
-    feed: (f) => { if (!capture) capture = PC.makeCapture(); const r = capture.add(f); paintCalib(); return r; },
+    feed: (f) => { if (!capture) capture = PC.makeCapture({ stamp: captureStamp() }); const r = capture.add(f); paintCalib(); return r; },
+    frames: () => (capture ? capture.frames.length : 0),
+    clear: () => { capture = null; calibResult = null; paintCalib(); return 0; },
     progress: () => (capture ? capture.progress() : null),
     solve: () => { const r = calibSolve(); return r && { ok: r.ok, reasons: (r.reasons || []).map(x => x.code),
                                                          report: r.report, lines: PC.solveLines(r) }; },
@@ -1170,10 +1261,10 @@ window.rigtest2 = {
     panel: () => ({ progress: $('calProgress').textContent, result: $('calResult').textContent,
                     hold: $('holdOut').textContent }),
     hold: {
-      start: () => { hold = PC.makeHoldCheck({ expectedCm: setup.head.positionCm.slice() }); return true; },
+      start: () => { $('holdStart').onclick(); return true; },
       feed: (p, at) => { const r = hold && hold.feed(p, at); paintHold(); return r; },
-      result: () => hold && hold.result(performance.now()),
-      stop: () => { hold = null; return true; },
+      result: () => (hold ? hold.result(performance.now()) : holdFrozen),
+      stop: () => { $('holdStop').onclick(); return true; },
     },
   },
   status: () => ({ source, mouseMode, sceneKind, fps, flip: RT.flipTransform(rc),

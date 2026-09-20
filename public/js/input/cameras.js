@@ -266,6 +266,9 @@ async function openSource(dev, opts) {
   const src = {
     deviceId: dev.deviceId, prefKey: dev.prefKey, label: dev.label || 'camera', cls, role: dev.role,
     width, height, fps: set.frameRate || 0, sbs, layout, calib, intr, ext, views, stream, track, video,
+    // the lens these intrinsics were built from, so a page that lets it be edited can tell whether the
+    // running camera and the number on screen still agree
+    dfovDeg: sbs ? null : (dev.pref?.dfovDeg || null),
     tasks: { face: dev.role === 'head' || dev.role === 'both', hands: dev.role === 'hands' || dev.role === 'both',
              // the full face mesh, for whoever is calibrating with it; see landmarks-worker.js packMesh
              mesh: !!opts.faceMesh && (dev.role === 'head' || dev.role === 'both') },
@@ -716,12 +719,22 @@ export function setRole(deviceId, role) {
 
 // Move a camera without reopening it. A calibration that has just solved where the two webcams really are
 // has to take effect NOW: closing and reopening both cameras means several seconds of MediaPipe reloading,
-// and the user is standing there waiting to see whether the answer was any good. The views are rebuilt
-// from the same intrinsics, so only the pose changes.
-export function setExtrinsics(deviceId, ext) {
+// and the user is standing there waiting to see whether the answer was any good.
+//
+// `dfovDeg` rebuilds the intrinsics too. It used to reuse src.intr unconditionally, which meant a camera
+// kept the focal length it was OPENED with: a page that let the user correct the lens fov after Start then
+// solved with one focal and decoded the rays with another, and nothing said so. A lens is not a preference
+// either, so it travels with the pose.
+export function setExtrinsics(deviceId, ext, { dfovDeg = null } = {}) {
   const src = cams.sources.find(s => s.deviceId === deviceId);
   if (!src || !ext) return false;
   src.ext = ext;
+  // sbs cameras get their intrinsics from the factory file, not from a typed fov; leave those alone.
+  if (Number.isFinite(dfovDeg) && dfovDeg > 0 && !src.sbs) {
+    const f = devices.focalPxFromDiagFov(src.width, src.height, dfovDeg);
+    src.intr = { ...src.intr, fx: f, fy: f, cx: src.width / 2, cy: src.height / 2 };
+    src.dfovDeg = dfovDeg;
+  }
   src.views = stereo.viewsForCamera({ width: src.width, height: src.height, sbs: src.sbs,
                                       calib: src.calib, intr: src.intr, ext, label: src.label });
   // The old verdict was about the old pose. Keeping it would let the grace period vouch for geometry that

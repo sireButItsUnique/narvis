@@ -28,8 +28,8 @@
 //              so that one degree of freedom stays at whatever the user typed or aimed. The page says so.
 // Pretending otherwise would be the same lie in a new coat, so solvePair() reports which is which.
 
-import { relativePoseRansac, triangulateNormalized, spreadCheck, bundleAdjust } from '../track/calibrate.js';
-import { PinholeCamera, intrinsicsFromFov } from '../track/camera.js';
+import { relativePoseRansac, triangulateNormalized, spreadCheck } from '../track/calibrate.js';
+import { PinholeCamera, intrinsicsFromFov, fovFromFocal } from '../track/camera.js';
 import {
   add, sub, scale, dot, cross, norm, normalize, matMul, matVec, transpose,
   rodrigues, orthonormalize, I3, mean, stddev,
@@ -105,6 +105,10 @@ export const CAPTURE = {
   bandD: 0.09,
   bandV: 0.07,
   minLandmarks: 200,    // a face mesh shorter than this is not a face mesh
+  // Once the buffer is full, a frame only displaces an older one while its band of the volume is this thin.
+  // One frame of "further back" is enough to stop the page asking for it and not enough to weigh on the
+  // fit, so the band is topped up to a few before the buffer settles.
+  minPerBand: 3,
 };
 
 // Which cell of the working volume this frame is, WITHOUT using any calibration - because the calibration
@@ -134,13 +138,39 @@ const AXES = [
  * Collects matched face-landmark frames while the user moves about. Pure: the page feeds it, tests feed it.
  */
 export function makeCapture(opts = {}) {
-  const cfg = { ...CAPTURE, ...opts };
+  const { stamp = '', ...rest } = opts;
+  const cfg = { ...CAPTURE, ...rest };
   const frames = [], bins = new Map();
-  let lastAt = -Infinity;
+  let lastAt = -Infinity, evicted = 0;
   const skipped = { noFace: 0, short: 0, skew: 0, soon: 0, binFull: 0, full: 0 };
 
+  const bandCounts = () => {
+    const counts = AXES.map(() => [0, 0, 0]);
+    for (const f of frames) AXES.forEach((ax, k) => { counts[k][f.cell[ax.i]]++; });
+    return counts;
+  };
+  // Is this cell in a band that is still thin? That is the only reason to displace an older frame.
+  const wantsCell = (cell) => {
+    const c = bandCounts();
+    return AXES.some((ax, k) => c[k][cell[ax.i]] < cfg.minPerBand);
+  };
+  // Make room by dropping the OLDEST frame from the most over-represented bin. Only a bin holding two or
+  // more is touched, so making room can never empty a bin - and so never loses a band that is already
+  // covered, which would just move the "still missing" complaint somewhere else.
+  const evictOne = () => {
+    let key = null, most = 1;
+    for (const [k, n] of bins) if (n > most) { most = n; key = k; }
+    if (key === null) return false;
+    const i = frames.findIndex(f => f.key === key);
+    if (i < 0) return false;
+    frames.splice(i, 1);
+    bins.set(key, most - 1);
+    evicted++;
+    return true;
+  };
+
   const api = {
-    cfg, frames,
+    cfg, frames, stamp,
     /** @param f { tA, tB, a, b } - capture timestamps in ms and the two face meshes, matched by index. */
     add(f) {
       const a = packLm(f.a), b = packLm(f.b);
@@ -150,10 +180,15 @@ export function makeCapture(opts = {}) {
       if (Math.abs(f.tA - f.tB) > cfg.maxSkewMs) { skipped.skew++; return { ok: false, why: 'skew' }; }
       const t = (f.tA + f.tB) / 2;
       if (t - lastAt < cfg.minGapMs) { skipped.soon++; return { ok: false, why: 'too-soon' }; }
-      if (frames.length >= cfg.maxFrames) { skipped.full++; return { ok: false, why: 'enough' }; }
       const bin = binOf(a, b, cfg);
       if (!bin) { skipped.noFace++; return { ok: false, why: 'no-face' }; }
       if ((bins.get(bin.key) || 0) >= cfg.perBin) { skipped.binFull++; return { ok: false, why: 'bin-full' }; }
+      // The cap is a budget, not a wall. It used to be checked BEFORE the bin, so once 110 frames were in,
+      // no new part of the volume could ever be recorded - and a capture that filled up before the user had
+      // leaned back went on asking forever for the one movement it was throwing away. A frame from a band
+      // that has never been seen now displaces the oldest frame of the most over-represented bin instead.
+      if (frames.length >= cfg.maxFrames && !(wantsCell(bin.cell) && evictOne()))
+        { skipped.full++; return { ok: false, why: 'enough' }; }
       bins.set(bin.key, (bins.get(bin.key) || 0) + 1);
       lastAt = t;
       frames.push({ t, a, b, n, ...bin });
@@ -162,25 +197,31 @@ export function makeCapture(opts = {}) {
 
     /** Live progress: how many usable views, how well spread, and what is still missing. */
     progress() {
-      const counts = AXES.map(ax => [0, 0, 0]);
-      for (const f of frames) AXES.forEach((ax, k) => { counts[k][f.cell[ax.i]]++; });
+      const counts = bandCounts();
       const missing = [];
       AXES.forEach((ax, k) => {
         for (const band of [0, 2]) if (!counts[k][band]) missing.push(ax.miss[band]);
       });
       const filled = bins.size;
       const enough = frames.length >= cfg.minFrames && filled >= cfg.minBins && !missing.length;
+      // Enough to solve with, even though a direction is still missing. Worth saying: the page used to show
+      // a full bar and an instruction at the same time, which reads as "stuck" when it is not.
+      const solvable = frames.length >= cfg.minFrames && filled >= cfg.minBins;
       return {
         frames: frames.length, maxFrames: cfg.maxFrames, minFrames: cfg.minFrames,
         binsFilled: filled, binsTotal: 27, minBins: cfg.minBins,
         axes: Object.fromEntries(AXES.map((ax, k) => [ax.name, counts[k]])),
-        missing, ready: enough, skipped: { ...skipped },
-        // one number for a progress bar: the worst of "enough frames" and "enough of the volume"
-        fraction: clamp(Math.min(frames.length / cfg.minFrames, filled / cfg.minBins), 0, 1),
+        missing, ready: enough, solvable, evicted, skipped: { ...skipped },
+        // One number for a progress bar: the worst of "enough frames" and "enough of the volume". It stops
+        // short of full while a direction is missing, because 100% and "still missing" together is a lie.
+        fraction: clamp(Math.min(frames.length / cfg.minFrames, filled / cfg.minBins, enough ? 1 : 0.95), 0, 1),
       };
     },
 
-    reset() { frames.length = 0; bins.clear(); lastAt = -Infinity; for (const k of Object.keys(skipped)) skipped[k] = 0; },
+    reset() {
+      frames.length = 0; bins.clear(); lastAt = -Infinity; evicted = 0;
+      for (const k of Object.keys(skipped)) skipped[k] = 0;
+    },
   };
   return api;
 }
@@ -190,7 +231,9 @@ export function captureLines(p) {
   const out = [
     `${p.frames} of ${p.minFrames} usable views  ·  ${p.binsFilled} of ${p.minBins} parts of the volume`,
   ];
-  if (p.missing.length) out.push('still missing: ' + p.missing.join(', '));
+  if (p.missing.length)
+    out.push('still missing: ' + p.missing.join(', ')
+      + (p.solvable ? ' — or press Solve, there is already enough' : ''));
   else if (!p.ready) out.push('keep moving: more views needed');
   else out.push('spread is good — press Solve');
   return out;
@@ -260,11 +303,21 @@ export const SOLVE = {
   minInlierRatio: 0.55,
   maxBaselineOffDeg: 12,    // the solved baseline vs the one the user measured across the rig
   maxToeDeltaDeg: 12,       // the solved toe-in vs the angles being replaced
-  minSpreadMm: 40,          // spreadCheck: below this the fit is good where you stood and wrong elsewhere
+  // The capture has to have MOVED, measured on its widest axis. It used to be measured on the NARROWEST,
+  // which refused captures that solve perfectly well: a head sliding along one line still carries the
+  // geometry in the face's own relief, and this was the only refusal that ever fired on a real capture.
+  minSpreadMm: 40,
   minDepthCm: 20, maxDepthCm: 200,
-  polish: false,            // bundleAdjust; see below - correct, but seconds rather than milliseconds
-  polishPoints: 36,
 };
+
+// A focal error does not just scale depth - it bends the toe-in, at roughly half a degree of relative
+// rotation per 1% of focal error, and the anchoring then carries that into the rig as a real rotation. At
+// about 3% (some 2 degrees of diagonal FOV) the solved pose is no better than the typed angles it replaces,
+// and no residual or inlier number can see it, because a wrong K is self-consistent in BOTH cameras. So the
+// lens is said out loud wherever the solve is reported, and the hold check measures it: see makeHoldCheck.
+export const LENS_LIMIT_NOTE =
+  'the solve is only as good as the lens fov in step 2: about 2 degrees of diagonal FOV out is break-even '
+  + 'against the angles this replaces, and the residual cannot see it — the hold check below can';
 
 /**
  * Solve the pair's relative pose from captured face frames and turn it into rig-frame extrinsics.
@@ -274,9 +327,13 @@ export const SOLVE = {
  * @param baselineCm  the measured centre-to-centre distance. This is the ONLY source of scale.
  * @param typed       { toeInDeg, tiltUpDeg } the angles being replaced - the sanity check, and the one
  *                    degree of freedom (roll about the baseline) the faces cannot see.
+ * @param expectedDepthCm  optional: how far the user says their head sits from the pair. Reported, never
+ *                    refused on - the iris is a few cm in front of the head centre and the capture covers a
+ *                    whole volume, so a few percent of disagreement is normal and a gate would misfire.
  * @returns { ok, pose?, reasons?, report }
  */
-export function solvePair({ frames, camA, camB, baselineCm, typed = { toeInDeg: 0, tiltUpDeg: 0 }, opts = {} }) {
+export function solvePair({ frames, camA, camB, baselineCm, typed = { toeInDeg: 0, tiltUpDeg: 0 },
+                            expectedDepthCm = null, opts = {} }) {
   const cfg = { ...SOLVE, ...opts };
   const idx = cfg.landmarks || CALIB_LANDMARKS;
   const reasons = [];
@@ -303,7 +360,12 @@ export function solvePair({ frames, camA, camB, baselineCm, typed = { toeInDeg: 
     use = []; useFrame = [];
     for (let k = 0; k < cfg.maxPairs; k++) { const i = Math.floor(k * step); use.push(pairs[i]); useFrame.push(ofFrame[i]); }
   }
-  const report = { frames: (frames || []).length, pairs: use.length, landmarks: idx.length };
+  // The lens the solve is being run with, carried on the answer. It is an INPUT, not a measurement, and it
+  // sets the toe-in as directly as the pictures do - so a pose that does not say which lens it was fitted
+  // against cannot be checked later against the lens the app is decoding with.
+  const dfovOf = c => round(fovFromFocal(c.fx, Math.hypot(c.width, c.height)), 2);
+  const report = { frames: (frames || []).length, pairs: use.length, landmarks: idx.length,
+                   dfovDeg: [dfovOf(camA), dfovOf(camB)] };
   if (use.length < cfg.minPairs) {
     fail('data', `Only ${use.length} matched points were captured; the solve needs at least ${cfg.minPairs}. `
       + 'Run the capture again and keep both cameras seeing your face.');
@@ -322,18 +384,17 @@ export function solvePair({ frames, camA, camB, baselineCm, typed = { toeInDeg: 
       + 'looking at the same face, or the landmarks are too noisy to use.');
     return { ok: false, reasons, report };
   }
-  let { R, t } = rp;
+  const { R, t } = rp;
   report.inliers = rp.inliers.length;
   report.inlierRatio = round(rp.inlierRatio, 3);
   report.sampsonRmsPx = round(rp.sampsonRmsPx, 3);
 
-  // ---- optional polish: reprojection instead of Sampson, cameras and points together. Camera A is held
-  // and camera B is free, so the scale floats; it is put back from the baseline immediately below, which is
-  // where it comes from anyway.
-  if (cfg.polish) {
-    const polished = polishWithBundle(camA, camB, use, rp, cfg);
-    if (polished) { R = polished.R; t = polished.t; report.bundleRmsPx = round(polished.rmsPx, 3); }
-  }
+  // (There used to be an optional bundleAdjust "polish" here. On a two-view problem it has 6 pose degrees
+  // of freedom against 3 per point and nothing else to pin it, so it walks BACK toward the answer
+  // refineRelativePose already had at best, and overfits a handful of points at worst - measured over 7
+  // seeds of the synthetic session it was 2x to 22x worse than not running it, every time, while reporting
+  // a smaller reprojection number than the Sampson one because it was fitted to fewer points. A knob that
+  // is never right is not an option, so it is gone.)
 
   // ---- SCALE. The essential matrix gives a unit translation: the pair could be two webcams a metre apart
   // or two grains of sand. The only metric number in the whole procedure is the baseline the user measured.
@@ -374,14 +435,28 @@ export function solvePair({ frames, camA, camB, baselineCm, typed = { toeInDeg: 
   const depths = heads.map(h => Math.hypot(h[0], h[1], h[2]));
   const medianDepthCm = depths.length ? percentileOf(depths, 0.5) : 0;
   report.medianDepthCm = round(medianDepthCm, 1);
-  const spread = spreadCheck(heads.map(h => scale(h, 10)), cfg.minSpreadMm);      // spreadCheck works in mm
-  report.spread = { ok: spread.ok, perAxisMm: (spread.perAxisMm || []).map(n => round(n, 0)),
-                    minAxisMm: round(spread.minAxisMm || 0, 0) };
+  // How far the triangulated head sits from where the user says they sit. NOT a refusal: the iris is a few
+  // cm in front of the head centre and the capture covers a whole volume, so this reads several percent
+  // high even with a perfect lens. It is reported because it is the only place a wrong lens fov shows up at
+  // all - it drifts about 3% per degree of diagonal FOV, while the residual moves the wrong way.
+  if (Number.isFinite(expectedDepthCm) && expectedDepthCm > 0 && medianDepthCm > 0)
+    report.depthVsNamedPct = round((medianDepthCm / expectedDepthCm - 1) * 100, 1);
 
-  // The headline number in millimetres, which is the one a person can judge: the epipolar error in pixels,
-  // carried out to the distance the head actually sits at.
+  const spread = spreadCheck(heads.map(h => scale(h, 10)), cfg.minSpreadMm);      // spreadCheck works in mm
+  const perAxisMm = (spread.perAxisMm || []).map(n => round(n, 0));
+  const widestMm = perAxisMm.length ? Math.max(...perAxisMm) : 0;
+  // Refuse on the WIDEST axis, not the narrowest: what makes a capture useless is not moving at all. A head
+  // that slid along one line has moved, and the face's own relief carries the rest of the geometry.
+  report.spread = { ok: widestMm >= cfg.minSpreadMm, perAxisMm, widestMm,
+                    minAxisMm: round(spread.minAxisMm || 0, 0), thin: !spread.ok };
+
+  // The epipolar error in pixels, carried out to the distance the head sits at. This is the CONSISTENCY of
+  // the fit with itself, not its accuracy, and it is worth being blunt about why: an inlier is by
+  // definition under thresholdPx, so this number cannot exceed the ceiling below whatever the pose is, and
+  // it FALLS when the lens fov is wrong. The accuracy number is the ray miss on the live readout.
   const f = (camA.fx + camB.fx) / 2;
   report.residualMm = round(medianDepthCm > 0 ? rp.sampsonRmsPx / f * medianDepthCm * 10 : 0, 2);
+  report.residualCeilingMm = round(medianDepthCm > 0 ? cfg.thresholdPx / f * medianDepthCm * 10 : 0, 2);
 
   // ---- angles, and whether they are believable
   const solvedToe = (right.rotDeg[1] - left.rotDeg[1]) / 2;
@@ -391,6 +466,10 @@ export function solvePair({ frames, camA, camB, baselineCm, typed = { toeInDeg: 
   report.dToeDeg = round(solvedToe - typed.toeInDeg, 2);
   report.dTiltDeg = round(solvedTilt - typed.tiltUpDeg, 2);
   report.asymmetryDeg = round(Math.abs(right.rotDeg[0] - left.rotDeg[0]), 2);
+  // The two cameras' yaws about the baseline. A symmetric pair sums to zero, so this is the part of the
+  // solved rotation the mean toe-in throws away - it was measured and then silently dropped, which let a
+  // pair that is a degree out on one side alone read as a pair that is bang on.
+  report.asymmetryYawDeg = round(Math.abs(right.rotDeg[1] + left.rotDeg[1]), 2);
 
   // The baseline check: take the solved A->B direction out of camera A's frame using the angles the user
   // typed, and compare it with the direction they measured (straight across the rig). A pair marked the
@@ -408,20 +487,24 @@ export function solvePair({ frames, camA, camB, baselineCm, typed = { toeInDeg: 
 
   // ---- the four ways this is refused. All of them are reported, not just the first: "it failed" is not
   // an answer a person can act on.
-  if (!spread.ok)
+  if (!report.spread.ok)
     fail('spread', `You did not move far enough while capturing: the head positions only span `
-      + `${report.spread.minAxisMm} mm on their narrowest axis, and ${cfg.minSpreadMm} mm is the minimum. `
-      + 'A fit from one spot looks perfect there and is wrong everywhere else. Capture again and go to the '
-      + 'corners of where you actually sit.');
+      + `${report.spread.widestMm} mm on their widest axis, and ${cfg.minSpreadMm} mm is the minimum. `
+      + 'A fit from one spot looks perfect there and is wrong everywhere else. Press "Throw the capture '
+      + 'away" and capture again, going to the corners of where you actually sit.');
   if (rp.inlierRatio < cfg.minInlierRatio)
     fail('inliers', `Only ${Math.round(rp.inlierRatio * 100)}% of the ${use.length} matched points fitted one `
       + `pose (${Math.round(cfg.minInlierRatio * 100)}% is the minimum). The two cameras were probably not `
-      + 'looking at the same face at the same moment, or one of them was moved during the capture.');
+      + 'looking at the same face at the same moment, or one of them was moved during the capture — or the '
+      + 'buffer still holds frames from before you changed something. Press "Throw the capture away" and '
+      + 'capture again.');
   if (offDeg > cfg.maxBaselineOffDeg)
     fail('baseline', `The solve puts the line between the two cameras ${report.baselineOffDeg} degrees away `
       + `from running across the rig, and you measured them as level and symmetric. `
-      + (report.baselineSwapped ? 'They look marked the wrong way round: swap left and right in step 1.'
-                                : 'Check the baseline, the height and the depth in step 2, or re-measure the mounting.'));
+      + (report.baselineSwapped
+         ? 'They look marked the wrong way round: swap left and right in step 1, then press "Throw the '
+           + 'capture away" — the frames already captured describe the old marking — and capture again.'
+         : 'Check the baseline, the height and the depth in step 2, or re-measure the mounting.'));
   if (Math.abs(report.dToeDeg) > cfg.maxToeDeltaDeg)
     fail('angles', `The solve says the cameras are toed in ${report.toeInDeg} degrees, but the angles it `
       + `would replace say ${round(typed.toeInDeg, 1)}. That is ${Math.abs(report.dToeDeg)} degrees apart, `
@@ -436,6 +519,10 @@ export function solvePair({ frames, camA, camB, baselineCm, typed = { toeInDeg: 
     version: POSE_VERSION, savedAt: new Date().toISOString(),
     baselineCm, left, right, toeInDeg: report.toeInDeg, tiltUpDeg: report.tiltUpDeg,
     scaleFrom: report.scaleFrom,
+    // The lens this pose was fitted against. It sets the toe-in as directly as the baseline sets the
+    // positions, so like the baseline it has to travel with the pose: changing it later means the pose
+    // describes a pair of cameras that no longer exists.
+    dfovDeg: report.dfovDeg.slice(),
     // what was measured and what was not, carried with the pose so the page can never overstate it
     tiltFromTyped: true, typedTiltUpDeg: typed.tiltUpDeg, rollDeg: round(best.deg, 2),
     report,
@@ -458,33 +545,6 @@ function percentileOf(xs, p) {
   return s[lo] + (s[hi] - s[lo]) * (i - lo);
 }
 
-// bundleAdjust over a handful of points: camera A fixed, camera B free, points free. It minimises the real
-// reprojection error rather than Sampson's linearisation of it. Kept small and optional because it is a
-// dense solve with 3 parameters per point.
-function polishWithBundle(camA, camB, pairs, rp, cfg) {
-  try {
-    const inl = rp.inliers.slice(0, cfg.polishPoints);
-    if (inl.length < 12) return null;
-    const A = inl.map(i => camA.normalized(pairs[i].a.u, pairs[i].a.v));
-    const B = inl.map(i => camB.normalized(pairs[i].b.u, pairs[i].b.v));
-    const pts = A.map((a, k) => triangulateNormalized(rp.R, rp.t, a, B[k])).filter(p => p && p.every(Number.isFinite));
-    if (pts.length < 12) return null;
-    const ca = camA.clone({ id: 'a' }).setPoseFromRt(I3(), [0, 0, 0]);
-    const cb = camB.clone({ id: 'b' }).setPoseFromRt(rp.R, rp.t);
-    // The observations are the MEASURED landmarks, put back into pixels; projecting the current estimate
-    // instead would hand the adjuster its own answer and it would report a perfect zero.
-    const obs = [];
-    pts.forEach((p, k) => {
-      obs.push({ cam: 0, point: k, u: A[k][0] * ca.fx + ca.cx, v: A[k][1] * ca.fy + ca.cy });
-      obs.push({ cam: 1, point: k, u: B[k][0] * cb.fx + cb.cx, v: B[k][1] * cb.fy + cb.cy });
-    });
-    const out = bundleAdjust({ cameras: [ca, cb], points: pts, observations: obs, fixed: [0], iterations: 12 });
-    const R = out.cameras[1].R, t = normalize(out.cameras[1].t);
-    if (!R.every(Number.isFinite) || !t.every(Number.isFinite)) return null;
-    return { R: orthonormalize(R), t, rmsPx: out.rmsPx };
-  } catch { return null; }
-}
-
 // ---------------------------------------------------------------- what the page shows
 
 /** The solve, in the sentences a person at the rig can act on. */
@@ -494,18 +554,33 @@ export function solveLines(res) {
   const lines = [head, ''];
   lines.push(`views ${r.frames}  ·  matched points ${r.pairs}`
     + (r.inliers != null ? `  ·  inliers ${r.inliers} (${Math.round((r.inlierRatio || 0) * 100)}%)` : ''));
-  if (r.residualMm != null) lines.push(`residual ${r.residualMm} mm at ${r.medianDepthCm} cm  ·  ${r.sampsonRmsPx} px`);
-  if (r.spread) lines.push(`spread ${r.spread.perAxisMm.join(' / ')} mm (x / y / z), narrowest ${r.spread.minAxisMm} mm`);
+  // NOT "residual". It is the epipolar error of the fit against itself, measured over the points that were
+  // close enough to be called inliers - so it can never exceed the ceiling, it says nothing about whether
+  // the pose is right, and with a wrong lens fov it gets SMALLER as the pose gets worse. Say all of that
+  // where the number is, because a small number in millimetres reads as "accurate to a millimetre".
+  if (r.residualMm != null)
+    lines.push(`epipolar fit ${r.residualMm} mm at ${r.medianDepthCm} cm  ·  ${r.sampsonRmsPx} px`
+      + (r.residualCeilingMm ? `  (consistency of the fit with itself, NOT accuracy: anything under `
+        + `${r.residualCeilingMm} mm is possible whatever the pose)` : ''));
+  if (r.spread)
+    lines.push(`spread ${r.spread.perAxisMm.join(' / ')} mm (x / y / z), widest ${r.spread.widestMm} mm`
+      + (r.spread.thin ? `  ·  thin on one axis (${r.spread.minAxisMm} mm) — still solvable, but move more` : ''));
   // The angles are only meaningful once the baseline has been anchored, so when THAT is what failed they
   // are not reported as if they were an answer - they would be the aim of a pair that does not exist.
   const anchored = !(res.reasons || []).some(x => x.code === 'baseline');
   if (r.toeInDeg != null && anchored)
     lines.push(`toe-in ${r.toeInDeg} deg (was ${round(r.toeInDeg - r.dToeDeg, 1)})  ·  tilt ${r.tiltUpDeg} deg`
-      + `  ·  the two cameras differ by ${r.asymmetryDeg} deg in tilt`);
+      + `  ·  the two cameras differ by ${r.asymmetryDeg} deg in tilt and ${r.asymmetryYawDeg} deg in yaw`);
   else if (r.toeInDeg != null)
     lines.push('angles: not reported — they are only meaningful once the baseline is anchored, and it is not');
   if (r.baselineOffDeg != null) lines.push(`baseline ${r.baselineOffDeg} deg off the line you measured`);
   if (r.scaleFrom) lines.push(`scale: ${r.scaleFrom} — the faces alone cannot set it`);
+  if (r.dfovDeg) lines.push(`lens: solved with ${r.dfovDeg.map(d => `${d} deg`).join(' / ')} diagonal fov — `
+    + LENS_LIMIT_NOTE);
+  if (r.depthVsNamedPct != null)
+    lines.push(`your head triangulates ${r.medianDepthCm} cm from the pair, ${r.depthVsNamedPct > 0 ? '+' : ''}`
+      + `${r.depthVsNamedPct}% against the spot you named (a few percent is normal — the iris sits in front `
+      + 'of the head centre — but tens of percent is the lens fov, not the angles)');
   if (res.ok) lines.push('the common tilt up is NOT measured (rolling the whole pair is invisible to a face);'
     + ' it is kept from the angles it replaced');
   for (const x of (res.reasons || [])) lines.push('', `${x.code.toUpperCase()}: ${x.text}`);
@@ -516,35 +591,86 @@ export function solveLines(res) {
 
 // The check that needs no faith in the hardware: stand at a spot you can point at, hold still, and the page
 // says how far the solved pair puts you from it. A calibration that cannot survive this is not calibrated.
-export function makeHoldCheck({ expectedCm, ms = 2000 } = {}) {
-  const samples = [];
-  let t0 = null;
-  return {
+//
+// It used to average EVERYTHING since the button was pressed, with no settling period and no stop: walking
+// to the spot over two seconds and then standing on it reported 16 cm of error that was entirely the walk,
+// and a finished, correct reading turned itself back into a wrong one as soon as the user leaned over to
+// read it. So: the clock only runs while the head is actually still, the mean is over a trailing window,
+// and the answer freezes the moment it is a measurement.
+export const HOLD = {
+  ms: 2000,          // how long the head has to be still for this to be a measurement
+  stepMm: 5,         // a jump bigger than this between samples is the user moving, not wobbling
+  spreadMm: 10,      // and a window spanning more than this was never a hold
+};
+
+export function makeHoldCheck({ expectedCm, originCm = null, lens = null, ms = HOLD.ms, opts = {} } = {}) {
+  const cfg = { ...HOLD, ...opts };
+  let win = [];                     // {p, t}: only samples from the current unbroken still stretch
+  let t0 = null, last = null, frozen = null, jumped = false;
+
+  const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+  const spreadOf = () => [0, 1, 2].map(k => {
+    const xs = win.map(s => s.p[k]);
+    return Math.max(...xs) - Math.min(...xs);
+  });
+
+  // Where a wrong lens fov shows up: a focal error is a radial scale about the tracker's own origin, so the
+  // named spot being consistently too far or too near is the one metric measurement on the page. f scales
+  // almost 1:1 with that ratio, so this hands back the fov to type into step 2 and solve again.
+  function lensHint(meanCm) {
+    if (!lens?.dfovDeg || !originCm) return null;
+    const want = dist(expectedCm, originCm), got = dist(meanCm, originCm);
+    if (!(want > 5 && got > 5)) return null;
+    const ratio = got / want;
+    const diag = Math.hypot(lens.width || 1280, lens.height || 720);
+    const f = (diag / 2) / Math.tan((lens.dfovDeg * DEG) / 2) * ratio;
+    return { ratio: round(ratio, 4), pct: round((ratio - 1) * 100, 1), dfovDeg: round(fovFromFocal(f, diag), 1) };
+  }
+
+  const api = {
     feed(p, now) {
-      if (!p || !p.every(Number.isFinite)) return this.result(now);
+      if (frozen) return frozen;                              // a measurement, not a running average
+      if (!p || !p.every(Number.isFinite)) return api.result(now);
+      // A step bigger than the wobble threshold is the user walking, not holding: start the clock again.
+      jumped = !!last && dist(p, last) > cfg.stepMm / 10;
+      if (jumped) { win = []; t0 = null; }
+      last = p.slice();
       if (t0 === null) t0 = now;
-      samples.push(p.slice());
-      return this.result(now);
+      win.push({ p: p.slice(), t: now });
+      while (win.length > 1 && now - win[0].t > ms) win.shift();          // trailing window, not the lot
+      while (win.length > 2 && Math.max(...spreadOf()) > cfg.spreadMm / 10) { win.shift(); t0 = win[0].t; }
+      const r = api.result(now);
+      if (r.done) frozen = { ...r, frozen: true };             // freeze it; the walk back must not move it
+      return frozen || r;
     },
     result(now = 0) {
-      const n = samples.length;
-      if (!n) return { done: false, n: 0, elapsedMs: 0, message: 'Stand at the spot and hold still…' };
-      const m = [0, 1, 2].map(k => mean(samples.map(s => s[k])));
-      const steady = [0, 1, 2].map(k => stddev(samples.map(s => s[k])));
+      if (frozen) return frozen;
+      const n = win.length;
+      if (!n) return { done: false, frozen: false, n: 0, elapsedMs: 0, message: 'Stand at the spot and hold still…' };
+      const m = [0, 1, 2].map(k => mean(win.map(s => s.p[k])));
+      const steady = [0, 1, 2].map(k => stddev(win.map(s => s.p[k])));
       const off = sub(m, expectedCm);
       const elapsed = t0 === null ? 0 : now - t0;
-      const done = elapsed >= ms && n >= 10;
+      const wobbleMm = steady.map(x => round(x * 10, 1));
+      const still = !jumped && Math.max(...spreadOf()) <= cfg.spreadMm / 10;
+      const done = elapsed >= ms && n >= 10 && still;
+      const hint = done ? lensHint(m) : null;
       return {
-        done, n, elapsedMs: round(elapsed, 0), meanCm: m.map(x => round(x, 2)),
-        offsetCm: off.map(x => round(x, 2)), distanceCm: round(norm(off), 2),
-        wobbleMm: steady.map(x => round(x * 10, 1)),
+        done, frozen: false, n, elapsedMs: round(elapsed, 0), meanCm: m.map(x => round(x, 2)),
+        offsetCm: off.map(x => round(x, 2)), distanceCm: round(norm(off), 2), wobbleMm, lens: hint,
         message: done
           ? `The pair puts you ${round(norm(off), 1)} cm from the spot you named `
             + `(${off.map(x => (x >= 0 ? '+' : '') + round(x, 1)).join(', ')} cm), `
             + `holding to within ${round(Math.max(...steady) * 10, 0)} mm.`
-          : `Hold still… ${n} samples, ${round(elapsed / 100) / 10} s`,
+            + (hint && Math.abs(hint.pct) >= 2
+               ? `\nIt also puts you ${Math.abs(hint.pct)}% ${hint.pct > 0 ? 'further from' : 'nearer'} the `
+                 + `pair than the spot you named, which is what a wrong lens fov looks like: try `
+                 + `${hint.dfovDeg} deg in step 2 and solve again.` : '')
+          : `Hold still… ${n} samples, ${round(elapsed / 100) / 10} s`
+            + (still ? '' : ' — still moving'),
       };
     },
-    reset() { samples.length = 0; t0 = null; },
+    reset() { win = []; t0 = null; last = null; frozen = null; jumped = false; },
   };
+  return api;
 }

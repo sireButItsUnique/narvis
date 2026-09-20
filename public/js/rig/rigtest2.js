@@ -202,6 +202,12 @@ export function validPose(p) {
 // tape measure, so re-measuring the baseline invalidates the positions it wrote. Saying "stale" and
 // falling back is the honest answer; quietly using metre-apart cameras that are now 90 cm apart is not.
 export const POSE_BASELINE_TOL_CM = 0.5;
+// The lens fov is the other input the solve cannot see afterwards. It is not decoration: it sets the
+// toe-in about as hard as the baseline sets the positions - two degrees of diagonal FOV moves the solved
+// toe by well over one - so a pose fitted at one fov and decoded at another is describing a different pair
+// of cameras, exactly like a baseline that has been re-measured. Poses saved before this was recorded
+// carry no fov and cannot be checked; they are left alone rather than condemned.
+export const POSE_DFOV_TOL_DEG = 0.25;
 export function poseStatus(setup) {
   const p = setup.pair.solved;
   if (!validPose(p)) return { pose: null, inUse: false, stale: false, reason: p ? 'the saved pose is not usable' : '' };
@@ -210,6 +216,13 @@ export function poseStatus(setup) {
     return { pose: p, inUse: false, stale: true,
              reason: `the pair was measured at a baseline of ${round(p.baselineCm, 1)} cm and step 2 now says `
                + `${round(setup.pair.baselineCm, 1)} cm — calibrate again, or put the baseline back` };
+  const fovs = Array.isArray(p.dfovDeg) ? p.dfovDeg : (Number.isFinite(p.dfovDeg) ? [p.dfovDeg] : []);
+  const offFov = fovs.filter(Number.isFinite).find(d => Math.abs(d - setup.pair.dfovDeg) > POSE_DFOV_TOL_DEG);
+  if (offFov != null)
+    return { pose: p, inUse: false, stale: true,
+             reason: `the pair was measured with a ${round(offFov, 1)} degree lens and step 2 now says `
+               + `${round(setup.pair.dfovDeg, 1)} — the fov sets the toe-in, so calibrate again, or put the `
+               + 'lens fov back' };
   if (setup.pair.useSolved === false)
     return { pose: p, inUse: false, stale: false, reason: 'switched off: the typed angles are in use' };
   return { pose: p, inUse: true, stale: false, reason: '' };
@@ -660,8 +673,10 @@ export function readoutLines({ setup, rig, eyeRig, source, status, fps, check, m
     views.length ? `views    ${views.map(v => `${v.fps} fps ${v.latencyMs} ms`).join('  ·  ')}` : 'views    none',
     `pair     ${round(setup.pair.baselineCm / INCH_CM, 1)}" apart  ·  toe ${ang.toeInDeg} tilt ${ang.tiltUpDeg} deg`
       + ` (${{ measured: 'MEASURED from your face', typed: 'typed', aimed: 'aimed at the head spot' }[ang.source]})`
+      // "residual" read as "accurate to a millimetre". It is the epipolar fit against itself, it is capped
+      // by the inlier threshold, and the accuracy number is the ray miss two lines up.
       + (ang.source === 'measured' && ang.solved.report?.residualMm != null
-         ? `  ·  ${ang.solved.report.residualMm} mm residual` : ''),
+         ? `  ·  ${ang.solved.report.residualMm} mm epipolar fit (not accuracy)` : ''),
     `render   ${fps.toFixed(0)} fps`
       + (volume ? `  ·  volume ${(volume.halfX * 2).toFixed(1)} x ${(volume.halfZ * 2).toFixed(1)} cm` : ''),
   ];
