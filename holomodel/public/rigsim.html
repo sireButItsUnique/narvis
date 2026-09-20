@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rig model</title>
+<style>
+  :root { --bg:#04060b; --panel:#07111c; --line:#1d3b55; --text:#cfe8ff; --dim:#7fa3bf; --cyan:#35d0ff; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); overflow:hidden;
+    font-family: system-ui, "Segoe UI", sans-serif; }
+  canvas { display:block; }
+  #ui { position:fixed; left:12px; top:12px; width:250px; background:rgba(7,17,28,.93); border:1px solid var(--line);
+    border-radius:10px; padding:12px 14px; font-size:13px; z-index:3; }
+  #ui h1 { margin:0 0 8px; font-size:14px; color:var(--cyan); font-weight:600; }
+  #ui label { display:block; color:var(--dim); margin:9px 0 2px; }
+  #ui input[type=range] { width:100%; }
+  #ui .val { color:var(--text); }
+  #ui .btns { display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
+  button { background:#0e2a40; color:var(--text); border:1px solid #2b5a80; border-radius:7px; padding:5px 9px;
+    font-size:12px; cursor:pointer; }
+  button.on { background:#0f4a6e; border-color:var(--cyan); }
+  #read { position:fixed; left:12px; bottom:12px; max-width:min(560px,60vw); background:rgba(7,17,28,.93);
+    border:1px solid var(--line); border-radius:10px; padding:10px 13px; font-size:13px; line-height:1.5; z-index:3; }
+  .tag { position:fixed; transform:translate(-50%,-50%); font-size:12px; color:var(--dim); pointer-events:none;
+    text-shadow:0 0 4px #000; z-index:2; white-space:nowrap; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <h1>Rig model</h1>
+  <label>Acrylic above base <span class="val" id="hv"></span></label>
+  <input type="range" id="h" min="2" max="14" step="0.5" value="6">
+  <label>Monitor above acrylic <span class="val" id="gv"></span></label>
+  <input type="range" id="g" min="0.5" max="10" step="0.5" value="6">
+  <label>Monitor size <span class="val" id="dv"></span></label>
+  <input type="range" id="d" min="19" max="32" step="1" value="24">
+  <label>Monitor tilt <span class="val" id="tv"></span></label>
+  <input type="range" id="t" min="20" max="70" step="1" value="45">
+  <label>ZED tilt down <span class="val" id="zv"></span></label>
+  <input type="range" id="z" min="0" max="80" step="1" value="0">
+  <div class="btns">
+    <button id="bEye">Your view</button>
+    <button id="bOrbit" class="on">Orbit</button>
+    <button id="bRays" class="on">Rays</button>
+    <button id="bReal">Only what you'd see</button>
+  </div>
+</div>
+<div id="read"></div>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+               "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// A 3D model of the rig, in centimetres, so the geometry can be argued about by looking at it: the monitor,
+// the acrylic, the black base, and the mirror image of the screen that is the thing you actually see floating.
+const CM = v => v * 2.54;
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x04060b, 1);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(42, 1, 1, 800);
+camera.position.set(118, 74, -168);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 10, -18);
+controls.enableDamping = true;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(40, 80, -60); scene.add(sun);
+const fill = new THREE.DirectionalLight(0x88bbff, 0.8); fill.position.set(-50, 30, 40); scene.add(fill);
+
+// ---- what the monitor is showing: a bright test pattern, so the mirrored copy is obviously mirrored
+const tex = (() => {
+  const c = document.createElement('canvas'); c.width = 512; c.height = 288;
+  const x = c.getContext('2d');
+  x.fillStyle = '#000'; x.fillRect(0, 0, 512, 288);
+  x.strokeStyle = '#123a56'; x.lineWidth = 1;
+  for (let i = 32; i < 512; i += 32) { x.beginPath(); x.moveTo(i, 0); x.lineTo(i, 288); x.stroke(); }
+  for (let i = 32; i < 288; i += 32) { x.beginPath(); x.moveTo(0, i); x.lineTo(512, i); x.stroke(); }
+  x.fillStyle = '#35d0ff'; x.beginPath(); x.arc(256, 150, 52, 0, 7); x.fill();
+  x.fillStyle = '#7cff9b'; x.fillRect(214, 208, 84, 26);
+  x.fillStyle = '#fff'; x.font = '600 26px system-ui'; x.textAlign = 'center';
+  x.fillText('FRONT EDGE', 256, 44);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+})();
+
+const rig = new THREE.Group(); scene.add(rig);
+const mk = (geo, mat) => { const m = new THREE.Mesh(geo, mat); rig.add(m); return m; };
+const QUAD = new THREE.PlaneGeometry(1, 1);
+
+const base = mk(QUAD, new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 1 }));
+base.rotation.x = -Math.PI / 2;
+const baseEdge = new THREE.LineSegments(new THREE.EdgesGeometry(QUAD), new THREE.LineBasicMaterial({ color: 0x2b5a80 }));
+baseEdge.rotation.x = -Math.PI / 2; rig.add(baseEdge);
+
+const sheet = mk(QUAD, new THREE.MeshPhysicalMaterial({ color: 0x9fd8ff, transparent: true, opacity: 0.16,
+  metalness: 0, roughness: 0.05, side: THREE.DoubleSide }));
+sheet.rotation.x = -Math.PI / 2;
+const sheetEdge = new THREE.LineSegments(new THREE.EdgesGeometry(QUAD), new THREE.LineBasicMaterial({ color: 0x378add }));
+sheetEdge.rotation.x = -Math.PI / 2; rig.add(sheetEdge);
+
+const screen = mk(QUAD, new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide }));
+const shell = mk(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: 0x1a2330, roughness: .8 }));
+const ghost = mk(QUAD, new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: .85, side: THREE.DoubleSide }));
+const ghostBad = mk(QUAD, new THREE.MeshBasicMaterial({ color: 0xE24B4A, transparent: true, opacity: .22, side: THREE.DoubleSide }));
+
+const band = mk(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial({ color: 0x1D9E75, transparent: true, opacity: .10 }));
+const zed = mk(new THREE.BoxGeometry(12, 3, 3), new THREE.MeshStandardMaterial({ color: 0x2a3a4a, roughness: .7 }));
+const cone = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.ConeGeometry(1, 1, 4, 1, true)),
+  new THREE.LineBasicMaterial({ color: 0x7fa3bf, transparent: true, opacity: .45 }));
+rig.add(cone);
+
+const head5 = mk(new THREE.BoxGeometry(9, 3, 3), new THREE.MeshStandardMaterial({ color: 0x3a2a4a, roughness: .7 }));
+const headCone = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.ConeGeometry(1, 1, 4, 1, true)),
+  new THREE.LineBasicMaterial({ color: 0xc79bff, transparent: true, opacity: .5 }));
+rig.add(headCone);
+
+const hand = mk(new THREE.CapsuleGeometry(2.6, 9, 6, 12), new THREE.MeshStandardMaterial({ color: 0xc79bff, roughness: .6 }));
+hand.rotation.z = Math.PI / 2;
+
+const head = mk(new THREE.SphereGeometry(6.5, 24, 16), new THREE.MeshStandardMaterial({ color: 0x24333f, roughness: .9 }));
+const eyeDot = mk(new THREE.SphereGeometry(1.2, 12, 8), new THREE.MeshBasicMaterial({ color: 0xcfe8ff }));
+
+const rays = new THREE.Group(); scene.add(rays);
+const rayMat = new THREE.LineBasicMaterial({ color: 0xEF9F27 });
+const rayMat2 = new THREE.LineDashedMaterial({ color: 0xEF9F27, dashSize: 2.4, gapSize: 2 });
+
+const tags = {};
+for (const id of ['monitor', 'sheet', 'image', 'band', 'zed', 'you', 'headcam']) {
+  const el = document.createElement('div'); el.className = 'tag'; el.textContent = id; document.body.appendChild(el);
+  tags[id] = el;
+}
+const TAG_TEXT = { monitor: 'monitor (45°)', sheet: 'acrylic', image: 'floating image', band: 'usable space',
+                   zed: 'ZED (hands)', you: 'you', headcam: 'head camera' };
+for (const k in tags) tags[k].textContent = TAG_TEXT[k];
+
+const view = { eye: false, rays: true, real: false };
+const anchors = {};
+
+function build() {
+  const hIn = +h.value, gIn = +g.value, diag = +d.value, tilt = +t.value, zTilt = +z.value;
+  hv.textContent = `${hIn}" (${CM(hIn).toFixed(0)} cm)`;
+  gv.textContent = `${gIn}" (${CM(gIn).toFixed(0)} cm)`;
+  dv.textContent = `${diag}"`;
+  tv.textContent = `${tilt}°`;
+  zv.textContent = `${zTilt}°`;
+
+  const H = CM(hIn), G = CM(gIn);
+  const sw = diag * 2.54 * 0.8716, sh = diag * 2.54 * 0.4903;   // 16:9 screen in cm
+  const rad = tilt * Math.PI / 180, run = sh * Math.cos(rad), rise = sh * Math.sin(rad);
+  const backZ = 20;                    // the monitor, sheet and base all line up at the back
+  const zFront = backZ - run;          // so the monitor's lower (front) edge sits this far forward
+
+  const deep = 44, deepS = 40;
+  base.scale.set(sw + 26, deep, 1); baseEdge.scale.copy(base.scale);
+  base.position.set(0, 0, backZ - deep / 2); baseEdge.position.set(0, 0.02, backZ - deep / 2);
+  sheet.scale.set(sw + 10, deepS, 1); sheetEdge.scale.copy(sheet.scale);
+  sheet.position.set(0, H, backZ - deepS / 2); sheetEdge.position.set(0, H, backZ - deepS / 2);
+
+  // monitor: lower edge at (y = H+G, z = zFront), rising back at the tilt angle, screen facing down-front
+  const mid = new THREE.Vector3(0, H + G + rise / 2, zFront + run / 2);
+  screen.position.copy(mid);
+  screen.rotation.set(-(Math.PI / 2 - rad), 0, 0);
+  screen.scale.set(sw, sh, 1);
+  shell.position.copy(mid).addScaledVector(new THREE.Vector3(0, Math.cos(rad), Math.sin(rad)), 1.6);
+  shell.rotation.copy(screen.rotation);
+  shell.scale.set(sw + 2.5, sh + 2.5, 2.6);
+
+  // the floating image: the screen mirrored in the sheet plane
+  const gy = 2 * H - mid.y;
+  ghost.position.set(0, gy, mid.z);
+  ghost.rotation.set(Math.PI / 2 - rad, 0, 0);
+  ghost.scale.copy(screen.scale);
+  const topY = 2 * H - (H + G + rise), botY = 2 * H - (H + G);   // far end and near end of the image
+  const sunk = topY < 0;
+  ghostBad.visible = sunk;
+  if (sunk) {   // the slab of image that is below the paper, i.e. inside the table
+    const frac = Math.min(1, (0 - topY) / Math.max(1e-3, botY - topY));
+    ghostBad.position.copy(ghost.position).addScaledVector(
+      new THREE.Vector3(0, Math.sin(rad), Math.cos(rad)), (sh / 2) * (1 - frac));
+    ghostBad.rotation.copy(ghost.rotation);
+    ghostBad.scale.set(sw, sh * frac, 1);
+  }
+
+  band.position.set(0, H / 2, backZ - 19);
+  band.scale.set(sw + 8, H, 38);
+
+  zed.position.set(0, H + G + 2, zFront - 3);
+  zed.rotation.set(-zTilt * Math.PI / 180, 0, 0);
+  const dir = new THREE.Vector3(0, -Math.sin(zTilt * Math.PI / 180), -Math.cos(zTilt * Math.PI / 180));
+  cone.position.copy(zed.position).addScaledVector(dir, 16);
+  cone.scale.set(15, 32, 15);
+  cone.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), dir);
+
+  // the head camera clips to the monitor's lower edge and looks at the face: above the sheet, so it never
+  // shoots through the acrylic, and rigidly attached so its pose stays true
+  const headCam = new THREE.Vector3(0, H + G - 2, zFront - 4);   // just below the monitor's lower edge
+  head5.position.copy(headCam);
+  const eyeGuess = new THREE.Vector3(0, H + 28, zFront - 70);
+  const toEye = new THREE.Vector3().subVectors(eyeGuess, headCam).normalize();
+  head5.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), toEye);
+  headCone.position.copy(headCam).addScaledVector(toEye, 16);
+  headCone.scale.set(16, 32, 16);
+  headCone.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), toEye);
+  anchors.headcam = headCam.clone().add(new THREE.Vector3(-8, 4, 0));
+  window.headCamRig = { x: +(headCam.x).toFixed(1), y: +(headCam.y - H).toFixed(1), z: +(-(headCam.z)).toFixed(1) };
+
+  hand.position.set(-6, Math.min(H - 4, Math.max(4, H / 2)), zFront + 14);
+  const eye = new THREE.Vector3(0, H + 28, zFront - 70);
+  head.position.copy(eye).add(new THREE.Vector3(0, 2, -6));
+  eyeDot.position.copy(eye);
+
+  rays.clear();
+  if (view.rays) {
+    for (const u of [-0.3, 0.1, 0.42]) {   // three points down the screen, reflected into the eye
+      const p = new THREE.Vector3(0, H + G + rise * (0.5 + u), zFront + run * (0.5 + u));
+      const q = new THREE.Vector3(p.x, 2 * H - p.y, p.z);              // its mirror image
+      const dirq = new THREE.Vector3().subVectors(q, eye);
+      const hit = new THREE.Vector3().copy(eye).addScaledVector(dirq, (H - eye.y) / dirq.y);   // where it meets the sheet
+      const a = new THREE.BufferGeometry().setFromPoints([p, hit, eye]);
+      rays.add(new THREE.Line(a, rayMat));
+      const b = new THREE.BufferGeometry().setFromPoints([hit, q]);
+      const l = new THREE.Line(b, rayMat2); l.computeLineDistances(); rays.add(l);
+    }
+  }
+
+  anchors.monitor = mid.clone().add(new THREE.Vector3(sw / 2 + 4, 2, 0));
+  anchors.sheet = new THREE.Vector3(sw / 2 + 8, H, backZ - 30);
+  anchors.image = ghost.position.clone().add(new THREE.Vector3(sw / 2 + 4, 0, 0));
+  anchors.band = new THREE.Vector3(-(sw / 2 + 8), H / 2, backZ - 14);
+  anchors.zed = zed.position.clone().add(new THREE.Vector3(10, 3, 0));
+  anchors.you = eye.clone().add(new THREE.Vector3(0, 12, 0));
+
+  screen.visible = shell.visible = !view.real;
+  band.visible = !view.real;
+  cone.visible = zed.visible = !view.real;
+
+  const usable = Math.max(0, Math.min(H, botY < 0 ? 0 : H - (H - botY)));
+  const floatCm = Math.max(0, botY);
+  read.innerHTML = floatCm > 0.5
+    ? `Head camera sits at x ${window.headCamRig.x}, y ${window.headCamRig.y}, z ${window.headCamRig.z} cm from the sheet centre (type these into rigtest2). The near edge of the image floats <b>${floatCm.toFixed(0)} cm</b> above the paper, so a model up to about that tall sits clear in the open space. The far end is <b>${Math.abs(Math.min(0, topY)).toFixed(0)} cm below the paper</b> (red), which is wasted screen: keep that part black.`
+    : `Nothing floats: the monitor is ${gIn}" above the sheet but the sheet is only ${hIn}" above the paper, so the whole image lands at or under the paper. Drop the monitor closer to the sheet, or raise the sheet.`;
+}
+
+function layout() {
+  const w = innerWidth, hgt = innerHeight;
+  renderer.setSize(w, hgt);
+  camera.aspect = w / hgt; camera.updateProjectionMatrix();
+}
+addEventListener('resize', layout);
+
+const h = document.getElementById('h'), g = document.getElementById('g'), d = document.getElementById('d');
+const t = document.getElementById('t'), z = document.getElementById('z');
+const hv = document.getElementById('hv'), gv = document.getElementById('gv'), dv = document.getElementById('dv');
+const tv = document.getElementById('tv'), zv = document.getElementById('zv'), read = document.getElementById('read');
+for (const el of [h, g, d, t, z]) el.addEventListener('input', build);
+
+const bEye = document.getElementById('bEye'), bOrbit = document.getElementById('bOrbit');
+const bRays = document.getElementById('bRays'), bReal = document.getElementById('bReal');
+bEye.addEventListener('click', () => { view.eye = true; bEye.classList.add('on'); bOrbit.classList.remove('on'); });
+bOrbit.addEventListener('click', () => { view.eye = false; bOrbit.classList.add('on'); bEye.classList.remove('on'); });
+bRays.addEventListener('click', () => { view.rays = !view.rays; bRays.classList.toggle('on', view.rays); build(); });
+bReal.addEventListener('click', () => { view.real = !view.real; bReal.classList.toggle('on', view.real); build(); });
+
+layout(); build();
+
+const tmp = new THREE.Vector3();
+renderer.setAnimationLoop(() => {
+  if (view.eye) {
+    camera.position.copy(eyeDot.position);
+    camera.lookAt(0, +h.value * 2.54 * 0.45, ghost.position.z);
+  } else {
+    controls.update();
+  }
+  renderer.render(scene, camera);
+  for (const k in anchors) {
+    tmp.copy(anchors[k]).project(camera);
+    const on = tmp.z < 1 && Math.abs(tmp.x) < 1.2 && Math.abs(tmp.y) < 1.2;
+    tags[k].style.display = on ? 'block' : 'none';
+    tags[k].style.left = `${(tmp.x * 0.5 + 0.5) * innerWidth}px`;
+    tags[k].style.top = `${(-tmp.y * 0.5 + 0.5) * innerHeight}px`;
+  }
+});
+</script>
+</body>
+</html>

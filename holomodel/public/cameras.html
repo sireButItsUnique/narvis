@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Holomodel cameras</title>
+<style>
+  :root { --bg:#04060b; --panel:#07111c; --line:#1d3b55; --text:#cfe8ff; --dim:#7fa3bf; --cyan:#35d0ff;
+          --amber:#ffb23e; --green:#7cff9b; --red:#ff6b7a; }
+  html, body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  header { padding:14px 18px; border-bottom:1px solid var(--line); display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:17px; margin:0 14px 0 0; color:var(--cyan); letter-spacing:.3px; }
+  button { background:#0e2a40; color:var(--text); border:1px solid #2b5a80; border-radius:8px; padding:7px 12px; font-size:13px; cursor:pointer; }
+  button:hover { background:#123551; }
+  button.primary { background:#0f4a6e; border-color:var(--cyan); }
+  input, select { background:#0b1a29; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 7px; font-size:13px; }
+  input.url { width:230px; }
+  main { padding:16px 18px; display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(330px,1fr)); }
+  .card { border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:12px; }
+  .card h2 { margin:0 0 8px; font-size:14px; color:var(--cyan); display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+  .card h2 small { color:var(--dim); font-weight:400; font-size:11px; }
+  canvas { width:100%; background:#000; border:1px solid var(--line); border-radius:6px; display:block; }
+  .views { display:grid; gap:6px; }
+  .nums { font:12px/1.6 ui-monospace,Consolas,monospace; color:var(--dim); margin-top:8px; white-space:pre-wrap; }
+  .badges { display:flex; gap:6px; margin-top:8px; flex-wrap:wrap; }
+  .b { font:11px/1 ui-monospace,Consolas,monospace; padding:4px 7px; border-radius:999px; border:1px solid var(--line); color:var(--dim); }
+  .b.on { color:#04202c; background:var(--green); border-color:var(--green); }
+  .b.warn { color:#2a1c00; background:var(--amber); border-color:var(--amber); }
+  .b.bad { color:#2a0007; background:var(--red); border-color:var(--red); }
+  .row { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+  #log { grid-column:1/-1; font:12px/1.6 ui-monospace,Consolas,monospace; color:var(--dim); white-space:pre-wrap;
+         border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:10px 12px; }
+  a { color:var(--cyan); }
+</style>
+</head>
+<body>
+<!-- webcam.js (the one-camera path) reads the display geometry from view.js, which expects the app's
+     canvas to exist. One hidden pixel of it is enough to let this page use the real tracker. -->
+<canvas id="htw-view" width="1" height="1" style="position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none"></canvas>
+<header>
+  <h1>Cameras</h1>
+  <button id="start" class="primary">Start</button>
+  <label>detector <select id="detector"><option value="auto">MediaPipe</option><option value="blob">blob (test)</option></select></label>
+  <input class="url" id="bridge" placeholder="ws://friend-laptop:8810 (optional)">
+  <button id="connect">Connect bridge</button>
+  <button id="stop">Stop</button>
+  <span id="head" style="color:var(--dim);font-size:12px"></span>
+</header>
+<main>
+  <section class="card" id="world">
+    <h2>World <small>cm, from the middle of the display</small></h2>
+    <div class="nums" id="worldNums">not started</div>
+    <div class="badges" id="worldBadges"></div>
+  </section>
+  <section class="card" id="bridgeCard">
+    <h2>Bridge <small>tools/zed-bridge</small></h2>
+    <div class="nums" id="bridgeNums">not connected</div>
+  </section>
+  <div id="log"></div>
+</main>
+
+<script>
+  // The import map has to exist before the first module loads, so pick the local copy (npm run vendor)
+  // or the CDN here, synchronously, rather than failing on whichever one is missing.
+  (function () {
+    const local = '/vendor/three/build/three.module.js';
+    let ok = false;
+    try { const x = new XMLHttpRequest(); x.open('HEAD', local, false); x.send(); ok = x.status >= 200 && x.status < 400; } catch (e) {}
+    const map = document.createElement('script');
+    map.type = 'importmap';
+    map.textContent = JSON.stringify({ imports: { three: ok ? local : 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js' } });
+    document.currentScript.after(map);
+  })();
+</script>
+<script type="module">
+import { startCameras, stopCameras, camerasStatus, cams, dropSource, setRole, setKind, setBridge } from './js/input/cameras.js';
+import { input } from './js/input/state.js';
+
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const cards = new Map();
+
+// Tests (and anyone curious) read the whole picture from here.
+window.__cams = { status: () => camerasStatus(), cams, input, start, dropSource, setRole, setKind, setBridge, stopCameras };
+
+function badge(on, text, cls = 'on') { return `<span class="b ${on ? cls : ''}">${text}</span>`; }
+
+function cardFor(src) {
+  let c = cards.get(src.deviceId);
+  if (c) return c;
+  const el = document.createElement('section');
+  el.className = 'card';
+  el.innerHTML = `<h2><span class="name"></span><small class="sub"></small></h2>
+    <div class="views"></div>
+    <div class="badges"></div>
+    <div class="nums"></div>
+    <div class="row">
+      <label>job <select class="role">
+        <option value="both">head + hands</option><option value="head">head</option>
+        <option value="hands">hands</option><option value="off">off</option></select></label>
+      <label>is a <select class="kind" title="takes effect next time this camera is opened">
+        <option value="auto">auto</option><option value="zed">ZED (side-by-side)</option>
+        <option value="webcam">plain webcam</option></select></label>
+      <button class="drop">Unplug (simulate)</button>
+    </div>`;
+  $('log').before(el);
+  const canvases = src.views.map(() => {
+    const cv = document.createElement('canvas');
+    cv.width = 320; cv.height = Math.round(320 * src.layout.eyeH / src.layout.eyeW);
+    el.querySelector('.views').appendChild(cv);
+    return cv;
+  });
+  el.querySelector('.role').value = src.role;
+  el.querySelector('.role').onchange = e => setRole(src.deviceId, e.target.value);
+  el.querySelector('.kind').value = src.cls.why === 'you said so' ? src.cls.kind : 'auto';
+  el.querySelector('.kind').onchange = e => { setKind(src.deviceId, e.target.value); flash('saved — press Start again to reopen this camera'); };
+  el.querySelector('.drop').onclick = () => dropSource(src.deviceId, 'unplug simulated from the setup page');
+  c = { el, canvases };
+  cards.set(src.deviceId, c);
+  return c;
+}
+
+// The camera image with whatever the worker found on top of it, so the user can aim the camera.
+function drawView(cv, src, i) {
+  const ctx = cv.getContext('2d');
+  const crop = i === 0 ? src.layout.left : src.layout.right;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cv.width, cv.height);
+  if (src.video.readyState >= 2) ctx.drawImage(src.video, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, cv.width, cv.height);
+  const s = src.samples[i][src.samples[i].length - 1];
+  if (!s) return;
+  if (s.face?.eyes) {
+    ctx.fillStyle = '#35d0ff';
+    for (const p of s.face.eyes) { ctx.beginPath(); ctx.arc(p[0] * cv.width, p[1] * cv.height, 3, 0, 7); ctx.fill(); }
+  }
+  for (const h of s.hands || []) {
+    ctx.fillStyle = h.synthetic ? '#ffb23e' : '#7cff9b';
+    h.lm.forEach((p, k) => { ctx.beginPath(); ctx.arc(p[0] * cv.width, p[1] * cv.height, k === 8 || k === 4 ? 4 : 2, 0, 7); ctx.fill(); });
+  }
+}
+
+// A short-lived message in the header, which the per-frame status line would otherwise wipe out.
+let flashText = '', flashUntil = 0;
+const flash = m => { flashText = m; flashUntil = performance.now() + 4000; };
+
+function paint() {
+  const st = camerasStatus();
+  $('head').textContent = performance.now() < flashUntil ? flashText
+    : `mode ${st.mode} · hands from ${st.handSource} · head from ${st.eyeSource} · ${st.solver}`;
+  for (const src of cams.sources) {
+    const c = cardFor(src), info = st.sources.find(s => s.deviceId === src.deviceId);
+    if (!info) continue;
+    c.el.querySelector('.name').textContent = info.label.length > 34 ? info.label.slice(0, 32) + '…' : info.label;
+    c.el.querySelector('.sub').textContent = `${info.model} · ${info.width}x${info.height}${info.sbs ? ' SBS' : ''} · ${info.detector}${info.delegate ? '/' + info.delegate : ''}`;
+    c.canvases.forEach((cv, i) => drawView(cv, src, i));
+    c.el.querySelector('.badges').innerHTML =
+      badge(info.seesHead, 'head') + badge(info.seesHands, 'hands') +
+      badge(info.kind === 'zed', info.kind === 'zed' ? 'ZED: ' + info.why : 'webcam') +
+      // A lens that is a guess is worth saying out loud: a wrong focal length comes out as DEPTH, and a
+      // hand published at 2.5x the right distance looks like broken tracking rather than a wrong number.
+      (info.calib ? badge(true, info.calib + (info.calibMetric ? '' : ' (guess)'), info.calibMetric ? 'on' : 'warn') : '') +
+      (info.error ? badge(true, info.error, 'bad') : '');
+    c.el.querySelector('.nums').textContent = info.views
+      .map(v => `${v.label}\n  ${v.fps} fps  ${v.latencyMs} ms  drops ${v.busyDrops} busy / ${v.staleDrops} stale` +
+                `${v.stallDrops ? ' / ' + v.stallDrops + ' STALLED' : ''}`).join('\n');
+  }
+  for (const [id, c] of cards) if (!cams.sources.some(s => s.deviceId === id)) { c.el.remove(); cards.delete(id); }
+
+  const h = st.hands.map((x, i) => `hand ${i}  ${x.active ? 'seen' : '   -'}  ${x.pinch ? 'PINCH' : '     '}  ` +
+    `${x.tip.map(v => v.toFixed(1).padStart(6)).join(' ')}${x.pinchCm != null ? '  gap ' + x.pinchCm.toFixed(1) + ' cm' : ''}`).join('\n');
+  $('worldNums').textContent = `eye        ${st.eye.map(v => v.toFixed(1).padStart(6)).join(' ')}\n${h}`;
+  $('worldBadges').innerHTML = badge(st.eyeSource !== 'none', 'head: ' + st.eyeSource) + badge(st.handSource !== 'none', 'hands: ' + st.handSource) +
+    badge(st.inputMode === 'camera', 'input.mode ' + st.inputMode, st.inputMode === 'camera' ? 'on' : 'warn');
+  const b = st.bridge;
+  $('bridgeNums').textContent = b
+    ? `${b.state}  ${b.url}\nsource ${b.source}  ${b.fps} fps  latency ${b.latencyMs.toFixed(0)} ms` +
+      `\nclock ${b.synced ? `synced, offset ${b.offsetMs.toFixed(0)} ms` : 'NOT SYNCED YET (waiting for the first pong)'}` +
+      `  frames ${b.frames}  stale ${b.stale}  bad ${b.bad}${b.error ? '\n' + b.error : ''}`
+    : 'not connected';
+  $('log').textContent = st.notes.join('\n');
+  requestAnimationFrame(paint);
+}
+
+async function start() {
+  $('start').disabled = true;
+  const detector = params.get('detector') || $('detector').value;
+  try {
+    await startCameras({
+      status: m => { if (m) flash(m); },
+      detector, allowBlob: detector === 'blob' || params.get('allowBlob') === '1',
+      bridgeUrl: $('bridge').value.trim() || params.get('bridge') || '',
+    });
+  } catch (e) {
+    $('log').textContent = 'start failed: ' + (e?.message || e);
+  }
+  $('start').disabled = false;
+}
+
+$('start').onclick = start;
+$('stop').onclick = () => { stopCameras(); cards.forEach(c => c.el.remove()); cards.clear(); };
+$('connect').onclick = () => { const u = $('bridge').value.trim(); if (!u) return; if (cams.running) setBridge(u); else start(); };
+if (params.get('detector')) $('detector').value = params.get('detector');
+if (params.get('bridge')) $('bridge').value = params.get('bridge');
+if (params.get('auto') === '1') start();
+paint();
+</script>
+</body>
+</html>

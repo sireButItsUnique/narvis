@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Holomodel rig maths</title>
+<!-- Standalone check of public/js/rig/*: a simulated side view of the Pepper's-ghost rig next to what the
+     rig monitor would show and what the viewer would see through the sheet. No hardware needed. -->
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #070a10; color: #dbe3f0; font: 12px/1.45 system-ui, sans-serif; }
+  #wrap { display: flex; height: 100vh; }
+  #side { width: 250px; flex: none; padding: 10px 12px; overflow: auto; border-right: 1px solid #1e2734; }
+  #stage { flex: 1; position: relative; min-width: 0; }
+  canvas { display: block; width: 100%; height: 100%; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  h2 { font-size: 12px; margin: 12px 0 4px; color: #8a97ad; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+  label.sl { display: block; margin: 5px 0; }
+  label.sl span { display: flex; justify-content: space-between; color: #9fb0c8; }
+  input[type=range] { width: 100%; }
+  .tag { position: absolute; padding: 2px 6px; background: #0d1118cc; border: 1px solid #22303f; border-radius: 4px;
+         font-size: 11px; color: #9fb0c8; pointer-events: none; }
+  .warn { color: #ffb23e; } .ok { color: #7cff9b; } .muted { color: #8a97ad; }
+  button { padding: 5px 9px; background: #1d4b6b; color: #eaf4ff; border: 0; border-radius: 6px; cursor: pointer; margin: 3px 4px 3px 0; }
+  #read { margin-top: 8px; font-variant-numeric: tabular-nums; }
+  #read div { margin: 2px 0; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "/node_modules/three/build/three.module.js",
+    "three/addons/": "/node_modules/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="wrap">
+  <div id="side">
+    <h1>Rig maths, simulated</h1>
+    <div class="muted">Monitor above facing down, acrylic sheet below it, the image floating under the sheet.
+      Move the eye: the picture on the panel changes, the floating teapot must not.</div>
+    <h2>Eye</h2><div id="eyeSliders"></div>
+    <h2>Rig</h2><div id="rigSliders"></div>
+    <h2>Options</h2>
+    <label><input type="checkbox" id="fold"> fold mirror (panel below)</label><br>
+    <label><input type="checkbox" id="pattern"> test pattern</label><br>
+    <label><input type="checkbox" id="orbit"> turn the side view</label><br>
+    <button id="calib">calibration panel</button>
+    <button id="check">run ray check</button>
+    <div class="muted">The panel edits the rig itself, so the sliders above pause while it is open. Its third
+      step is driven by a pretend hand tracker: hold still on each spot (it does that for you) and the fit
+      should come back with the tracker's own 0.92 scale.</div>
+    <div id="read"></div>
+  </div>
+  <div id="stage">
+    <canvas id="view"></canvas>
+    <div class="tag" id="tagA">side view of the rig</div>
+    <div class="tag" id="tagB">what the rig monitor shows</div>
+    <div class="tag" id="tagC">what the viewer sees through the sheet</div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { makeRig, DEFAULT_RIG, DEFAULT_EYE, FOLD_EXAMPLE, panelRect, virtualScreen,
+         mirrorRect, planeOf, planeAxes, rigCheck, tracePath, rigMirrors,
+         projectToMonitor, projectPoint, rectFrom, rectUV, rayPlane, reflectPoint, lineDist,
+         sub, add, scale, dist, v3 } from './js/rig/geometry.js';
+import { RigView } from './js/rig/output.js';
+import { openCalibration, fitSimilarity, poseMatrix3, m3apply } from './js/rig/calibrate.js';
+
+// ---------- state ----------
+const state = { eye: DEFAULT_EYE.slice(), tilt: 20, monY: 30, monZ: -18, sheetY: 0, anchorY: -13,
+                fold: false, pattern: false, orbit: false, spin: 0 };
+let rig = makeRig();
+
+function buildRig() {
+  if (cal) return rig;                     // the calibration panel owns the rig while it is open
+  const keep = { hand: rig.hand, head: rig.head };
+  rig = state.fold ? FOLD_EXAMPLE() : makeRig({
+    monitor: { ...DEFAULT_RIG.monitor, centre: [0, state.monY, state.monZ], tiltDeg: state.tilt },
+    sheet: { ...DEFAULT_RIG.sheet, point: [0, state.sheetY, 0] },
+  });
+  rig.model = { ...DEFAULT_RIG.model, anchor: [0, state.anchorY, 0] };
+  Object.assign(rig, keep);                // a calibration survives moving the hardware about
+  return rig;
+}
+
+// ---------- sliders ----------
+const SL = [
+  ['eye', 'eye x', -30, 30, 1, () => state.eye[0], (v) => state.eye[0] = v],
+  ['eye', 'eye height', 15, 80, 1, () => state.eye[1], (v) => state.eye[1] = v],
+  ['eye', 'eye distance', 15, 90, 1, () => state.eye[2], (v) => state.eye[2] = v],
+  ['rig', 'monitor tilt', 0, 60, 1, () => state.tilt, (v) => state.tilt = v],
+  ['rig', 'monitor height', 15, 80, 1, () => state.monY, (v) => state.monY = v],
+  ['rig', 'monitor z', -50, 5, 1, () => state.monZ, (v) => state.monZ = v],
+  ['rig', 'sheet height', -12, 12, 0.5, () => state.sheetY, (v) => state.sheetY = v],
+  ['rig', 'model floats at', -30, -4, 0.5, () => state.anchorY, (v) => state.anchorY = v],
+];
+for (const [where, name, min, max, step, get, set] of SL) {
+  const l = document.createElement('label');
+  l.className = 'sl';
+  l.innerHTML = `<span><i>${name}</i><b></b></span>`;
+  const i = document.createElement('input');
+  Object.assign(i, { type: 'range', min, max, step, value: get() });
+  const b = l.querySelector('b');
+  b.textContent = get();
+  i.oninput = () => { set(parseFloat(i.value)); b.textContent = i.value; dirty = true; };
+  l.appendChild(i);
+  document.getElementById(where === 'eye' ? 'eyeSliders' : 'rigSliders').appendChild(l);
+}
+const bind = (id, k) => document.getElementById(id).onchange = (e) => { state[k] = e.target.checked; dirty = true; };
+bind('fold', 'fold'); bind('pattern', 'pattern'); bind('orbit', 'orbit');
+
+// ---------- three ----------
+const canvas = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.autoClear = false;
+renderer.toneMapping = THREE.NoToneMapping;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+// the hologram scene: only this is rendered by the rig camera, on pure black
+const holo = new THREE.Scene();
+holo.background = new THREE.Color(0x000000);
+holo.add(new THREE.HemisphereLight(0xbfe4ff, 0x101820, 1.2));
+const key = new THREE.DirectionalLight(0xffffff, 2.2); key.position.set(12, 30, 25); holo.add(key);
+const holoModel = new THREE.Group(); holo.add(holoModel);
+
+// The page drives the rig through the same object the app will use, so this demo doubles as its smoke test.
+// It does NOT call rigView.enter(): the demo owns the canvas and shows the flip by mapping the panel texture,
+// rather than flipping the whole window.
+// assumeFullscreen: the render target stands in for the whole panel, so no window-position viewport.
+const rigView = new RigView({ rig, renderer, scene: holo, assumeFullscreen: true });
+
+// the simulation scene: the rig itself, drawn from outside (no background: each panel clears its own)
+const sim = new THREE.Scene();
+sim.add(new THREE.HemisphereLight(0x9fd8ff, 0x0a0f18, 1.0));
+const simParts = new THREE.Group(); sim.add(simParts);           // rebuilt whenever the rig changes
+const ghost = new THREE.Group(); sim.add(ghost);                 // where the model really floats
+
+// the render target that stands in for the physical panel
+const RTW = 960, RTH = 540;
+const rt = new THREE.WebGLRenderTarget(RTW, RTH);     // linear, like any offscreen pass
+const panelTex = rt.texture;
+
+// panel 2: the monitor image, shown the way the panel shows it
+const flat = new THREE.Scene();
+const flatCam = new THREE.OrthographicCamera(-1, 1, 1, -1, -1, 1);
+const flatQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2),
+  new THREE.MeshBasicMaterial({ map: panelTex, toneMapped: false }));
+flat.add(flatQuad);
+
+const rigCam = rigView.camera;
+const sideCam = new THREE.OrthographicCamera(-60, 60, 60, -60, -400, 400);
+const eyeCam = new THREE.PerspectiveCamera(46, 1, 1, 600);
+
+// ---------- helpers ----------
+const V3 = (p) => new THREE.Vector3(p[0], p[1], p[2]);
+function quad(corners, uvs, material) {
+  const g = new THREE.BufferGeometry();
+  const { tl, tr, br, bl } = corners;
+  g.setAttribute('position', new THREE.Float32BufferAttribute([...tl, ...bl, ...br, ...tl, ...br, ...tr], 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute([...uvs.tl, ...uvs.bl, ...uvs.br, ...uvs.tl, ...uvs.br, ...uvs.tr], 2));
+  g.computeVertexNormals();
+  return new THREE.Mesh(g, material);
+}
+// how the panel's pixels sit on the rendered image: one reflection mirrors it
+const panelUVs = (rc) => rc.flipX ? { tl: [1, 1], tr: [0, 1], br: [0, 0], bl: [1, 0] }
+                  : rc.flipY ? { tl: [0, 0], tr: [1, 0], br: [1, 1], bl: [0, 1] }
+                             : { tl: [0, 1], tr: [1, 1], br: [1, 0], bl: [0, 0] };
+const lines = (pts, color, opacity = 1) => new THREE.LineSegments(
+  new THREE.BufferGeometry().setFromPoints(pts.map(V3)),
+  new THREE.LineBasicMaterial({ color, transparent: opacity < 1, opacity, toneMapped: false }));
+
+// ---------- build the simulated rig ----------
+function buildSim(rc) {
+  simParts.clear();
+  const mon = panelRect(rig), V = virtualScreen(rig), uvs = panelUVs(rc);   // where the panel physically hangs
+  // the panel, showing exactly what the rig camera drew
+  simParts.add(quad(mon, uvs, new THREE.MeshBasicMaterial({ map: panelTex, side: THREE.DoubleSide, toneMapped: false })));
+  simParts.add(lines([mon.tl, mon.tr, mon.tr, mon.br, mon.br, mon.bl, mon.bl, mon.tl], 0xffd479));
+  // its image under the sheet: the beam splitter ADDS it to what you see through the sheet
+  const img = quad(V, uvs, new THREE.MeshBasicMaterial({ map: panelTex, side: THREE.DoubleSide, toneMapped: false,
+                                                          blending: THREE.AdditiveBlending, depthWrite: false }));
+  img.name = 'virtual';
+  simParts.add(img);
+  simParts.add(lines([V.tl, V.tr, V.tr, V.br, V.br, V.bl, V.bl, V.tl], 0xff9bd2, 0.7));
+  // the acrylic sheet
+  const sheetPl = planeOf(rig.sheet), ax = planeAxes(sheetPl);
+  const sr = rectFrom(sheetPl.point, ax.u, ax.v, rig.sheet.widthCm, rig.sheet.depthCm);
+  simParts.add(quad(sr, { tl: [0, 1], tr: [1, 1], br: [1, 0], bl: [0, 0] },
+    new THREE.MeshBasicMaterial({ color: 0x7fd4ff, transparent: true, opacity: 0.07, side: THREE.DoubleSide, depthWrite: false })));
+  simParts.add(lines([sr.tl, sr.tr, sr.tr, sr.br, sr.br, sr.bl, sr.bl, sr.tl], 0x7fd4ff, 0.8));
+  if (rig.fold) {
+    const fr = mirrorRect(rig.fold);
+    simParts.add(quad(fr, { tl: [0, 1], tr: [1, 1], br: [1, 0], bl: [0, 0] },
+      new THREE.MeshBasicMaterial({ color: 0xc0c8d8, transparent: true, opacity: 0.25, side: THREE.DoubleSide })));
+    simParts.add(lines([fr.tl, fr.tr, fr.tr, fr.br, fr.br, fr.bl, fr.bl, fr.tl], 0xc0c8d8));
+  }
+  // light paths for the four image corners and the model anchor
+  const beams = [];
+  for (const target of [V.tl, V.tr, V.br, V.bl, rig.model.anchor]) {
+    const tr = tracePath(rig, state.eye, sub(v3(target), state.eye));
+    if (!tr.ok) continue;
+    let prev = tr.monitorPoint;
+    for (const h of tr.points.slice().reverse()) { beams.push(prev, h); prev = h; }
+    beams.push(prev, state.eye);
+    beams.push(state.eye, v3(target));                     // and on to where the eye thinks it is
+  }
+  const beamLines = lines(beams, 0x5ad1ff, 0.45);
+  beamLines.name = 'beams';
+  simParts.add(beamLines);
+  // the eye
+  const eye = new THREE.Mesh(new THREE.SphereGeometry(1.6, 16, 12), new THREE.MeshBasicMaterial({ color: 0x7cff9b }));
+  eye.position.set(...state.eye);
+  simParts.add(eye);
+  // the rig frame
+  simParts.add(lines([[0, 0, 0], [12, 0, 0], [0, 0, 0], [0, 12, 0], [0, 0, 0], [0, 0, 12]], 0x44566e));
+}
+
+// ---------- the model ----------
+const loader = new GLTFLoader();
+let modelReady = false;
+loader.load('/test/fixtures/teapot.glb', (gltf) => {
+  const src = gltf.scene;
+  const bright = new THREE.MeshStandardMaterial({ color: 0x9fd6ff, roughness: 0.35, metalness: 0.1,
+                                                  emissive: 0x103048, emissiveIntensity: 1 });
+  const lit = src.clone(true);
+  lit.traverse((o) => { if (o.isMesh) o.material = bright; });
+  holoModel.add(lit);
+  const wire = src.clone(true);
+  wire.traverse((o) => { if (o.isMesh) o.material = new THREE.MeshBasicMaterial({ color: 0x7cff9b, wireframe: true, transparent: true, opacity: 0.35 }); });
+  ghost.add(wire);
+  modelReady = true;
+  dirty = true;
+}, undefined, (e) => { console.warn('teapot did not load', e); modelReady = 'failed'; });
+
+function placeModel() {
+  // Exactly the call the app makes on its display root, with no reset first: placeModel measures the model
+  // with the root's own transform lifted off, so calling it again on an already-placed root is a no-op.
+  for (const root of [holoModel, ghost]) rigView.placeModel(root);
+}
+
+// ---------- panels ----------
+function panels() {
+  const w = canvas.clientWidth, h = canvas.clientHeight, half = Math.round(w * 0.52);
+  const solo = location.hash.slice(1), hide = [0, 0, 1, 1];
+  const p = { side: [0, 0, half, h], mon: [half, Math.round(h / 2), w - half, h - Math.round(h / 2)],
+              eye: [half, 0, w - half, Math.round(h / 2)] };
+  if (solo === 'eye') { p.side = hide; p.mon = hide; p.eye = [0, 0, w, h]; }
+  if (solo === 'mon') { p.side = hide; p.eye = hide; p.mon = [0, 0, w, h]; }
+  if (solo === 'side') { p.mon = hide; p.eye = hide; p.side = [0, 0, w, h]; }
+  // the panel view keeps the monitor's own aspect, or the picture would lie about what it looks like
+  p.mon = letterbox(p.mon, (rig.monitor.pixelW || rig.monitor.widthCm) / (rig.monitor.pixelH || rig.monitor.heightCm));
+  return p;
+}
+function letterbox([x, y, w, h], aspect) {
+  const fit = w / h > aspect ? [Math.round(h * aspect), h] : [w, Math.round(w / aspect)];
+  return [x + Math.round((w - fit[0]) / 2), y + Math.round((h - fit[1]) / 2), fit[0], fit[1]];
+}
+function drawPanel(rect, scene, cam, clear) {
+  renderer.setViewport(...rect);
+  renderer.setScissor(...rect);
+  renderer.setScissorTest(true);
+  renderer.setClearColor(clear, 1);
+  renderer.clear(true, true, false);
+  renderer.render(scene, cam);
+  renderer.setScissorTest(false);
+}
+
+// ---------- frame ----------
+let dirty = true, rc = null;
+function frame(t) {
+  requestAnimationFrame(frame);
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== Math.round(w * renderer.getPixelRatio()) || canvas.height !== Math.round(h * renderer.getPixelRatio())) {
+    renderer.setSize(w, h, false); dirty = true;
+  }
+  if (state.orbit) { state.spin = t * 0.0002; }
+  if (cal) cal.tick(t);
+  if (dirty) { rebuild(); dirty = false; }
+
+  // 1. the hologram, drawn by the rig camera into the stand-in for the panel
+  renderer.setRenderTarget(rt);
+  renderer.setViewport(0, 0, RTW, RTH);
+  renderer.setClearColor(0x000000, 1);
+  renderer.clear(true, true, false);
+  renderer.render(holo, rigCam);
+  renderer.setRenderTarget(null);
+
+  // 2. three views of the result. Straight down the +X axis by default, so the rig reads as a side view;
+  // the orbit option turns it to show that nothing depends on that.
+  const p = panels();
+  renderer.setViewport(0, 0, w, h);
+  renderer.setScissorTest(false);
+  renderer.setClearColor(0x05070c, 1);
+  renderer.clear(true, true, false);
+  const ang = state.orbit ? state.spin : 0;
+  sideCam.position.set(Math.cos(ang) * 220, 10, Math.sin(ang) * 220);
+  sideCam.lookAt(0, 6, -6);
+  const aspect = p.side[2] / p.side[3], ext = 62;
+  sideCam.left = -ext * aspect; sideCam.right = ext * aspect; sideCam.top = ext; sideCam.bottom = -ext;
+  sideCam.updateProjectionMatrix();
+  simParts.getObjectByName('beams').visible = true;
+  drawPanel(p.side, sim, sideCam, 0x0a0e16);
+
+  flatQuad.geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvArray(rc), 2));
+  drawPanel(p.mon, flat, flatCam, 0x000000);
+
+  eyeCam.position.set(...state.eye);
+  eyeCam.up.set(0, 1, 0);
+  eyeCam.lookAt(V3(rig.model.anchor));
+  eyeCam.aspect = p.eye[2] / p.eye[3];
+  eyeCam.updateProjectionMatrix();
+  simParts.getObjectByName('beams').visible = false;      // the viewer does not see the light path itself
+  drawPanel(p.eye, sim, eyeCam, 0x080b12);
+
+  renderer.setViewport(0, 0, w, h);
+}
+function uvArray(rc) {
+  const u = panelUVs(rc);                                   // plane geometry order: tl, tr, bl, br
+  return [...u.tl, ...u.tr, ...u.bl, ...u.br];
+}
+
+function rebuild() {
+  buildRig();
+  rigView.setRig(rig);
+  rigView.setTestPattern(state.pattern);
+  rigView.setTargets(calTargets, calActiveIdx);
+  rc = rigView.update(state.eye, { rigFrame: true });     // the eye is already in rig coordinates here
+  placeModel();
+  buildSim(rc);
+  readout();
+  syncSliders();
+}
+function syncSliders() {
+  document.querySelectorAll('#rigSliders input').forEach((i) => { i.disabled = state.fold || !!cal; });
+}
+
+function readout() {
+  const chk = rigCheck(rig, state.eye);
+  const V = virtualScreen(rig);
+  const err = rayCheck(40);
+  document.getElementById('read').innerHTML = [
+    `<div>reflections ${V.reflections}, flip ${rc.flipX ? 'x' : rc.flipY ? 'y' : 'none'}</div>`,
+    `<div>image centre ${V.centre.map((n) => n.toFixed(0)).join(', ')} cm, ${rc.eyeDistanceCm.toFixed(0)} cm from the eye</div>`,
+    `<div class="${err < 1e-6 ? 'ok' : 'warn'}">ray check ${err.toExponential(1)} cm, texture ${uvCheck(12).toExponential(1)}</div>`,
+    chk.ok ? '<div class="ok">geometry usable</div>' : chk.warnings.map((w) => `<div class="warn">${w}</div>`).join(''),
+  ].join('');
+}
+
+// The check the tests do, run live in the page: project a point, then follow the light from that panel
+// pixel back to the eye and see whether it passes through the point.
+function rayCheck(n = 40) {
+  let worst = 0;
+  const a = v3(rig.model.anchor), mirrors = rigMirrors(rig);
+  for (let i = 0; i < n; i++) {
+    const P = add(a, [Math.sin(i * 1.7) * 6, Math.cos(i * 2.3) * 5, Math.sin(i * 0.9) * 6]);
+    let img = projectToMonitor(rig, rc, P).point;          // the panel point the projection picked
+    for (const pl of mirrors) img = reflectPoint(pl, img); // where its light appears to come from
+    worst = Math.max(worst, lineDist(P, state.eye, sub(img, state.eye)));
+  }
+  return worst;
+}
+
+// ---------- calibration panel, with a simulated hand tracker ----------
+let cal = null;
+const fakeTracker = { s: 0.92, R: [0.9848, 0, 0.1736, 0, 1, 0, -0.1736, 0, 0.9848], t: [4, -6, 12] };
+document.getElementById('calib').onclick = () => {
+  if (cal) { cal.close(); cal = null; return; }
+  // getTip() pretends a hand tracker is running: it reports the ACTIVE target, seen through an unknown
+  // transform plus noise, so pressing "capture" six times must recover that transform.
+  const inv = (p) => {                                         // rig -> fake tracker space
+    const q = sub(v3(p), fakeTracker.t), R = fakeTracker.R, s = 1 / fakeTracker.s;
+    return [s * (R[0] * q[0] + R[3] * q[1] + R[6] * q[2]), s * (R[1] * q[0] + R[4] * q[1] + R[7] * q[2]),
+            s * (R[2] * q[0] + R[5] * q[1] + R[8] * q[2])];
+  };
+  cal = openCalibration({
+    rig,
+    getEye: () => state.eye,
+    getTip: () => {
+      const t = cal?.targets?.[Math.max(0, cal.step === 2 ? calActive() : 0)];
+      return t ? inv(t).map((c) => c + (Math.random() - 0.5) * 0.3) : null;
+    },
+    onTargets: (pts, active) => { calTargets = pts || []; calActiveIdx = active; dirty = true; },
+    onChange: () => { dirty = true; },
+    onClose: () => { cal = null; },
+  });
+};
+let calTargets = [], calActiveIdx = -1;
+const calActive = () => calActiveIdx;
+document.getElementById('check').onclick = () => {
+  const err = rayCheck(200);
+  alert(`worst distance between the point and the light ray for 200 points: ${err.toExponential(2)} cm`);
+};
+
+// Does the texture actually land where the projection says? Take a point under the sheet, find where the
+// line from the eye crosses the virtual screen, interpolate the panel texture coordinate there from the same
+// UVs the quads use, and compare it with the point's own place in the rendered image. This is the one part
+// of the chain the geometry tests cannot see: the mapping of pixels onto the quads, flip included.
+function uvCheck(n = 24) {
+  const V = virtualScreen(rig), uv = panelUVs(rc), eye = state.eye, a = v3(rig.model.anchor);
+  let worst = 0;
+  for (let i = 0; i < n; i++) {
+    const P = add(a, [Math.sin(i * 1.3) * 6, Math.cos(i * 1.9) * 5, Math.sin(i * 2.7) * 6]);
+    const pr = projectPoint(rc, P);
+    const want = [(pr.ndc[0] + 1) / 2, (pr.ndc[1] + 1) / 2];       // where it sits in the rendered texture
+    const d = sub(P, eye), t = rayPlane(eye, d, planeOf({ point: V.centre, normal: V.normal }));
+    const hit = add(eye, scale(d, t)), st = rectUV(V, hit);        // its place on the virtual screen
+    const got = [0, 1].map((k) => uv.tl[k] * (1 - st.u) * (1 - st.v) + uv.tr[k] * st.u * (1 - st.v)
+                                + uv.bl[k] * (1 - st.u) * st.v + uv.br[k] * st.u * st.v);
+    worst = Math.max(worst, Math.hypot(got[0] - want[0], got[1] - want[1]));
+  }
+  return worst;
+}
+
+// ---------- expose for the headless check ----------
+window.rigDemo = {
+  get rig() { return rig; }, get rc() { return rc; }, state,
+  get ready() { return modelReady === true; },
+  rayCheck, uvCheck,
+  setEye(p) { state.eye = [...p]; dirty = true; },
+  setFold(on) { state.fold = on; document.getElementById('fold').checked = on; dirty = true; },
+  setPattern(on) { state.pattern = on; document.getElementById('pattern').checked = on; dirty = true; },
+  // the whole calibration chain, without a camera: fit the fake tracker from 6 touched targets
+  simulateHandFit(noiseCm = 0.3) {
+    const targets = [[-8, -13, 0], [8, -13, 0], [0, -7, 0], [0, -13, 8], [0, -19, 0], [0, -13, -8]];
+    const inv = (p) => {
+      const q = sub(v3(p), fakeTracker.t), R = fakeTracker.R, s = 1 / fakeTracker.s;
+      return [s * (R[0] * q[0] + R[3] * q[1] + R[6] * q[2]), s * (R[1] * q[0] + R[4] * q[1] + R[7] * q[2]),
+              s * (R[2] * q[0] + R[5] * q[1] + R[8] * q[2])];
+    };
+    const src = targets.map((t) => inv(t).map((c) => c + (Math.random() - 0.5) * noiseCm));
+    const fit = fitSimilarity(src, targets);
+    return { rmsMm: fit.rmsMm, maxMm: fit.maxMm, scale: fit.s };
+  },
+  // the same fit, written to the rig, so the UI checks can exercise "copy from hand fit"
+  applyHandFit(noiseCm = 0.3) {
+    const targets = [[-8, -13, 0], [8, -13, 0], [0, -7, 0], [0, -13, 8], [0, -19, 0], [0, -13, -8]];
+    const inv = (p) => {
+      const q = sub(v3(p), fakeTracker.t), R = fakeTracker.R, s = 1 / fakeTracker.s;
+      return [s * (R[0] * q[0] + R[3] * q[1] + R[6] * q[2]), s * (R[1] * q[0] + R[4] * q[1] + R[7] * q[2]),
+              s * (R[2] * q[0] + R[5] * q[1] + R[8] * q[2])];
+    };
+    rig.hand.fit = fitSimilarity(targets.map((t) => inv(t).map((c) => c + (Math.random() - 0.5) * noiseCm)), targets);
+    dirty = true;
+    return { scale: +rig.hand.fit.s.toFixed(4), maxMm: +rig.hand.fit.maxMm.toFixed(2) };
+  },
+  // Rig output mode, on this page: black, HUD hidden, canvas flipped, scene content that is not hologram
+  // hidden, then everything back.
+  enterExit() {
+    const marker = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial());
+    marker.name = 'not-hologram';
+    holo.add(marker);
+    const view = new RigView({ rig, renderer, canvas, scene: holo, webcam: [0, 9.52, 0], sceneHide: ['not-hologram'] });
+    view.update(state.eye, { rigFrame: true });
+    const side = document.getElementById('side');
+    const before = { transform: canvas.style.transform, sidebar: side.style.visibility, marker: marker.visible };
+    view.enter();
+    const during = { transform: canvas.style.transform, sidebar: side.style.visibility, marker: marker.visible,
+                     background: holo.background.getHex(), flipX: view.rc.flipX,
+                     pattern: (view.setTestPattern(true), view.group.children.length) };
+    view.exit();
+    view.dispose();
+    const after = { transform: canvas.style.transform, sidebar: side.style.visibility, marker: marker.visible };
+    holo.remove(marker); marker.geometry.dispose(); marker.material.dispose();
+    return { before, during, after };
+  },
+  // The documented integration recipe, end to end: take a known rig-frame eye, write it the way webcam.js
+  // writes input.eye, and see what RigView gives back with the webcam position and without it.
+  eyeRoundTrip(webcam = [0, 9.52, 0], nudgeYCm = 1.5, eyeRig = [3, 36.7, 71.1]) {
+    const head = rig.head, R = poseMatrix3(head), s = head.scale ?? 1;
+    const Rt = [R[0], R[3], R[6], R[1], R[4], R[7], R[2], R[5], R[8]];            // rig -> camera frame
+    const local = m3apply(Rt, sub(v3(eyeRig), v3(head.position))).map((c) => c / s);
+    const tracker = [webcam[0] - local[0], webcam[1] - local[1] + nudgeYCm, webcam[2] + local[2]];
+    const opts = { rig, renderer, canvas, scene: holo, assumeFullscreen: true };
+    const withCam = new RigView({ ...opts, webcam, nudgeYCm }), without = new RigView(opts);
+    const out = { eyeRig, tracker: tracker.map((n) => +n.toFixed(3)),
+                  withWebcamCm: withCam.eyeToRig(tracker), withoutWebcamCm: without.eyeToRig(tracker) };
+    out.withWebcamErrCm = dist(out.withWebcamCm, v3(eyeRig));
+    out.withoutWebcamErrCm = dist(out.withoutWebcamCm, v3(eyeRig));
+    withCam.dispose(); without.dispose();
+    return out;
+  },
+  // placeModel must be idempotent: measuring the box through the root's world matrix shrank a rotated model
+  // by a third on the second call. The largest dimension has to stay at model.fitCm however often it runs.
+  placeRepeat(yawDeg = 30, times = 3) {
+    const was = rig.model.yawDeg;
+    rig.model = { ...rig.model, yawDeg };
+    const sizes = [], scales = [];
+    for (let i = 0; i < times; i++) {
+      rigView.placeModel(holoModel);
+      const size = new THREE.Box3().setFromObject(holoModel).getSize(new THREE.Vector3());
+      sizes.push(+Math.max(size.x, size.y, size.z).toFixed(4));
+      scales.push(+holoModel.scale.x.toFixed(6));           // the number the bug actually shrank
+    }
+    rig.model = { ...rig.model, yawDeg: was };
+    placeModel();
+    return { yawDeg, fitCm: rig.model.fitCm, sizes, scales };
+  },
+  // Auto-capture must need the hand to MOVE. Holding still used to refill the sample buffer in ~117 ms and
+  // fire again a second later, recording every remaining target at the first spot. Real panel, virtual clock.
+  dwellProbe() {
+    const keep = rig.hand;
+    rig.hand = { ...rig.hand, fit: null };
+    let tip = null, t = 0;
+    const panel = openCalibration({ rig, getEye: () => state.eye, getTip: () => tip,
+                                    onTargets: () => {}, onChange: () => {} });
+    panel.setStep(2);
+    const run = (ms) => { for (const end = t + ms; t <= end; t += 1000 / 60) panel.tick(t); };
+    const spots = panel.targets.map((p) => p.slice());        // tracker frame = rig frame for this probe
+    tip = spots[0].slice();
+    run(6000);                                                // six seconds of a perfectly still fingertip
+    const whileStill = panel.captures.filter(Boolean).length;
+    for (let i = 1; i < spots.length; i++) { tip = spots[i].slice(); run(1500); }   // then touch each spot
+    const captured = panel.captures.filter(Boolean);
+    const worstCm = Math.max(...captured.map((c, i) => dist(c, spots[i])));
+    tip = add(spots[spots.length - 1], [20, 0, 0]);            // hand parked elsewhere after finishing
+    run(3000);
+    const strayCm = dist(panel.captures[spots.length - 1], spots[spots.length - 1]);
+    const fitScale = rig.hand.fit ? rig.hand.fit.s : null;
+    panel.close();
+    rig.hand = keep;
+    return { spots: spots.length, whileStill, captured: captured.length, worstCm: +worstCm.toFixed(6),
+             strayCm: +strayCm.toFixed(6), fitScale: fitScale === null ? null : +fitScale.toFixed(6) };
+  },
+  summary() {
+    const V = virtualScreen(rig);
+    return { reflections: V.reflections, flipX: rc.flipX, flipY: rc.flipY,
+             imageCentre: V.centre.map((n) => +n.toFixed(2)), eye: state.eye,
+             eyeDistanceCm: +rc.eyeDistanceCm.toFixed(2), rayCheckCm: rayCheck(60), uvCheck: uvCheck(24),
+             warnings: rigCheck(rig, state.eye).warnings, modelReady };
+  },
+};
+
+// tag positions
+function tags() {
+  const p = panels(), h = canvas.clientHeight, solo = location.hash.slice(1);
+  const shown = { side: 'tagA', mon: 'tagB', eye: 'tagC' }[solo];
+  const put = (id, x, y) => {
+    const e = document.getElementById(id);
+    e.style.left = x + 'px'; e.style.top = y + 'px';
+    e.style.display = solo && id !== shown ? 'none' : '';
+  };
+  put('tagA', 8, 8);
+  put('tagB', (solo ? 0 : p.mon[0]) + 8, 8);
+  put('tagC', (solo ? 0 : p.eye[0]) + 8, solo ? 8 : h - p.eye[3] + 8);
+}
+addEventListener('resize', () => { dirty = true; tags(); });
+addEventListener('hashchange', () => { dirty = true; tags(); });
+tags();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

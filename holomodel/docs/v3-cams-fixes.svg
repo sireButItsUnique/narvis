@@ -1,0 +1,289 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1560 1080" width="1560" height="1080" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+<title>Holomodel v3: where the hand-tracking chain was wrong, and what each fault cost</title>
+<desc>The same chain as docs/chain.svg — cameras and the LAN bridge into the solver, the solver into the
+shared input object, the input object into the grab, the grab onto the rig — with the twenty-one
+confirmed faults marked at the file and line they live in, each with the measured cost before the fix and
+the measured number after it. Every figure comes from a test in test/ that fails on v3-cams and passes on
+v3-cams-final.</desc>
+
+<defs>
+  <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#35d0ff"/>
+  </marker>
+  <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#ff6b6b"/>
+  </marker>
+  <style>
+    .col   { fill:#0a1622; stroke:#1d3b55; stroke-width:1 }
+    .hdr   { fill:#35d0ff; font-size:12px; font-weight:600; letter-spacing:.09em }
+    .box   { fill:#0e2336; stroke:#2b5a80; stroke-width:1 }
+    .t     { fill:#e8f4ff; font-size:13px }
+    .tb    { fill:#ffffff; font-size:14px; font-weight:600 }
+    .s     { fill:#8fb6d4; font-size:11px }
+    .file  { fill:#5f8fb0; font-size:10px; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace }
+    .bad   { fill:#ff6b6b; font-size:11px }
+    .good  { fill:#7cff9b; font-size:11px }
+    .fixbox{ fill:#1a1214; stroke:#63333a; stroke-width:1 }
+    .sev   { font-size:9.5px; font-weight:700; letter-spacing:.06em }
+    .wire  { stroke:#35d0ff; stroke-width:1.6; fill:none; marker-end:url(#a) }
+    .lead  { stroke:#63333a; stroke-width:1; fill:none; stroke-dasharray:3 3 }
+  </style>
+</defs>
+
+<rect width="1560" height="1080" fill="#05090f"/>
+<text x="40" y="44" class="tb" font-size="21">Holomodel v3 — the hand-tracking chain, and the 21 faults now fixed on v3-cams-final</text>
+<text x="40" y="68" class="s" font-size="12.5">Every red figure was measured against the code as it stood; every green one is the same measurement after the fix. Both come from tests in test/ that fail on v3-cams and pass here.</text>
+<text x="40" y="88" class="s" font-size="12.5">Priority order the numbers serve: 1) the rig shows the model correctly, 2) you can pick it up, move it and drop it. Nothing here is about Fable or sculpting.</text>
+
+<!-- ============ column 1: sensors and capture ============ -->
+<rect x="40" y="120" width="330" height="900" rx="12" class="col"/>
+<text x="60" y="148" class="hdr">1 · SENSORS AND CAPTURE</text>
+<text x="60" y="168" class="s">pixels and timestamps · public/js/input/</text>
+
+<rect x="60" y="186" width="290" height="70" rx="9" class="box"/>
+<text x="76" y="208" class="tb">ZED 2i (side-by-side)</text>
+<text x="76" y="226" class="t">two eyes, one exposure → hands</text>
+<text x="76" y="243" class="file">cameras.js openSource · stereo.js</text>
+
+<rect x="60" y="266" width="290" height="62" rx="9" class="box"/>
+<text x="76" y="288" class="tb">2 × Logitech 1080p</text>
+<text x="76" y="306" class="t">the head, for the off-axis projection</text>
+<text x="76" y="321" class="file">devices.js planRoles</text>
+
+<rect x="60" y="338" width="290" height="62" rx="9" class="box"/>
+<text x="76" y="360" class="tb">ZED SDK over the LAN</text>
+<text x="76" y="378" class="t">3D hands from the CUDA laptop</text>
+<text x="76" y="393" class="file">zed-client.js</text>
+
+<rect x="60" y="410" width="290" height="62" rx="9" class="box"/>
+<text x="76" y="432" class="tb">one plain webcam</text>
+<text x="76" y="450" class="t">today's app, the degradation target</text>
+<text x="76" y="465" class="file">webcam.js</text>
+
+<rect x="60" y="490" width="290" height="80" rx="9" class="fixbox"/>
+<text x="76" y="510" class="sev" fill="#ff6b6b">BLOCKER · zed-client.js:151</text>
+<text x="76" y="528" class="t">hands that land before the first pong</text>
+<text x="76" y="544" class="bad">was: stamped on the bridge's epoch clock →</text>
+<text x="76" y="558" class="bad">a ghost hand holds the model for ever</text>
+<text x="76" y="570" class="good">now: unsynced = stamped on our clock, and every</text>
+<text x="76" y="584" class="good">staleness test is two-sided, so it expires</text>
+
+<rect x="60" y="606" width="290" height="82" rx="9" class="fixbox"/>
+<text x="76" y="626" class="sev" fill="#ffb23e">BUG · cameras.js:333 FrameGate</text>
+<text x="76" y="644" class="t">a worker that stops answering</text>
+<text x="76" y="660" class="bad">was: 1 slot held for ever, 3606 busy drops in</text>
+<text x="76" y="674" class="bad">60 s, both ZED eyes dead, fps still read 30</text>
+<text x="76" y="688" class="good">now: watchdog frees it, fps reads 0, 3 strikes</text>
+<text x="76" y="701" class="good">and the camera is given up so the ladder degrades</text>
+
+<rect x="60" y="716" width="290" height="80" rx="9" class="fixbox"/>
+<text x="76" y="736" class="sev" fill="#ffb23e">BUG · cameras.js:259 + stereo.js:55</text>
+<text x="76" y="754" class="t">which lens is this, really</text>
+<text x="76" y="770" class="bad">was: three focal lengths for one ZED (514 / 518 /</text>
+<text x="76" y="784" class="bad">700 px). A hand at 400 mm published at 989 mm</text>
+<text x="76" y="798" class="good">now: one measured figure, and the status line</text>
+<text x="76" y="811" class="good">says when the millimetres are still a guess</text>
+
+<rect x="60" y="826" width="290" height="62" rx="9" class="fixbox"/>
+<text x="76" y="846" class="sev" fill="#ffb23e">BUG · cameras.js:638 · webcam.js</text>
+<text x="76" y="864" class="bad">was: Stop/Start leaked a camera stream and two</text>
+<text x="76" y="878" class="bad">MediaPipe landmarkers, every time</text>
+<text x="76" y="892" class="good">now: stopCamera() gives all of it back</text>
+
+<rect x="60" y="904" width="290" height="58" rx="9" class="fixbox"/>
+<text x="76" y="924" class="sev" fill="#8fb6d4">MINOR · cameras.js:605</text>
+<text x="76" y="942" class="bad">was: 18 001 notes after 10 min of a dead graph,</text>
+<text x="76" y="956" class="bad">0.9 MB re-joined into the DOM 60x a second</text>
+<text x="76" y="970" class="good">now: capped at 12, and the tracker is stopped</text>
+
+<!-- ============ column 2: the solver ============ -->
+<rect x="410" y="120" width="360" height="900" rx="12" class="col"/>
+<text x="430" y="148" class="hdr">2 · THE SOLVER (geometry)</text>
+<text x="430" y="168" class="s">millimetres, rig frame · public/js/track/</text>
+
+<rect x="430" y="186" width="320" height="92" rx="9" class="box"/>
+<text x="446" y="208" class="tb">line the cameras up in time</text>
+<text x="446" y="226" class="t">each camera samples at its own phase, so</text>
+<text x="446" y="242" class="t">every view is interpolated to one instant</text>
+<text x="446" y="266" class="file">solve.js CameraTrack.sampleAt / blend</text>
+
+<rect x="430" y="288" width="320" height="74" rx="9" class="box"/>
+<text x="446" y="310" class="tb">match hands across cameras</text>
+<text x="446" y="328" class="t">handedness first, then reprojection error</text>
+<text x="446" y="350" class="file">solve.js matchHandsAcrossCameras</text>
+
+<rect x="430" y="372" width="320" height="74" rx="9" class="box"/>
+<text x="446" y="394" class="tb">triangulate 21 landmarks</text>
+<text x="446" y="412" class="t">weighted per view, outliers voted out</text>
+<text x="446" y="434" class="file">triangulate.js · filter.js</text>
+
+<rect x="430" y="456" width="320" height="74" rx="9" class="box"/>
+<text x="446" y="478" class="tb">or fall back to one camera</text>
+<text x="446" y="496" class="t">depth from palm size — about 10x worse</text>
+<text x="446" y="518" class="file">solve.js monoHandToRig</text>
+
+<rect x="430" y="548" width="320" height="104" rx="9" class="fixbox"/>
+<text x="446" y="568" class="sev" fill="#ff6b6b">BLOCKER · solve.js:238 grouping</text>
+<text x="446" y="586" class="t">a missed detection is a RESULT, not silence:</text>
+<text x="446" y="602" class="t">the worker posts { face: null, hands: [] }</text>
+<text x="446" y="620" class="bad">was: that empty frame hid the good frame 16 ms</text>
+<text x="446" y="634" class="bad">earlier. 10% miss rate → 33% of frames on the</text>
+<text x="446" y="648" class="bad">mono guess, fingertip 12.6 mm (p95 54 mm)</text>
+
+<rect x="430" y="654" width="320" height="40" rx="9" class="fixbox"/>
+<text x="446" y="672" class="good">now: group on "has a usable frame in the stale</text>
+<text x="446" y="686" class="good">bound" → 0% mono, 2.7 mm (p95 5.3 mm)</text>
+
+<rect x="430" y="706" width="320" height="76" rx="9" class="fixbox"/>
+<text x="446" y="726" class="sev" fill="#ffb23e">BUG · solve.js:44 blend at t = 1</text>
+<text x="446" y="744" class="bad">was: the reference camera blends with itself every</text>
+<text x="446" y="758" class="bad">frame and the OLDER frame decided which hands</text>
+<text x="446" y="772" class="good">now: iterate the newer frame; blend(a,b,1) === b</text>
+
+<rect x="430" y="792" width="320" height="76" rx="9" class="fixbox"/>
+<text x="446" y="812" class="sev" fill="#ffb23e">BUG · solve.js:495 reject sentinel</text>
+<text x="446" y="830" class="bad">was: 1e6 meant "not the same hand", but</text>
+<text x="446" y="844" class="bad">Number.isFinite(1e6) is true → a 407 mm phantom</text>
+<text x="446" y="858" class="good">now: Infinity, plus a reprojection gate at 8 px</text>
+
+<rect x="430" y="878" width="320" height="62" rx="9" class="fixbox"/>
+<text x="446" y="898" class="sev" fill="#ffb23e">BUG · calibrate.js:221</text>
+<text x="446" y="916" class="bad">was: a fingertip waved in one PLANE gave a pose</text>
+<text x="446" y="930" class="bad">30-70 deg wrong with a healthy 1 px RMS</text>
+
+<rect x="430" y="944" width="320" height="30" rx="9" class="fixbox"/>
+<text x="446" y="964" class="good">now: refused, with a reason the user can act on</text>
+
+<rect x="430" y="974" width="320" height="40" rx="9" class="fixbox"/>
+<text x="446" y="992" class="good">stereo.js and calibrate.js now agree on the ZED's</text>
+<text x="446" y="1006" class="good">stereo rotation — it was 5.7 mm of depth, one way</text>
+
+<!-- ============ column 3: shared input + grab ============ -->
+<rect x="810" y="120" width="360" height="900" rx="12" class="col"/>
+<text x="830" y="148" class="hdr">3 · SHARED INPUT AND THE GRAB</text>
+<text x="830" y="168" class="s">centimetres, app frame · interact/</text>
+
+<rect x="830" y="186" width="320" height="76" rx="9" class="box"/>
+<text x="846" y="208" class="tb">input/state.js</text>
+<text x="846" y="226" class="t">eye, two hands, 21 joints, pinch, seenAt</text>
+<text x="846" y="242" class="t">the one contract the whole app reads</text>
+<text x="846" y="256" class="file">solve.js publish() → wire.js</text>
+
+<rect x="830" y="272" width="320" height="70" rx="9" class="box"/>
+<text x="846" y="294" class="tb">pinch, with two thresholds</text>
+<text x="846" y="312" class="t">25 mm in, 30 mm out, plus a hold time</text>
+<text x="846" y="332" class="file">grab.js readHand</text>
+
+<rect x="830" y="352" width="320" height="70" rx="9" class="box"/>
+<text x="846" y="374" class="tb">what did you mean to take</text>
+<text x="846" y="392" class="t">intent memory: what the OPEN hand was near</text>
+<text x="846" y="412" class="file">grab.js bestTarget / updateIntent</text>
+
+<rect x="830" y="432" width="320" height="70" rx="9" class="box"/>
+<text x="846" y="454" class="tb">hold, carry, release, settle</text>
+<text x="846" y="472" class="t">anchored offset, deadband, spring, throw</text>
+<text x="846" y="492" class="file">grab.js driveHold / endHold</text>
+
+<rect x="830" y="520" width="320" height="92" rx="9" class="fixbox"/>
+<text x="846" y="540" class="sev" fill="#ff6b6b">BLOCKER · config.js:59 default volume</text>
+<text x="846" y="558" class="bad">was: a scene that did not state its own working</text>
+<text x="846" y="572" class="bad">volume was clamped into the demo's metre box —</text>
+<text x="846" y="586" class="bad">28 cm of travel on the first grab, 156 mm in one frame</text>
+<text x="846" y="602" class="good">now: no volume given → no clamp, no gravity, and a warning</text>
+
+<rect x="830" y="624" width="320" height="92" rx="9" class="fixbox"/>
+<text x="846" y="644" class="sev" fill="#ffb23e">BUG · grab.js:135 target ranking</text>
+<text x="846" y="662" class="bad">was: ranked by (distance − bounding-SPHERE radius),</text>
+<text x="846" y="676" class="bad">and the sphere was half the box DIAGONAL: a 30×2×30</text>
+<text x="846" y="690" class="bad">cm base beat the ball on it, 30 times out of 30</text>
+<text x="846" y="706" class="good">now: distance to the part's own box, radius capped</text>
+
+<rect x="830" y="728" width="320" height="78" rx="9" class="fixbox"/>
+<text x="846" y="748" class="sev" fill="#ffb23e">BUG · grab.js:133 re-grab lockout</text>
+<text x="846" y="766" class="bad">was: the lockout skipped the part you just dropped</text>
+<text x="846" y="780" class="bad">and handed the grab to its NEIGHBOUR for 620 ms</text>
+<text x="846" y="796" class="good">now: the winner is locked out → take nothing</text>
+
+<rect x="830" y="818" width="320" height="92" rx="9" class="fixbox"/>
+<text x="846" y="838" class="sev" fill="#ffb23e">BUG · grab.js:295 losing tracking mid-carry</text>
+<text x="846" y="856" class="bad">was: treated like a deliberate let-go — rolled back</text>
+<text x="846" y="870" class="bad">24 mm and released at 45 cm/s, then fell 9 cm.</text>
+<text x="846" y="884" class="bad">A camera blink was indistinguishable from a throw</text>
+<text x="846" y="900" class="good">now: 0.0 cm/s, 1.3 mm — it stays where it was</text>
+
+<rect x="830" y="916" width="320" height="56" rx="9" class="fixbox"/>
+<text x="846" y="934" class="sev" fill="#ffb23e">BUG · grab.js:247 two-hand blink</text>
+<text x="846" y="950" class="bad">was: frozen for the gap, then 38 mm in one frame</text>
+<text x="846" y="964" class="good">now: 12.7 mm — inside an ordinary carrying frame</text>
+
+<rect x="830" y="974" width="320" height="40" rx="9" class="fixbox"/>
+<text x="846" y="992" class="good">hold-through is one window again: 464 ms → 256 ms,</text>
+<text x="846" y="1006" class="good">and a rotated part rests ON the floor, not 45 mm above it</text>
+
+<!-- ============ column 4: the rig ============ -->
+<rect x="1210" y="120" width="310" height="900" rx="12" class="col"/>
+<text x="1230" y="148" class="hdr">4 · THE RIG</text>
+<text x="1230" y="168" class="s">Pepper's ghost · view.js, sim/</text>
+
+<rect x="1230" y="186" width="270" height="96" rx="9" class="box"/>
+<text x="1246" y="208" class="tb">portrait monitor, tilted, above</text>
+<text x="1246" y="226" class="t">only a 4:3 area of it is used; the rest is</text>
+<text x="1246" y="242" class="t">black, because black is what the acrylic</text>
+<text x="1246" y="258" class="t">does not reflect</text>
+<text x="1246" y="274" class="file">sim/rig-sim.js rigGeometry</text>
+
+<rect x="1230" y="292" width="270" height="84" rx="9" class="box"/>
+<text x="1246" y="314" class="tb">head-tracked off-axis frustum</text>
+<text x="1246" y="332" class="t">Kooima's generalised perspective, built</text>
+<text x="1246" y="348" class="t">from input.eye every frame</text>
+<text x="1246" y="368" class="file">view.js applyOffAxis</text>
+
+<rect x="1230" y="386" width="270" height="84" rx="9" class="box"/>
+<text x="1246" y="408" class="tb">the virtual image</text>
+<text x="1246" y="426" class="t">the panel mirrored in the sheet — where</text>
+<text x="1246" y="442" class="t">the hands actually reach</text>
+<text x="1246" y="462" class="file">parallax gain 0.20 on this rig</text>
+
+<rect x="1230" y="490" width="270" height="118" rx="9" class="fixbox"/>
+<text x="1246" y="510" class="sev" fill="#ff6b6b">BLOCKER · solver.js:181 eye nudge</text>
+<text x="1246" y="528" class="t">the rig's own eye-height calibration knob</text>
+<text x="1246" y="546" class="bad">was: re-added on EVERY frame that published</text>
+<text x="1246" y="560" class="bad">no eye. input.eye.y reached 120 cm after 1 s</text>
+<text x="1246" y="574" class="bad">and 1200 cm after 10 s — the frustum shears</text>
+<text x="1246" y="588" class="bad">off the panel and the rig shows black</text>
+<text x="1246" y="602" class="good">now: applied inside publish(), once, or not at all</text>
+
+<rect x="1230" y="624" width="270" height="132" rx="9" class="fixbox"/>
+<text x="1246" y="644" class="sev" fill="#ffb23e">BUG · rig-sim.js — the simulator itself</text>
+<text x="1246" y="662" class="bad">was: it could not express a calibration error at</text>
+<text x="1246" y="676" class="bad">all (its one hook was overwritten), it modelled</text>
+<text x="1246" y="690" class="bad">a dropped frame as silence rather than as an</text>
+<text x="1246" y="704" class="bad">empty result, its ZED lens was 26% short, and</text>
+<text x="1246" y="718" class="bad">its two eyes were the wrong way round</text>
+<text x="1246" y="734" class="good">now: all four fixed, so the millimetres it prints</text>
+<text x="1246" y="748" class="good">are about the rig and not about its own model</text>
+
+<rect x="1230" y="776" width="270" height="150" rx="9" class="box"/>
+<text x="1246" y="798" class="tb">what the simulator now says</text>
+<text x="1246" y="818" class="t">planned kit, 1 px noise, 300 frames:</text>
+<text x="1246" y="838" class="good">fingertip 2.5 mm mean, 4.4 mm p95</text>
+<text x="1246" y="856" class="good">eye 1.9 mm mean, 3.5 mm p95</text>
+<text x="1246" y="874" class="t">...assuming exact calibration. Under the</text>
+<text x="1246" y="890" class="t">residual this project's own calibration</text>
+<text x="1246" y="906" class="t">leaves (1.3% scale, 0.3°):</text>
+<text x="1246" y="922" class="bad">fingertip 16.1 mm</text>
+
+<rect x="1230" y="936" width="270" height="78" rx="9" class="box"/>
+<text x="1246" y="956" class="tb">so: add the side view</text>
+<text x="1246" y="974" class="t">the second webcam aimed at the hands</text>
+<text x="1246" y="990" class="t">instead of the head holds 3.8 mm under</text>
+<text x="1246" y="1006" class="t">the same band, against 16.1 mm</text>
+
+<!-- wires between columns -->
+<path class="wire" d="M352 300 C 390 300, 392 300, 424 300"/>
+<path class="wire" d="M752 300 C 790 300, 792 300, 824 300"/>
+<path class="wire" d="M1152 300 C 1185 300, 1190 300, 1224 300"/>
+<text x="366" y="288" class="s" font-size="10">px + t</text>
+<text x="762" y="288" class="s" font-size="10">mm</text>
+<text x="1160" y="288" class="s" font-size="10">cm</text>
+</svg>

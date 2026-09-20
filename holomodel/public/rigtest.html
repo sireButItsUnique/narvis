@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Object viewer</title>
+<style>
+  html, body { margin:0; height:100%; background:#000; overflow:hidden; cursor:crosshair; }
+  /* the sheet flips what it reflects, so the WHOLE page (object, ruler, text) is sent flipped */
+  #flip { position:fixed; inset:0; transform-origin:50% 50%; }
+  canvas { display:block; }
+  #help { position:fixed; left:14px; top:14px; color:#7fa3bf; background:rgba(0,0,0,.78); border:1px solid #1d3b55;
+    border-radius:8px; padding:10px 13px; font:13px/1.6 system-ui, "Segoe UI", sans-serif; white-space:pre; z-index:2; }
+  #help b { color:#cfe8ff; font-weight:600; }
+  #hud { position:fixed; right:14px; top:14px; color:#7fa3bf; background:rgba(0,0,0,.78); border:1px solid #1d3b55;
+    border-radius:8px; padding:8px 12px; font:12px/1.5 ui-monospace, Consolas, monospace; z-index:2; white-space:pre; }
+  .hidden { display:none !important; }
+  /* alignment frame: the edges of what the page covers, and its exact centre */
+  #frame { position:fixed; inset:0; border:1px solid #35d0ff; box-sizing:border-box; pointer-events:none; z-index:1; }
+  #frame::before, #frame::after { content:""; position:absolute; background:#35d0ff; }
+  #frame::before { left:50%; top:calc(50% - 22px); width:1px; height:44px; }
+  #frame::after { top:50%; left:calc(50% - 22px); height:1px; width:44px; }
+  #warn { position:fixed; left:50%; top:16px; transform:translateX(-50%); color:#04060b; background:#ffb23e;
+    border-radius:6px; padding:6px 12px; font:13px system-ui; z-index:3; }
+</style>
+</head>
+<body>
+<div id="flip">
+<div id="help" class="hidden"><b>Object viewer</b>  (H shows/hides this and the readout)
+<b>Drag</b> to turn it   <b>Wheel</b> or <b>+ -</b> to resize   <b>Arrows</b> to move
+<b>1 2 3 4</b> cube · knot · sphere · rings    <b>Drop a .glb</b> for your own model
+<b>T</b> true size (cm on the sheet)   <b>I</b> set monitor size   <b>R</b> ruler
+<b>W</b> wireframe  <b>C</b> colour  <b>B</b> brightness  <b>Space</b> spin  <b>[ ]</b> speed
+<b>X</b> mirror   <b>Y</b> upside down   <b>0</b> reset   <b>F</b> fullscreen</div>
+<div id="hud" class="hidden"></div>
+<div id="frame"></div>
+<div id="warn" class="hidden"></div>
+</div>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+               "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// For checking on the real rig that an object shows up, at the size it claims, the right way up. Pure black,
+// one object, a centimetre ruler. Sizes are in centimetres so "10 cm" on screen is 10 cm in the reflection.
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.getElementById('flip').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const persp = new THREE.PerspectiveCamera(35, 1, 0.1, 400);
+const ortho = new THREE.OrthographicCamera(-10, 10, 10, -10, -400, 400);
+persp.position.set(0, 0, 60);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+const key = new THREE.DirectionalLight(0xffffff, 3.2); key.position.set(2, 3, 4); scene.add(key);
+const rim = new THREE.DirectionalLight(0x88ccff, 2.0); rim.position.set(-3, 1, -2); scene.add(rim);
+
+const holder = new THREE.Group();   // the object, turned by dragging and by the spin
+const stage = new THREE.Group();    // where it sits
+stage.add(holder); scene.add(stage);
+
+const load = k => { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch { return null; } };
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+
+const PALETTE = [0xffffff, 0x35d0ff, 0x7cff9b, 0xffb23e, 0xff6b7a];
+const state = { shape: 0, colour: 0, bright: 1, wire: false, spin: true, speed: 0.6,
+                size: 10, x: 0, y: 0, trueSize: true, ruler: true, diagIn: load('rig-diag') || 24 };
+const flip = { x: false, y: true };   // the sheet flips it, so send it upside down by default
+
+function material() {
+  return state.wire
+    ? new THREE.MeshBasicMaterial({ color: PALETTE[state.colour], wireframe: true })
+    : new THREE.MeshStandardMaterial({ color: PALETTE[state.colour], roughness: 0.35, metalness: 0.15,
+        emissive: PALETTE[state.colour], emissiveIntensity: 0.12 * state.bright });
+}
+
+const SHAPES = [
+  () => new THREE.BoxGeometry(1, 1, 1),
+  () => new THREE.TorusKnotGeometry(0.34, 0.11, state.wire ? 90 : 180, state.wire ? 12 : 32),
+  () => new THREE.SphereGeometry(0.5, state.wire ? 28 : 64, state.wire ? 18 : 48),
+  null,
+];
+
+function clear(group) {
+  group.traverse(o => { if (o.isMesh) { o.geometry?.dispose?.(); const m = o.material; Array.isArray(m) ? m.forEach(x => x.dispose()) : m?.dispose?.(); } });
+  group.clear();
+}
+
+// everything is built inside a 1-unit box, then scaled to the wanted size in cm
+function fit(obj) {
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3()), centre = box.getCenter(new THREE.Vector3());
+  obj.position.sub(centre);
+  obj.scale.multiplyScalar(1 / Math.max(size.x, size.y, size.z, 1e-6));
+}
+
+function setShape(i) {
+  state.shape = i;
+  clear(holder);
+  if (i === 3) {
+    for (let k = 0; k < 3; k++) {
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.5 - k * 0.14, 0.022, 20, 96), material());
+      ring.rotation.set(k === 0 ? 0 : Math.PI / 2, k === 2 ? Math.PI / 2 : 0, 0);
+      holder.add(ring);
+    }
+  } else {
+    holder.add(new THREE.Mesh(SHAPES[i](), material()));
+  }
+  applyStage();
+}
+
+function reskin() {
+  holder.traverse(o => { if (o.isMesh) { o.material?.dispose?.(); o.material = material(); } });
+  key.intensity = 3.2 * state.bright;
+  rim.intensity = 2.0 * state.bright;
+}
+
+// a 10 cm ruler: in true-size mode these ticks really are 1 cm apart on the glass
+const ruler = new THREE.Group(); scene.add(ruler);
+{
+  const mat = new THREE.LineBasicMaterial({ color: 0x35d0ff });
+  const pts = [new THREE.Vector3(-5, 0, 0), new THREE.Vector3(5, 0, 0)];
+  ruler.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat));
+  for (let i = 0; i <= 10; i++) {
+    const h = i % 5 === 0 ? 0.8 : 0.4;
+    ruler.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(
+      [new THREE.Vector3(-5 + i, 0, 0), new THREE.Vector3(-5 + i, h, 0)]), mat));
+  }
+}
+
+function pxPerCm() {
+  const screenW = (screen?.width || innerWidth);
+  return screenW / (state.diagIn * 2.54 * 0.8716);   // 16:9 screen width in cm
+}
+
+function camera() { return state.trueSize ? ortho : persp; }
+
+function layout() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h);
+  persp.aspect = w / h; persp.updateProjectionMatrix();
+  const cmW = w / pxPerCm(), cmH = h / pxPerCm();   // how many centimetres the window covers
+  ortho.left = -cmW / 2; ortho.right = cmW / 2; ortho.top = cmH / 2; ortho.bottom = -cmH / 2;
+  ortho.updateProjectionMatrix();
+  applyStage();
+}
+addEventListener('resize', layout);
+
+function applyStage() {
+  stage.scale.setScalar(state.size);
+  stage.position.set(state.x, state.y, 0);
+  const cmH = innerHeight / pxPerCm();
+  ruler.visible = state.ruler;
+  ruler.position.set(0, -Math.min(cmH / 2 - 2, state.size * 0.9 + 3), 0);
+  document.getElementById('flip').style.transform = `scale(${flip.x ? -1 : 1}, ${flip.y ? -1 : 1})`;
+  hud();
+}
+
+const hudEl = document.getElementById('hud'), warnEl = document.getElementById('warn');
+function hud() {
+  const w = innerWidth, h = innerHeight, sw = screen?.width || w, sh = screen?.height || h;
+  const full = Math.abs(w - sw) < 4 && Math.abs(h - sh) < 40;   // is the page actually covering the monitor?
+  warnEl.classList.toggle('hidden', full);
+  if (!full) warnEl.textContent = `Window ${w}x${h}, monitor ${sw}x${sh} — press F for fullscreen or the centre is off`;
+  hudEl.textContent = [
+    `${state.size.toFixed(1)} cm ${state.trueSize ? '(true size)' : '(not to scale)'}`,
+    `window ${w}x${h}  ${(w / h).toFixed(2)}:1`,
+    `screen ${sw}x${sh}  ${(sw / sh).toFixed(2)}:1  dpr ${devicePixelRatio}`,
+    `monitor ${state.diagIn}"  ${pxPerCm().toFixed(1)} px/cm`,
+    `${flip.y ? 'upside down' : 'right way up'}${flip.x ? ' · mirrored' : ''}`,
+  ].join('\n');
+}
+
+// drag to turn, wheel to resize
+let drag = null;
+renderer.domElement.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY }; state.spin = false; });
+addEventListener('pointerup', () => { drag = null; });
+addEventListener('pointermove', e => {
+  if (!drag) return;
+  const dx = (e.clientX - drag.x) / 160, dy = (e.clientY - drag.y) / 160;
+  drag = { x: e.clientX, y: e.clientY };
+  holder.rotation.y += flip.x ? -dx : dx;
+  holder.rotation.x += flip.y ? -dy : dy;
+});
+addEventListener('wheel', e => { state.size = THREE.MathUtils.clamp(state.size * (e.deltaY > 0 ? 0.92 : 1.09), 0.5, 60); applyStage(); }, { passive: true });
+
+// drop your own model
+const loader = new GLTFLoader();
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', async e => {
+  e.preventDefault();
+  const file = e.dataTransfer?.files?.[0];
+  if (!file || !/\.(glb|gltf)$/i.test(file.name)) return;
+  const url = URL.createObjectURL(file);
+  try {
+    const gltf = await loader.loadAsync(url);
+    clear(holder);
+    fit(gltf.scene);
+    holder.add(gltf.scene);
+    if (state.wire) reskin();
+    applyStage();
+  } catch (err) { console.error(err); } finally { URL.revokeObjectURL(url); }
+});
+
+const help = document.getElementById('help');
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k >= '1' && k <= '4') return setShape(+k - 1);
+  if (k === 'w') { state.wire = !state.wire; (state.shape === 1 || state.shape === 2) ? setShape(state.shape) : reskin(); }
+  else if (k === 'c') { state.colour = (state.colour + 1) % PALETTE.length; reskin(); }
+  else if (k === 'b') { state.bright = state.bright >= 2 ? 0.5 : state.bright + 0.5; reskin(); }
+  else if (k === 't') { state.trueSize = !state.trueSize; layout(); }
+  else if (k === 'i') {
+    const v = parseFloat(prompt('Monitor diagonal in inches (the rig monitor)', String(state.diagIn)));
+    if (v > 5) { state.diagIn = v; save('rig-diag', v); layout(); }
+  }
+  else if (k === 'r') { state.ruler = !state.ruler; applyStage(); }
+  else if (k === 'g') document.getElementById('frame').classList.toggle('hidden');
+  else if (k === 'x') { flip.x = !flip.x; applyStage(); }
+  else if (k === 'y') { flip.y = !flip.y; applyStage(); }
+  else if (k === ' ') { state.spin = !state.spin; e.preventDefault(); }
+  else if (k === '[') state.speed = Math.max(0, state.speed - 0.2);
+  else if (k === ']') state.speed = Math.min(3, state.speed + 0.2);
+  else if (k === '+' || k === '=') { state.size = Math.min(60, state.size * 1.12); applyStage(); }
+  else if (k === '-') { state.size = Math.max(0.5, state.size / 1.12); applyStage(); }
+  else if (k === 'arrowleft') { state.x -= 0.5; applyStage(); }
+  else if (k === 'arrowright') { state.x += 0.5; applyStage(); }
+  else if (k === 'arrowup') { state.y += 0.5; applyStage(); }
+  else if (k === 'arrowdown') { state.y -= 0.5; applyStage(); }
+  else if (k === 'p') { state.x = 0; state.y = -innerHeight / pxPerCm() / 2 + state.size * 0.75 + 2; applyStage(); }
+  else if (k === '0') { Object.assign(state, { size: 10, x: 0, y: 0, speed: 0.6, spin: true });
+                        flip.x = false; flip.y = true; holder.rotation.set(0, 0, 0); applyStage(); }
+  else if (k === 'h') { help.classList.toggle('hidden'); hudEl.classList.toggle('hidden'); }
+  else if (k === 'f') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+});
+
+setShape(0); layout();
+
+let last = performance.now();
+renderer.setAnimationLoop(now => {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (state.spin) { holder.rotation.y += dt * state.speed; holder.rotation.x += dt * state.speed * 0.35; }
+  renderer.render(scene, camera());
+});
+</script>
+</body>
+</html>

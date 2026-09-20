@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Camera check</title>
+<style>
+  :root { --bg:#04060b; --panel:#07111c; --line:#1d3b55; --text:#cfe8ff; --dim:#7fa3bf; --cyan:#35d0ff; --green:#7cff9b; --red:#ff6b7a; --amber:#ffb23e; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.6 system-ui, "Segoe UI", sans-serif; padding:18px; }
+  h1 { font-size:18px; color:var(--cyan); margin:0 0 4px; }
+  p { color:var(--dim); margin:4px 0 14px; }
+  button { background:#0e2a40; color:var(--text); border:1px solid #2b5a80; border-radius:8px; padding:8px 13px;
+    font-size:14px; cursor:pointer; margin-right:8px; }
+  button:hover { background:#123551; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:10px 0; }
+  .card h2 { font-size:15px; margin:0 0 6px; color:var(--text); }
+  .ok { color:var(--green); } .bad { color:var(--red); } .warn { color:var(--amber); }
+  video { width:220px; background:#000; border:1px solid var(--line); border-radius:6px; display:block; margin-top:8px; }
+  pre { white-space:pre-wrap; font:12px/1.5 ui-monospace, Consolas, monospace; color:var(--dim); margin:6px 0 0; }
+  #out { margin-top:14px; }
+</style>
+</head>
+<body>
+<h1>Camera check</h1>
+<p>Works out whether this browser will really give you two cameras at once, and if not, why.</p>
+<button id="run">Run the check</button>
+<button id="both">Try both at once (low res)</button>
+<div id="out"></div>
+<script type="module">
+const out = document.getElementById('out');
+const log = (html, cls = '') => { const d = document.createElement('div'); d.className = 'card ' + cls; d.innerHTML = html; out.appendChild(d); return d; };
+const esc = s => String(s).replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+
+// Opening one camera at a time tells permission problems apart from bandwidth problems: a second camera that
+// fails only while the first is open is almost always USB bandwidth, not permissions.
+async function openOne(dev, constraints) {
+  const t0 = performance.now();
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: dev.deviceId }, ...constraints } });
+    const s = stream.getVideoTracks()[0].getSettings();
+    return { ok: true, stream, settings: s, ms: Math.round(performance.now() - t0) };
+  } catch (err) {
+    return { ok: false, name: err.name, message: err.message, ms: Math.round(performance.now() - t0) };
+  }
+}
+
+const HINT = {
+  NotReadableError: 'The camera opened but the system would not hand over the video. Almost always USB bandwidth (two 1080p cameras on one controller) or another app holding the camera (Teams, Zoom, OBS, Windows Camera).',
+  NotAllowedError: 'Permission was refused. Click the camera icon in the address bar and allow it, or check Windows Settings, Privacy, Camera.',
+  OverconstrainedError: 'That resolution is not available on this camera. Lower it.',
+  NotFoundError: 'The camera disappeared between listing and opening (unplugged, or grabbed by another app).',
+  AbortError: 'The device failed to start. Usually a driver or a USB hub problem; try a different port.',
+};
+
+async function run(both = false) {
+  out.innerHTML = '';
+  let probe;
+  try { probe = await navigator.mediaDevices.getUserMedia({ video: true }); }
+  catch (err) { return log(`<h2 class="bad">Could not open any camera: ${esc(err.name)}</h2><pre>${esc(err.message)}\n\n${esc(HINT[err.name] || '')}</pre>`); }
+  probe.getTracks().forEach(t => t.stop());
+
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  log(`<h2>${devs.length} camera${devs.length === 1 ? '' : 's'} listed</h2><pre>${devs.map((d, i) => `${i + 1}. ${esc(d.label || '(no label)')}\n   id ${esc(d.deviceId.slice(0, 16))}...  group ${esc((d.groupId || '').slice(0, 12))}`).join('\n')}</pre>`
+    + (devs.length < 2 ? `<p class="bad">Windows is only showing one camera. Both webcams must appear here before the browser can use them: check them in the Windows Camera app first, and try different USB ports.</p>` : ''));
+  if (devs.length < 2) return;
+
+  if (!both) {
+    for (const d of devs) {
+      const r = await openOne(d, { width: { ideal: 1280 }, height: { ideal: 720 } });
+      if (r.ok) {
+        const card = log(`<h2 class="ok">Opens on its own: ${esc(d.label)}</h2><pre>${r.settings.width}x${r.settings.height} @ ${r.settings.frameRate || '?'} fps, took ${r.ms} ms</pre>`);
+        const v = document.createElement('video'); v.autoplay = true; v.muted = true; v.playsInline = true; v.srcObject = r.stream; card.appendChild(v);
+        setTimeout(() => { r.stream.getTracks().forEach(t => t.stop()); v.remove(); }, 2500);
+        await new Promise(r2 => setTimeout(r2, 2700));
+      } else {
+        log(`<h2 class="bad">Will not open: ${esc(d.label)}</h2><pre>${esc(r.name)}: ${esc(r.message)}\n\n${esc(HINT[r.name] || '')}</pre>`);
+      }
+    }
+    log(`<p>Each camera opened on its own above. Now press <b>Try both at once</b>: that is the test that matters.</p>`, 'warn');
+    return;
+  }
+
+  // both at once, stepping the resolution down until it works
+  for (const res of [[1280, 720], [960, 540], [640, 480], [320, 240]]) {
+    const streams = [];
+    let failed = null;
+    for (const d of devs.slice(0, 2)) {
+      const r = await openOne(d, { width: { ideal: res[0] }, height: { ideal: res[1] } });
+      if (r.ok) streams.push({ d, r }); else { failed = { d, r }; break; }
+    }
+    if (!failed) {
+      const card = log(`<h2 class="ok">Both cameras open together at ${res[0]}x${res[1]}</h2><pre>${streams.map(s => `${esc(s.d.label)}: ${s.r.settings.width}x${s.r.settings.height} @ ${s.r.settings.frameRate || '?'} fps`).join('\n')}</pre>`
+        + (res[0] < 1280 ? `<p class="warn">It needed the lower resolution, so this is a USB bandwidth limit. Put rigtest2's cameras at ${res[0]}x${res[1]}, or move one camera to a different USB controller.</p>` : `<p>Use this resolution in rigtest2.</p>`));
+      for (const s of streams) { const v = document.createElement('video'); v.autoplay = true; v.muted = true; v.playsInline = true; v.srcObject = s.r.stream; card.appendChild(v); }
+      setTimeout(() => streams.forEach(s => s.r.stream.getTracks().forEach(t => t.stop())), 6000);
+      return;
+    }
+    streams.forEach(s => s.r.stream.getTracks().forEach(t => t.stop()));
+    log(`<h2 class="warn">Both at ${res[0]}x${res[1]}: failed on ${esc(failed.d.label)}</h2><pre>${esc(failed.r.name)}: ${esc(failed.r.message)}\n\n${esc(HINT[failed.r.name] || '')}</pre>`);
+  }
+  log(`<h2 class="bad">The two cameras will not run at the same time, even at 320x240</h2>
+    <pre>That is not a browser limit, it is the USB path. In order of how often it works:
+1. Put the second camera on a USB port on the other side of the laptop (different controller).
+2. Avoid a shared hub; plug both straight into the laptop.
+3. Close anything else using a camera (Teams, Zoom, OBS, Windows Camera).
+4. If one is a USB 2.0 port and the camera is MJPEG-capable, it should still manage 640x480.</pre>`);
+}
+
+document.getElementById('run').addEventListener('click', () => run(false));
+document.getElementById('both').addEventListener('click', () => run(true));
+</script>
+</body>
+</html>
