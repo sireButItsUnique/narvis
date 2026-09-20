@@ -38,7 +38,7 @@ const round = (x, n = 2) => Math.round(x * 10 ** n) / 10 ** n;
 // toward them, the acrylic sheet 6 inches below the panel, black paper 6 inches below the sheet, the whole
 // screen used, the picture sent flipped; and the head tracker is two 1080p webcams at sheet height, 40
 // inches apart, angled in.
-export const SETUP_VERSION = 3;
+export const SETUP_VERSION = 4;
 export const DEFAULT_SETUP = {
   version: SETUP_VERSION,
   units: 'in',
@@ -72,6 +72,11 @@ export const DEFAULT_SETUP = {
     // null = "work it out"; aimManual is set only when the user types an angle by hand.
     toeInDeg: null, tiltUpDeg: null, aimManual: false,
     dfovDeg: 78,                // Logitech 1080p (C920-family) diagonal field of view
+    // The MEASURED relative pose (rig/paircalib.js solvePair), when the user has run step 5. It beats both
+    // the derived and the typed angles, because it is the only one of the three that came from data: the
+    // two cameras watching the user's own face from hundreds of head positions. Kept on file even when it
+    // is switched off, so "go back to the typed angles" and "use the measurement again" are both one press.
+    solved: null, useSolved: true,
   },
   head: { positionCm: [0, 40, 45], sweepXCm: 30, sweepYCm: 12 },   // where a seated viewer's eye sits
   trimCm: [0, 0, 0],            // the nudge from step 4: it corrects the TRACKER's origin, not the rig
@@ -93,6 +98,10 @@ export function mergeSetup(saved) {
   if (!(Number((saved || {}).version) >= 3)) {
     out.pair.toeInDeg = null; out.pair.tiltUpDeg = null; out.pair.aimManual = false;
   }
+  // A solved pose that is not shaped like one is dropped here rather than being handed to the triangulator
+  // to decode into nonsense. localStorage is editable by anything, and a half-written pose is not evidence.
+  if (!validPose(out.pair.solved)) out.pair.solved = null;
+  out.pair.useSolved = out.pair.useSolved !== false;
   out.version = SETUP_VERSION;
   return out;
 }
@@ -165,6 +174,13 @@ export function minimumSheetCm(rig, eyes, marginCm = 1) {
 // face. The positions are in the TRACKER frame, whose origin is the midpoint between the two, so the pair's
 // height and depth live in eyeToRig() instead of being baked in here.
 export function pairCameras(setup) {
+  // A measured pose wins: it is per CAMERA, so it can describe a pair that is not quite symmetric, which
+  // the two shared angles below cannot.
+  const solved = solvedPose(setup);
+  if (solved) return [
+    { side: 'left', posCm: solved.left.posCm.slice(), rotDeg: solved.left.rotDeg.slice() },
+    { side: 'right', posCm: solved.right.posCm.slice(), rotDeg: solved.right.rotDeg.slice() },
+  ];
   const half = setup.pair.baselineCm / 2, { toeInDeg: toe, tiltUpDeg: tilt } = pairAngles(setup);
   return [
     { side: 'left', posCm: [-half, 0, 0], rotDeg: [tilt, -toe, 180] },
@@ -172,15 +188,59 @@ export function pairCameras(setup) {
   ];
 }
 
-// The angles actually used. They are aimPair()'s answer unless the user typed one by hand, so editing the
-// baseline or where the head sits re-aims the pair instead of quietly leaving stale angles behind. These
-// angles ARE the triangulation extrinsics (cameras.js -> stereo.viewsForCamera), not decoration.
+// Is this thing a pose, or is it whatever was in localStorage? Nothing downstream re-checks, because by
+// then it is numbers in a rotation matrix.
+const num3 = a => Array.isArray(a) && a.length === 3 && a.every(Number.isFinite);
+export function validPose(p) {
+  return !!p && typeof p === 'object' && p.version === 1
+    && !!p.left && !!p.right && num3(p.left.posCm) && num3(p.left.rotDeg)
+    && num3(p.right.posCm) && num3(p.right.rotDeg) && Number.isFinite(p.baselineCm);
+}
+
+// The pose on file, and whether it is the one in use. It stops being usable when the rig it describes has
+// changed underneath it: the solve fixes the pair's ANGLES from the pictures but takes the SCALE from the
+// tape measure, so re-measuring the baseline invalidates the positions it wrote. Saying "stale" and
+// falling back is the honest answer; quietly using metre-apart cameras that are now 90 cm apart is not.
+export const POSE_BASELINE_TOL_CM = 0.5;
+export function poseStatus(setup) {
+  const p = setup.pair.solved;
+  if (!validPose(p)) return { pose: null, inUse: false, stale: false, reason: p ? 'the saved pose is not usable' : '' };
+  const drift = Math.abs(p.baselineCm - setup.pair.baselineCm);
+  if (drift > POSE_BASELINE_TOL_CM)
+    return { pose: p, inUse: false, stale: true,
+             reason: `the pair was measured at a baseline of ${round(p.baselineCm, 1)} cm and step 2 now says `
+               + `${round(setup.pair.baselineCm, 1)} cm — calibrate again, or put the baseline back` };
+  if (setup.pair.useSolved === false)
+    return { pose: p, inUse: false, stale: false, reason: 'switched off: the typed angles are in use' };
+  return { pose: p, inUse: true, stale: false, reason: '' };
+}
+export const solvedPose = (setup) => (poseStatus(setup).inUse ? setup.pair.solved : null);
+
+/** Put a fresh solve in the setup. The caller saves; this only decides what the pair is. */
+export function applySolvedPose(setup, pose) {
+  if (!validPose(pose)) return false;
+  setup.pair.solved = pose;
+  setup.pair.useSolved = true;
+  return true;
+}
+
+// The angles actually used, and where they came from. Three sources, best first:
+//   measured  solved from the user's face (step 5). Per camera, so it can be asymmetric.
+//   typed     the user measured an angle with a protractor and typed it.
+//   aimed     derived from the baseline and where the user says their head sits - a guess, and the reason
+//             step 5 exists.
+// These angles ARE the triangulation extrinsics (cameras.js -> stereo.viewsForCamera), not decoration.
 export function pairAngles(setup) {
-  const p = setup.pair, aimed = aimPair(setup);
+  const p = setup.pair, aimed = aimPair(setup), solved = solvedPose(setup);
+  if (solved) return {
+    toeInDeg: round((solved.right.rotDeg[1] - solved.left.rotDeg[1]) / 2, 1),
+    tiltUpDeg: round((solved.right.rotDeg[0] + solved.left.rotDeg[0]) / 2, 1),
+    aimed, manual: false, source: 'measured', solved,
+  };
   const manual = !!p.aimManual;
   const pick = (v, fallback) => (manual && Number.isFinite(v) ? v : fallback);
   return { toeInDeg: pick(p.toeInDeg, aimed.toeInDeg), tiltUpDeg: pick(p.tiltUpDeg, aimed.tiltUpDeg),
-           aimed, manual };
+           aimed, manual, source: manual ? 'typed' : 'aimed', solved: null };
 }
 // Where the pair's own origin sits in the rig frame.
 export const trackerOriginRig = (setup) => [0, setup.pair.heightCm, setup.pair.depthCm];
@@ -229,8 +289,25 @@ export function convergeRig(setup, angles = pairAngles(setup)) {
 // nothing on screen saying so. A tenth of a degree is aimPair's rounding (0.17 cm at this range) and one
 // degree of toe error is 1.7 cm of eye error, so two degrees is the most that can be called agreement.
 export const AIM_TOLERANCE_DEG = 2;
+// Once the pair has been MEASURED, "do the angles agree with where you say you sit" is the wrong question:
+// the head spot was only ever a stand-in for a protractor, and the measurement replaced it. What is still
+// worth saying is that the measured lenses cross somewhere you could not possibly be - that means the
+// cameras have been knocked since, or the seat has moved, and either way the measurement is out of date.
+export const MEASURED_MISS_CM = 40;
 export function aimCheck(setup) {
   const used = pairAngles(setup), aimed = used.aimed;
+  if (used.source === 'measured') {
+    const at = convergeRig(setup, used), head = v3(setup.head.positionCm);
+    const missCm = at ? Math.hypot(at[0] - head[0], at[1] - head[1], at[2] - head[2]) : Infinity;
+    const ok = missCm <= MEASURED_MISS_CM;
+    return { ok, used, aimed, dToe: round(used.toeInDeg - aimed.toeInDeg, 2),
+             dTilt: round(used.tiltUpDeg - aimed.tiltUpDeg, 2), convergeRig: at, missCm,
+             message: ok ? '' :
+               `The pair was MEASURED, and the measurement says both lenses cross ${missCm === Infinity ? 'nowhere'
+                 : `${missCm.toFixed(0)} cm from where you said your head sits`}. The pose is not a guess, so `
+               + 'either a camera has been knocked since you calibrated, or your seat has moved: re-aim them '
+               + 'and calibrate again in step 5, or update where your head sits in step 2.' };
+  }
   const dToe = used.toeInDeg - aimed.toeInDeg, dTilt = used.tiltUpDeg - aimed.tiltUpDeg;
   const ok = Math.abs(dToe) <= AIM_TOLERANCE_DEG && Math.abs(dTilt) <= AIM_TOLERANCE_DEG;
   const at = convergeRig(setup, used), head = v3(setup.head.positionCm);
@@ -582,7 +659,9 @@ export function readoutLines({ setup, rig, eyeRig, source, status, fps, check, m
       (s.solver ? `  ·  ${s.solver}` : ''),
     views.length ? `views    ${views.map(v => `${v.fps} fps ${v.latencyMs} ms`).join('  ·  ')}` : 'views    none',
     `pair     ${round(setup.pair.baselineCm / INCH_CM, 1)}" apart  ·  toe ${ang.toeInDeg} tilt ${ang.tiltUpDeg} deg`
-      + ` (${ang.manual ? 'typed' : 'aimed at the head spot'})`,
+      + ` (${{ measured: 'MEASURED from your face', typed: 'typed', aimed: 'aimed at the head spot' }[ang.source]})`
+      + (ang.source === 'measured' && ang.solved.report?.residualMm != null
+         ? `  ·  ${ang.solved.report.residualMm} mm residual` : ''),
     `render   ${fps.toFixed(0)} fps`
       + (volume ? `  ·  volume ${(volume.halfX * 2).toFixed(1)} x ${(volume.halfZ * 2).toFixed(1)} cm` : ''),
   ];

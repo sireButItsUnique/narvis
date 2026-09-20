@@ -265,8 +265,10 @@ async function openSource(dev, opts) {
 
   const src = {
     deviceId: dev.deviceId, prefKey: dev.prefKey, label: dev.label || 'camera', cls, role: dev.role,
-    width, height, fps: set.frameRate || 0, sbs, layout, calib, views, stream, track, video,
-    tasks: { face: dev.role === 'head' || dev.role === 'both', hands: dev.role === 'hands' || dev.role === 'both' },
+    width, height, fps: set.frameRate || 0, sbs, layout, calib, intr, ext, views, stream, track, video,
+    tasks: { face: dev.role === 'head' || dev.role === 'both', hands: dev.role === 'hands' || dev.role === 'both',
+             // the full face mesh, for whoever is calibrating with it; see landmarks-worker.js packMesh
+             mesh: !!opts.faceMesh && (dev.role === 'head' || dev.role === 'both') },
     gate: views.map(() => new FrameGate({ maxAgeMs: opts.maxAgeMs ?? 120 })),
     samples: views.map(() => []), workers: [], ready: views.map(() => false), detector: '?', delegate: null,
     seq: 0, error: '', live: true, lastFaceAt: -1e9, lastHandAt: -1e9, stopped: false,
@@ -710,6 +712,24 @@ export function setRole(deviceId, role) {
   const src = cams.sources.find(s => s.deviceId === deviceId);
   if (src) { src.role = role; src.tasks = { face: role === 'head' || role === 'both', hands: role === 'hands' || role === 'both' }; }
   return prefs;
+}
+
+// Move a camera without reopening it. A calibration that has just solved where the two webcams really are
+// has to take effect NOW: closing and reopening both cameras means several seconds of MediaPipe reloading,
+// and the user is standing there waiting to see whether the answer was any good. The views are rebuilt
+// from the same intrinsics, so only the pose changes.
+export function setExtrinsics(deviceId, ext) {
+  const src = cams.sources.find(s => s.deviceId === deviceId);
+  if (!src || !ext) return false;
+  src.ext = ext;
+  src.views = stereo.viewsForCamera({ width: src.width, height: src.height, sbs: src.sbs,
+                                      calib: src.calib, intr: src.intr, ext, label: src.label });
+  // The old verdict was about the old pose. Keeping it would let the grace period vouch for geometry that
+  // no longer exists, or keep showing a refusal the new pose has just fixed.
+  cams.eyeSource = 'none'; cams.eyeResidualCm = null; cams.eyeSwapHint = false; cams.lastStereoAt = -1e9;
+  note(`${src.label}: moved to ${ext.posCm.map(n => n.toFixed(1)).join(', ')} cm, `
+    + `${ext.rotDeg.map(n => n.toFixed(1)).join(', ')} deg`);
+  return true;
 }
 
 // "This one really is a ZED" (or really is not). It changes which resolutions we ask for, so it only

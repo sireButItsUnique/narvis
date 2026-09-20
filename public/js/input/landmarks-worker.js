@@ -20,8 +20,18 @@ const URLS = {
   hand: ['/vendor/models/hand_landmarker.task', `${GOOGLE}/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`],
 };
 
+// The whole 478-point face mesh, as a flat u,v Float32Array. Off by default: the eye centres are all the
+// tracker needs, and 478 points per frame per camera is bandwidth nobody asked for. Calibration is the one
+// job that wants them - the same landmark INDEX is the same physical point in both cameras, which is what
+// turns a face moving about into a calibration target (see js/rig/paircalib.js).
+function packMesh(L) {
+  const out = new Float32Array(L.length * 2);
+  for (let i = 0; i < L.length; i++) { out[i * 2] = L[i].x; out[i * 2 + 1] = L[i].y; }
+  return out;
+}
+
 const state = {
-  id: '?', tasks: { face: true, hands: true }, detector: 'auto', allowBlob: false,
+  id: '?', tasks: { face: true, hands: true, mesh: false }, detector: 'auto', allowBlob: false,
   faceLm: null, handLm: null, busy: false, canvas: null, ctx: null, lastTs: -1,
   dropped: 0, done: 0, delegate: null, kind: null,
 };
@@ -101,6 +111,8 @@ function detect(bitmap, at) {
     if (b) {
       if (state.tasks.hands) out.hands.push(blobHand(b));
       if (state.tasks.face) out.face = { eyes: [[b.u - b.r * 0.6, b.v, 0], [b.u + b.r * 0.6, b.v, 0]], synthetic: true };
+      // No mesh from a blob: one bright spot is one point, and 478 copies of it would be a calibration
+      // target made of nothing. Calibration refuses a short mesh rather than fitting a pose to a lamp.
     }
     return out;
   }
@@ -115,6 +127,7 @@ function detect(bitmap, at) {
       const a = L[468] ? [L[468].x, L[468].y, L[468].z] : mid(L[33], L[133]);   // iris centres when present
       const b = L[473] ? [L[473].x, L[473].y, L[473].z] : mid(L[362], L[263]);
       out.face = { eyes: [a, b], nose: L[1] ? [L[1].x, L[1].y, L[1].z] : null };
+      if (state.tasks.mesh) out.face.mesh = packMesh(L);
     }
   }
   if (state.handLm) {
@@ -135,7 +148,7 @@ self.onmessage = async (e) => {
   const m = e.data;
   if (m.t === 'init') {
     state.id = m.id ?? '?';
-    state.tasks = { face: !!m.tasks?.face, hands: !!m.tasks?.hands };
+    state.tasks = { face: !!m.tasks?.face, hands: !!m.tasks?.hands, mesh: !!m.tasks?.mesh };
     state.detector = m.detector || 'auto';
     state.allowBlob = !!m.allowBlob;
     try {

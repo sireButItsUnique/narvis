@@ -53,9 +53,13 @@
     background:#ffb23e; border-radius:6px; padding:5px 12px; font-weight:600; }
   /* near the top of the RENDER, which is the bottom of the reflection: the volume sits in the middle and a
      panel across it would hide the very thing the user is trying to stop swimming */
-  #trimflag { position:fixed; left:50%; top:6%; transform:translateX(-50%); z-index:9; text-align:center;
+  #trimflag, #calflag { position:fixed; left:50%; top:6%; transform:translateX(-50%); z-index:9; text-align:center;
     background:rgba(4,6,11,.92); border:1px solid #35d0ff; border-radius:10px; padding:12px 16px; max-width:560px; }
-  #trimflag b { color:#35d0ff; }
+  #trimflag b, #calflag b { color:#35d0ff; }
+  /* the calibration wants the user moving round the volume, so its progress has to be readable from there */
+  #calflag { font-size:15px; }
+  #calflag .bar { height:6px; background:#0b1a29; border-radius:3px; margin:8px 0 4px; overflow:hidden; }
+  #calflag .bar i { display:block; height:100%; background:#35d0ff; }
 
   /* setup */
   #setup { position:fixed; inset:0; z-index:20; background:#04060b; overflow:auto; padding:18px 20px 40px; }
@@ -101,6 +105,7 @@
   <div id="banner" class="hidden"></div>
   <div id="mouseflag" class="hidden">MOUSE STAND-IN — this is not head tracking</div>
   <div id="trimflag" class="hidden"></div>
+  <div id="calflag" class="hidden"></div>
   <div id="readout" class="hidden"></div>
   <div id="hint" class="hidden"></div>
 </div>
@@ -111,13 +116,16 @@
 
 <div id="setup" class="hidden">
   <h1>rigtest2 setup</h1>
-  <p class="note">Four steps, a couple of minutes. Everything is saved in this browser as you go.
-    Press <b>S</b> at any time to come back here, <b>Esc</b> to go to the rig view.</p>
+  <p class="note">Five steps, a few minutes. Everything is saved in this browser as you go.
+    Press <b>S</b> at any time to come back here, <b>Esc</b> to go to the rig view.
+    Steps 1 to 4 get the rig running; <b>step 5 replaces the guessed camera angles with measured ones</b>,
+    and is the one that stops the hologram swimming as you move.</p>
   <div class="steps">
     <button data-step="1">1 · cameras</button>
     <button data-step="2">2 · the pair</button>
     <button data-step="3">3 · the rig</button>
     <button data-step="4">4 · trim</button>
+    <button data-step="5">5 · calibrate the pair</button>
     <span style="flex:1"></span>
     <button id="exportBtn">Export JSON</button>
     <button id="resetBtn">Reset to this rig</button>
@@ -215,6 +223,48 @@
       <button id="trimZero">Zero the trim</button>
     </div>
   </section>
+
+  <section class="panel" data-panel="5">
+    <h2>Measure the pair from your own face</h2>
+    <p class="note">The two angles in step 2 are <b>worked out</b> from where you said your head sits — they are
+      a good guess, not a measurement, and a guess that is one degree off moves your tracked head about a
+      centimetre at arm's length. That is not something the trim in step 4 can fix: a trim is a constant
+      shift, and an angle error shifts you differently depending on where you stand, which is exactly what
+      "the hologram swims" means. So measure the angles instead.
+      <b>Your face is the calibration target.</b> Both cameras already find the same 478 points on it, so
+      moving your head round the volume gives hundreds of matched points per second and no printed pattern
+      to hold. Press Start capture, then move about where you normally sit: left and right, nearer and
+      further, higher and lower. The flag on the glass says what is still missing. Then press Solve.
+      <b class="warn">The scale cannot come from your face</b> — two cameras watching a face can only see
+      their pose relative to each other, never how big the world is — so it comes from the baseline you
+      measured in step 2. Measure that one with a tape.</p>
+    <div class="row" style="margin-top:0">
+      <button id="calStart" class="primary">Start capture</button>
+      <button id="calStop">Stop</button>
+      <button id="calSolve">Solve</button>
+      <button id="calClear">Throw the capture away</button>
+      <label class="f" style="margin:0;flex:0 0 auto"><input type="checkbox" id="calPolish" style="width:auto">
+        <span>polish with bundle adjustment (slower)</span></label>
+    </div>
+    <div class="mono" id="calProgress" style="margin-top:10px"></div>
+    <div class="mono" id="calResult" style="margin-top:10px"></div>
+    <div class="row">
+      <button id="calUse">Use the measured pose</button>
+      <button id="calRevert">Go back to the typed angles</button>
+      <button id="calForget">Forget the measurement</button>
+    </div>
+
+    <h2 style="margin-top:20px">Then prove it, without taking anything on faith</h2>
+    <p class="note">Put your head at the spot you told the page about in step 2 (<span id="holdSpot"></span>),
+      hold still, and this reports how far the measured pair thinks you are from it. A calibration that
+      cannot survive that is not a calibration. Whatever constant offset is left is what step 4's trim is
+      for — the trim still exists, and it still does the same job.</p>
+    <div class="row" style="margin-top:0">
+      <button id="holdStart" class="primary">Hold still at the spot</button>
+      <button id="holdStop">Stop</button>
+    </div>
+    <div class="mono" id="holdOut" style="margin-top:10px"></div>
+  </section>
 </div>
 
 <!-- Same map as index.html: the server serves /vendor when `npm run vendor` has been run and redirects to
@@ -231,7 +281,8 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { rigCamera, applyRigCamera, modelRigMatrix, rigCheck } from './js/rig/geometry.js';
 import * as RT from './js/rig/rigtest2.js';
-import { startCameras, stopCameras, camerasStatus, cams } from './js/input/cameras.js';
+import * as PC from './js/rig/paircalib.js';
+import { startCameras, stopCameras, camerasStatus, setExtrinsics, cams } from './js/input/cameras.js';
 import * as devices from './js/input/devices.js';
 import { input } from './js/input/state.js';
 
@@ -251,6 +302,9 @@ let sceneKind = params.get('scene') || 'cube';
 let source = { ok: false, reason: 'none', message: '' };
 let rc = null, check = null, viewport = null;
 let droppedName = '';
+// step 5: measuring the pair instead of guessing it
+let capture = null, capturing = false, calibResult = null, hold = null;
+let lastMesh = { a: -1, b: -1 };
 
 // ---------------------------------------------------------------- renderer
 // preserveDrawingBuffer so the headless test can read the framebuffer back and say where a known point
@@ -479,6 +533,7 @@ addEventListener('fullscreenchange', () => layout());
 let frames = 0, fpsAt = performance.now(), fps = 0;
 function frame(now) {
   updateEye();
+  calibTick(now);
   rc = rigCamera(rig, eyeRig, { viewport });
   applyRigCamera(camera, rc);
   applyFlips();
@@ -527,13 +582,14 @@ function paintChrome() {
     r.textContent = RT.readoutLines({ setup, rig, eyeRig, source, status: cams.running ? camerasStatus() : null,
                                       fps, check, mouse: mouseMode, volume: vol, aim }).join('\n');
   if (trimMode) paintTrim();
+  if (capturing || hold) paintCalib();
 }
 const escapeHtml = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
 function hint() {
   $('hint').textContent = [
     `scene: ${sceneKind}${droppedName ? ' (' + droppedName + ')' : ''}   1 cube · 2 posts · 3 teapot · 4 dropped .glb`,
-    'S setup   H readout   M mouse stand-in   T trim   F fullscreen   X panel mounted upside down   V flip the setup page too',
+    'S setup   H readout   M mouse stand-in   T trim   C calibrate the pair   F fullscreen   X panel mounted upside down   V flip the setup page too',
   ].join('\n');
 }
 
@@ -670,7 +726,9 @@ async function start() {
     }
   }
   try {
-    await startCameras({ prefs, ext, extById, status: m => { if (m) flash(m); },
+    // faceMesh: the whole 478-point mesh, not just the eye centres. It is what step 5 calibrates from -
+    // same index, same physical point, in both cameras - and it costs nothing when nobody is calibrating.
+    await startCameras({ prefs, ext, extById, faceMesh: true, status: m => { if (m) flash(m); },
                          detector: params.get('detector') || 'auto', allowBlob: params.get('allowBlob') === '1' });
   } catch (e) { flash('Cameras failed: ' + (e?.message || e)); }
   paintCams();
@@ -696,7 +754,10 @@ navigator.mediaDevices?.addEventListener?.('devicechange', () => {
 function save() { RT.saveSetup(setup); }
 // layout(false): the rebuild is right here, so letting layout schedule a second one would build twice and
 // re-fetch the .glb for nothing.
-function rebuild() { rig = RT.rigFromSetup(setup); layout(false); buildScene(); paintForm(); }
+// pushExtrinsics: the running cameras were posed when they were opened, so anything that changes the pair -
+// the baseline, the angles, a fresh calibration, reverting one - has to reach them or the page would be
+// showing one geometry and triangulating with another.
+function rebuild() { rig = RT.rigFromSetup(setup); layout(false); buildScene(); pushExtrinsics(); paintForm(); }
 
 const U = () => setup.units;
 const setNum = (id, cm) => { $(id).value = RT.fromCm(cm, U()).toFixed(2).replace(/\.?0+$/, ''); };
@@ -715,6 +776,7 @@ function paintForm() {
   setNum('sheetW', r.sheetWidthCm); setNum('sheetD', r.sheetDepthCm); setNum('fit', r.modelFitCm);
   $('rot180').checked = !!r.rot180; $('fullscreen').checked = !!r.fullScreen;
 
+  paintCalib();
   const pc = RT.pairCameras(setup), o = RT.trackerOriginRig(setup);
   // These angles ARE the triangulation extrinsics, so a disagreement between them and where the user says
   // they sit is not a note for later: it decides where the tracker thinks their head is. Both numbers are
@@ -725,9 +787,10 @@ function paintForm() {
     `right camera at rig ${pc[1].posCm.map((n, i) => (n + o[i]).toFixed(1).padStart(6)).join(' ')} cm`,
     `tracker origin is rig ${o.map(n => n.toFixed(1)).join(', ')} cm`,
     at ? `both lenses point at rig ${at.map(n => n.toFixed(1)).join(', ')} cm` : 'the two lenses never meet',
-    aim.ok ? (aim.used.manual ? 'angles: typed, and they agree with where your head sits'
-                              : 'angles: worked out from where your head sits')
-           : `\nWARNING — ${aim.message}`,
+    { measured: 'angles: MEASURED from your own face in step 5',
+      typed: 'angles: typed, and they agree with where your head sits',
+      aimed: 'angles: worked out from where your head sits' }[aim.used.source]
+      + (aim.ok ? '' : `\nWARNING — ${aim.message}`),
   ].join('\n');
   $('pairOut').className = aim.ok ? 'mono' : 'mono warn';
 
@@ -817,13 +880,171 @@ function showSetup(on) {
 function setTrim(on) {
   trimMode = on;
   $('trimflag').classList.toggle('hidden', !on);
-  if (on) { trimBackup = setup.trimCm.slice(); paintTrim(); }
+  if (on) { if (capturing) setCapture(false); trimBackup = setup.trimCm.slice(); paintTrim(); }
 }
 let trimBackup = [0, 0, 0];
 function nudge(axis, amount) {
   setup.trimCm[axis] += amount;
   save(); paintTrim(); paintForm();
 }
+
+// ---------------------------------------------------------------- calibrating the pair (step 5)
+
+// The two cameras that are supposed to be watching the head, as running sources.
+function calibSources() {
+  const find = side => cams.sources.find(s => s.deviceId === setup.cameras[side]?.deviceId);
+  const L = find('left'), R = find('right');
+  return L && R && L !== R ? { L, R } : null;
+}
+// The lens only: the solve works out the pose, so handing it one would be handing it the answer. The sizes
+// come from the running cameras when there are any, because the landmarks are normalised to THAT picture.
+function calibLenses() {
+  const s = calibSources();
+  const mk = src => PC.lensOnly({ width: src?.layout.eyeW || 1280, height: src?.layout.eyeH || 720,
+                                  dfovDeg: setup.pair.dfovDeg });
+  return [mk(s?.L), mk(s?.R)];
+}
+// The newest sample from this camera that actually carries a mesh. MediaPipe posts face:null on a miss and
+// those land in the same ring, so ring[last] alone would throw away a camera for one blink.
+function newestMesh(src) {
+  const ring = src.samples[0];
+  for (let i = ring.length - 1; i >= 0; i--) if (ring[i]?.face?.mesh) return ring[i];
+  return null;
+}
+
+function setCapture(on) {
+  capturing = !!on;
+  if (on) {
+    if (trimMode) setTrim(false);                 // one flag on the glass at a time
+    if (!capture) capture = PC.makeCapture();
+    lastMesh = { a: -1, b: -1 };
+    if (!calibSources()) flash('Start both cameras in step 1 first');
+  }
+  $('calflag').classList.toggle('hidden', !on);
+  paintCalib();
+}
+
+function calibTick(now) {
+  if (hold && source.usable && !mouseMode) { hold.feed(eyeRig, now); paintHold(); }
+  if (!capturing || !capture) return;
+  const s = calibSources();
+  if (!s) return;
+  const a = newestMesh(s.L), b = newestMesh(s.R);
+  if (!a || !b) return;
+  if (a.seq === lastMesh.a && b.seq === lastMesh.b) return;   // the same two frames as last time
+  lastMesh = { a: a.seq, b: b.seq };
+  capture.add({ tA: a.at, tB: b.at, a: a.face.mesh, b: b.face.mesh });
+  const p = capture.progress();
+  paintCalib(p);
+  if (p.ready && p.frames >= capture.cfg.maxFrames) { setCapture(false); flash('Captured enough — press Solve'); }
+}
+
+function calibSolve() {
+  if (!capture || capture.frames.length < 2) { flash('Capture something first'); return null; }
+  const used = RT.pairAngles(setup);
+  const [camA, camB] = calibLenses();
+  calibResult = PC.solvePair({
+    frames: capture.frames, camA, camB, baselineCm: setup.pair.baselineCm,
+    // The angles being replaced are the sanity check AND the one degree of freedom a face cannot show:
+    // rolling the whole pair about its own baseline is invisible, so the common tilt stays as it was.
+    typed: { toeInDeg: used.toeInDeg, tiltUpDeg: used.tiltUpDeg },
+    opts: { polish: $('calPolish').checked },
+  });
+  if (calibResult.ok) { RT.applySolvedPose(setup, calibResult.pose); save(); rebuild(); }
+  paintCalib();
+  flash(calibResult.ok ? 'Measured — the pair now uses the solved pose'
+                       : 'Refused: ' + calibResult.reasons.map(r => r.code).join(', ') + ' — the typed angles are kept');
+  return calibResult;
+}
+
+// A pose is only real once the running cameras are using it. Reopening them would mean several seconds of
+// MediaPipe reloading while the user waits to find out whether the answer was any good.
+function pushExtrinsics() {
+  if (!cams.running) return;
+  const pc = RT.pairCameras(setup);
+  for (const [side, i] of [['left', 0], ['right', 1]]) {
+    const id = setup.cameras[side]?.deviceId;
+    if (id) setExtrinsics(id, { posCm: pc[i].posCm, rotDeg: pc[i].rotDeg });
+  }
+}
+
+function useSolved(on) {
+  setup.pair.useSolved = !!on;
+  save(); rebuild();
+  flash(on ? 'Using the measured pose' : 'Back to the angles worked out from where your head sits');
+}
+
+function paintCalib(p = null) {
+  const prog = p || (capture ? capture.progress() : null);
+  const st = RT.poseStatus(setup), ang = RT.pairAngles(setup);
+  if (!$('calflag').classList.contains('hidden')) {
+    const pct = Math.round((prog?.fraction || 0) * 100);
+    $('calflag').innerHTML = `<b>Measuring the pair from your face</b>`
+      + `<div class="bar"><i style="width:${pct}%"></i></div>`
+      + PC.captureLines(prog || { frames: 0, minFrames: 0, binsFilled: 0, minBins: 0, missing: [], ready: false })
+          .map(escapeHtml).join('<br>')
+      + `<br>Move about where you sit. C stops, S goes to the setup page to solve.`;
+  }
+  if (!setupVisible()) return;
+  $('calProgress').textContent = prog
+    ? [`${prog.frames} usable views (want ${prog.minFrames}+, cap ${prog.maxFrames})`,
+       `${prog.binsFilled} of ${prog.binsTotal} parts of the volume seen (want ${prog.minBins}+)`,
+       `left/right ${prog.axes.lateral.join(' ')}   ·   near/far ${prog.axes.depth.join(' ')}   ·   up/down ${prog.axes.height.join(' ')}`,
+       prog.missing.length ? 'still missing: ' + prog.missing.join(', ')
+                           : (prog.ready ? 'spread is good — press Solve' : 'keep moving'),
+       `dropped: ${prog.skipped.skew} out of step, ${prog.skipped.soon} too soon, ${prog.skipped.binFull} from a full bin, ${prog.skipped.noFace} with no face`,
+      ].join('\n')
+    : 'nothing captured yet';
+  $('calResult').textContent = calibResult ? PC.solveLines(calibResult).join('\n')
+    : (st.pose ? `a pose from ${st.pose.savedAt || 'an earlier session'} is on file` : 'not calibrated');
+  $('calResult').className = 'mono ' + (calibResult ? (calibResult.ok ? 'good' : 'bad') : '');
+  const inUse = `\nin use: ${{ measured: 'the MEASURED pose', typed: 'the angles you typed',
+                               aimed: 'angles worked out from where your head sits' }[ang.source]}`
+    + (st.stale ? `\nWARNING — ${st.reason}` : '');
+  $('calResult').textContent += inUse;
+  $('calUse').classList.toggle('on', st.inUse);
+  $('calRevert').classList.toggle('on', !st.inUse && !!st.pose);
+  $('holdSpot').textContent = setup.head.positionCm.map(n => n.toFixed(0)).join(', ') + ' cm from the sheet centre';
+  paintHold();
+}
+
+// The live proof, whether or not the hold check is running: where the pair says the head is RIGHT NOW, and
+// how far the two cameras' rays missed each other getting there. A pose with a beautiful solve report and a
+// two-centimetre ray miss is not calibrated, and the user should be able to see that without a stopwatch.
+function paintHold() {
+  if (!setupVisible()) return;
+  const st = cams.running ? camerasStatus() : null;
+  const r = hold ? hold.result(performance.now()) : null;
+  const ang = RT.pairAngles(setup);
+  const lines = [
+    source.usable && !mouseMode
+      ? `tracked head now ${eyeRig.map(n => n.toFixed(1).padStart(6)).join(' ')} cm`
+        + (st?.eyeResidualCm != null ? `   ·   the two rays miss by ${(st.eyeResidualCm * 10).toFixed(1)} mm` : '')
+      : `not tracking your head: ${mouseMode ? 'the mouse stand-in is on (press M)' : (source.message || 'waiting for both cameras')}`,
+    ang.source === 'measured' && ang.solved.report
+      ? `the solve that posed this pair: ${ang.solved.report.residualMm} mm residual over `
+        + `${ang.solved.report.inliers} matched points` : '',
+    '',
+    r ? r.message : 'press "Hold still at the spot" when you are standing where you said you sit',
+    r?.n ? `average ${r.meanCm.join(', ')} cm   ·   you said ${setup.head.positionCm.map(n => n.toFixed(1)).join(', ')} cm` : '',
+    r?.n ? `off by ${r.offsetCm.join(', ')} cm   ·   ${r.distanceCm} cm in all   ·   you held to ${r.wobbleMm.join('/')} mm` : '',
+    r?.done ? 'whatever is left over and CONSTANT is what step 4\'s trim is for; what changes as you move is not.' : '',
+  ];
+  $('holdOut').textContent = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+$('calStart').onclick = () => setCapture(true);
+$('calStop').onclick = () => setCapture(false);
+$('calSolve').onclick = () => { setCapture(false); calibSolve(); };
+$('calClear').onclick = () => { capture = PC.makeCapture(); calibResult = null; paintCalib(); };
+$('calUse').onclick = () => { if (setup.pair.solved) useSolved(true); else flash('Nothing measured yet'); };
+$('calRevert').onclick = () => useSolved(false);
+$('calForget').onclick = () => {
+  if (!confirm('Throw the measured pose away and go back to the angles worked out from where your head sits?')) return;
+  setup.pair.solved = null; calibResult = null; save(); rebuild(); paintCalib();
+};
+$('holdStart').onclick = () => { hold = PC.makeHoldCheck({ expectedCm: setup.head.positionCm.slice() }); paintHold(); };
+$('holdStop').onclick = () => { hold = null; paintHold(); };
 
 // ---------------------------------------------------------------- input
 
@@ -862,6 +1083,9 @@ addEventListener('keydown', e => {
   else if (k === 'h') { const on = $('readout').classList.toggle('hidden'); $('hint').classList.toggle('hidden', on); }
   else if (k === 'm') { mouseMode = !mouseMode; pinnedEye = null; flash(mouseMode ? 'Mouse stand-in ON — not head tracking' : 'Mouse stand-in off'); }
   else if (k === 't') setTrim(!trimMode);
+  // Calibration is done on your feet, moving about the volume, so it has to start and stop from the rig
+  // view as well as from the setup page.
+  else if (k === 'c') setCapture(!capturing);
   // NOT a flip-axis toggle. The mirror parity is forced by the optics and rigCamera derives it, and the
   // two axes differ only by a roll the flip cancels - so the old X key changed nothing about the hologram
   // and left every word on the glass upside down. What a person at the rig can actually be wrong about is
@@ -925,6 +1149,32 @@ window.rigtest2 = {
       pixels: readProbePixel(),                                       // what is actually lit on the canvas
       canvas: { w, h }, transform: canvas.style.transform, overlayTransform: overlay.style.transform,
     };
+  },
+  // Step 5, driven from outside. feed() is the ONE stub: it stands in for two webcams and MediaPipe, which
+  // a headless browser has neither of. Everything after it - the bins, the progress, the solve, applying
+  // the pose, saving it, reverting - is the same code the rig runs.
+  calib: {
+    start: () => { setCapture(true); return !!capture; },
+    stop: () => { setCapture(false); return capture ? capture.frames.length : 0; },
+    feed: (f) => { if (!capture) capture = PC.makeCapture(); const r = capture.add(f); paintCalib(); return r; },
+    progress: () => (capture ? capture.progress() : null),
+    solve: () => { const r = calibSolve(); return r && { ok: r.ok, reasons: (r.reasons || []).map(x => x.code),
+                                                         report: r.report, lines: PC.solveLines(r) }; },
+    pose: () => setup.pair.solved,
+    status: () => RT.poseStatus(setup),
+    angles: () => { const a = RT.pairAngles(setup); return { toeInDeg: a.toeInDeg, tiltUpDeg: a.tiltUpDeg, source: a.source }; },
+    cameras: () => RT.pairCameras(setup),
+    use: on => { useSolved(on); return RT.poseStatus(setup).inUse; },
+    forget: () => { setup.pair.solved = null; calibResult = null; save(); rebuild(); return true; },
+    flag: () => ($('calflag').classList.contains('hidden') ? null : $('calflag').textContent),
+    panel: () => ({ progress: $('calProgress').textContent, result: $('calResult').textContent,
+                    hold: $('holdOut').textContent }),
+    hold: {
+      start: () => { hold = PC.makeHoldCheck({ expectedCm: setup.head.positionCm.slice() }); return true; },
+      feed: (p, at) => { const r = hold && hold.feed(p, at); paintHold(); return r; },
+      result: () => hold && hold.result(performance.now()),
+      stop: () => { hold = null; return true; },
+    },
   },
   status: () => ({ source, mouseMode, sceneKind, fps, flip: RT.flipTransform(rc),
                    overlayFlip: RT.overlayFlip(rig, eyeRig), aim: RT.aimCheck(setup),
