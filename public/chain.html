@@ -368,6 +368,7 @@ function frame(now) {
   requestAnimationFrame(frame);
   if (current === 'sim' || current === 'both') feedCameras(now);
   solver.step(input, now);
+  servePendingPlacement();
 
   const state = chain.step(input, bodies, now);
   for (const b of bindings) b.apply();
@@ -471,19 +472,46 @@ $('b-reset').onclick = () => {
   });
 };
 
+// Handing a part to a hand that is about to close on it. Putting it where the hand was ON AVERAGE is no
+// good: the bridge's hand sweeps a volume about 20 cm across and shuts its fingers once every 3 s, so the
+// centre of that sweep is regularly further from the pinch than grabRadius (7 cm) allows. Wait instead for
+// the fingers to be nearly shut - the input closes the pinch at 2.5 cm, and the last centimetre of that
+// takes about 0.2 s, in which the hand moves ~3 cm - and put the part there, leaving the open hand frames
+// to aim: grab takes what the hand was nearest up to 400 ms BEFORE the pinch, not at the pinch.
+const CLOSING_CM = 3.5;
+let placeWhenClosing = null;
+
+function placeBody(id, p) {
+  const bnd = bindings.find(b => b.body.id === id);
+  if (!bnd) return false;
+  chain.grab.reset();
+  bnd.body.pose = { position: { x: p[0], y: p[1], z: p[2] }, quaternion: { x: 0, y: 0, z: 0, w: 1 }, scale: 1 };
+  bnd.apply();
+  return true;
+}
+
+function servePendingPlacement() {
+  if (placeWhenClosing == null) return;
+  const h = input.hands.find(x => x.active);
+  if (!h || h.pinch || !Number.isFinite(h.tip.x)) return;
+  if (!Number.isFinite(h.pinchCm) || h.pinchCm > CLOSING_CM) return;
+  const id = placeWhenClosing;
+  placeWhenClosing = null;
+  placeBody(id, [h.tip.x, h.tip.y, h.tip.z]);
+}
+
 window.__chain = {
   metrics, events, input, solver, grab: chain.grab, bodies,
   setSource, setBridge, reset: () => $('b-reset').onclick(),
   // Put a part somewhere: the bridge's hands sweep their own volume, so a test has to move the model into
   // reach of them rather than assume the two happen to overlap.
-  place(id, p) {
-    const bnd = bindings.find(b => b.body.id === id);
-    if (!bnd) return false;
-    chain.grab.reset();
-    bnd.body.pose = { position: { x: p[0], y: p[1], z: p[2] }, quaternion: { x: 0, y: 0, z: 0, w: 1 }, scale: 1 };
-    bnd.apply();
+  place: placeBody,
+  placeOnNextPinch(id) {
+    if (!bindings.some(b => b.body.id === id)) return false;
+    placeWhenClosing = id;
     return true;
   },
+  placementPending: () => placeWhenClosing != null,
   set noisePx(v) { noisePx = v; }, get noisePx() { return noisePx; },
   restartScript: () => { t0 = performance.now(); tipErr = []; meter.reset(); events.length = 0; },
   ready: true,

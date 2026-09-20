@@ -171,8 +171,10 @@ try {
   check(m.hands[0].active, 'bridge hands reached input/state.js in world centimetres', m.hands[0].tip.join(', ') + ' cm');
 
   // The fake bridge's hands sweep their OWN volume, which has nothing to do with where the sim script left
-  // the teapot. Watch where the bridge's grip point actually goes for a couple of seconds, put the model in
-  // the middle of that, and then wait: the fake source closes a pinch once every 3 s.
+  // the teapot. The middle of that sweep is not the answer either: the hand covers about 20 cm and pinches
+  // once every 3 s, so where it averages out is regularly further from where it shuts than the 7 cm grab
+  // radius allows, and this check used to fail perhaps one run in three. Ask the page to hand the teapot
+  // over at the moment the fingers are already closing instead, which is the only position that matters.
   const seen = [];
   for (let i = 0; i < 20; i++) {
     const s = await b.metrics();
@@ -180,9 +182,12 @@ try {
     await sleep(100);
   }
   check(seen.length > 10, 'the bridge hand was seen moving', `${seen.length} samples`);
-  const mid = [0, 1, 2].map(k => seen.reduce((a, p) => a + p[k], 0) / seen.length);
-  console.log(`      bridge hand sweeps around ${mid.map(v => v.toFixed(1)).join(', ')} cm; putting the teapot there`);
-  await b.evaluate(`window.__chain.place('teapot', [${mid.map(v => v.toFixed(3)).join(',')}])`);
+  const spread = [0, 1, 2].map(k => Math.max(...seen.map(p => p[k])) - Math.min(...seen.map(p => p[k])));
+  console.log(`      bridge hand sweeps ${spread.map(v => v.toFixed(1)).join(' x ')} cm in 2 s; waiting for it to close`);
+  await b.evaluate("window.__chain.placeOnNextPinch('teapot')");
+  for (let i = 0; i < 50 && await b.evaluate('window.__chain.placementPending()'); i++) await sleep(100);
+  check(!(await b.evaluate('window.__chain.placementPending()')), 'the teapot was put where the hand was closing',
+        (await b.metrics()).bodies.find(x => x.id === 'teapot').pos.join(', ') + ' cm');
 
   let bridgeGrabs = [];
   for (let i = 0; i < 12 && !bridgeGrabs.length; i++) {
