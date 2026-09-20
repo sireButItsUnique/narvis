@@ -17,7 +17,6 @@ import { parseCommand, parseTyped, heardCommand, WAKE } from './commands.js';
 import { quip, quipFor } from './narvis.js';
 import { createVoice, createCloudVoice } from './voice.js';
 import { createSpeaker } from './speak.js';
-import { startSentry, tag } from './observability.js';
 import { downloadScene, downloadBlend } from './export.js';
 
 // ---------- UI ----------
@@ -114,7 +113,6 @@ $('btn-cam').addEventListener('click', async () => {
   const v = parseFloat($('s-diag').value); if (v > 5) { S.diagIn = v; saveSettings(); }
   try {
     await startCamera(status);
-    tag('mode', 'camera');
     begin();
     try { await document.documentElement.requestFullscreen(); } catch (e) {}
   } catch (e) {
@@ -125,7 +123,6 @@ $('btn-cam').addEventListener('click', async () => {
 $('btn-mouse').addEventListener('click', async () => {
   const v = parseFloat($('s-diag').value); if (v > 5) { S.diagIn = v; saveSettings(); }
   input.mode = 'mouse';
-  tag('mode', 'mouse');
   begin();
   try { await document.documentElement.requestFullscreen(); } catch (e) {}
 });
@@ -206,13 +203,12 @@ function useVoiceEngine(kind) {
   if (wasOn) voice.start();
 }
 
-// which integrations the server has keys for: ElevenLabs voice, Sentry, where version history is kept
+// which integrations the server has keys for: ElevenLabs voice, where version history is kept
 fetch('/api/config').then(r => r.json()).then(config => {
   if (config.voice === 'elevenlabs') {
     useVoiceEngine('elevenlabs');
     speaker = createSpeaker({ engine: 'elevenlabs', onTalking: on => voice.mute(on) });
   }
-  startSentry(config).catch(err => console.warn(err.message));
 }).catch(() => {});
 
 // ---------- typed commands (press /) ----------

@@ -10,7 +10,6 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import * as Sentry from '@sentry/node';
 import { HOME, CURRENT_BLEND } from './history.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -283,10 +282,10 @@ export class BlenderProcess extends EventEmitter {
       const f = path.join(os.tmpdir(), 'blender.crash.txt');   // Blender writes this one on a hard crash
       if (Date.now() - fs.statSync(f).mtimeMs < 120000) crash = fs.readFileSync(f, 'utf8').slice(0, 8000);
     } catch {}
-    Sentry.captureMessage(`Headless Blender exited (code ${code})${asked ? `: ${asked}` : ''}`, {
-      level: asked ? 'warning' : 'error',
-      extra: { code, signal, asked, restarts: this.#restarts, log: this.logTail(60).join('\n'), crash },
-    });
+    console[asked ? 'warn' : 'error'](
+      `[blender] headless Blender exited (code ${code})${asked ? `: ${asked}` : ''}`,
+      { code, signal, restarts: this.#restarts, crash: crash ? crash.slice(0, 400) : null });
+    if (!asked) console.error(this.logTail(20).join('\n'));
   }
 }
 

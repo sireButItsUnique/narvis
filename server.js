@@ -4,7 +4,6 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import * as Sentry from '@sentry/node';
 import { bridge, buildInBlender, blenderModel, BridgeError } from './server/blender.js';
 import { blender } from './server/blender-process.js';
 import { loadScene, watchBlender, sceneRoute, sceneInfo, publish, lock, busyWith, SceneError } from './server/scene.js';
@@ -240,7 +239,6 @@ async function blenderBuild(req, res) {
                                       model: blenderModel(), steps, sources: [...sources].map(([url, title]) => ({ url, title })) });
         send({ type: 'saved', version: v });
       } catch (err) {
-        Sentry.captureException(err);
         console.error('[history] save failed:', err.message);
         send({ type: 'status', text: '' });
         send({ type: 'warn', message: `Built, but couldn't save a version: ${err.message}` });
@@ -248,7 +246,6 @@ async function blenderBuild(req, res) {
     }
   } catch (err) {
     if (!controller.signal.aborted) {
-      Sentry.captureException(err);
       console.error('[blender] failed:', err.message);
       emit({ type: 'error', message: err instanceof BridgeError || err instanceof SceneError ? err.message : `Couldn't build it: ${err.message}` });
     } else {
@@ -304,7 +301,7 @@ async function historyRoute(req, res, pathname) {
     }
   } catch (err) {
     const known = err instanceof VersionError || err instanceof BridgeError || err instanceof SceneError;
-    if (!known) { Sentry.captureException(err); console.error('[history]', err); }
+    if (!known) console.error('[history]', err);
     sendJson(res, err instanceof VersionError ? 400 : 502, { ok: false, error: err.message });
   }
 }
@@ -345,17 +342,15 @@ async function voiceRoute(req, res, pathname) {
     sendJson(res, 404, { error: 'not_found' });
   } catch (err) {
     if (ac.signal.aborted) return;
-    Sentry.captureException(err);
     console.error('[voice]', err.message);
     if (!res.headersSent) sendJson(res, 502, { error: 'voice_failed', message: err.message });
     else res.destroy();
   }
 }
 
-// what the page needs to know at startup; the Sentry DSN is public by design (it's only for sending events)
+// what the page needs to know at startup
 function config(res) {
   sendJson(res, 200, {
-    sentryDsn: (process.env.SENTRY_DSN || '').trim() || null,
     voice: voiceAvailable() ? 'elevenlabs' : 'browser',
     history: historyInfo().kind,
     textures: textureToolAvailable(),
@@ -427,7 +422,6 @@ http.createServer((req, res) => {
   console.log(`serving on http://localhost:${PORT}  (open it in Edge for voice)`);
   console.log(hasKey() ? `Builds: ${blenderModel()} in a hidden Blender` : 'Builds: no ANTHROPIC_API_KEY in .env yet, so "make a ___" is off; local commands still work');
   console.log(`Voice: ${voiceAvailable() ? 'ElevenLabs (Scribe v2 in, Flash voice out)' : "the browser's (add ELEVENLABS_API_KEY for ElevenLabs)"}`);
-  console.log(`Sentry: ${(process.env.SENTRY_DSN || '').trim() ? 'on' : 'off (add SENTRY_DSN)'}`);
   if (!fs.existsSync(path.join(root, 'vendor'))) console.log('Warning: no public/vendor, so three.js and MediaPipe come from jsDelivr; run "npm run vendor" to work offline');
   blender.start();
   warmUp();

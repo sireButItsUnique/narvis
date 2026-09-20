@@ -2,7 +2,6 @@
 // "sculpt" and "Blender", where the browser's recogniser often doesn't. A real voice answers back when a build
 // finishes. Off until ELEVENLABS_API_KEY is set; the page then uses Edge's own speech recognition and voice.
 import { Readable } from 'node:stream';
-import * as Sentry from '@sentry/node';
 
 const env = name => (process.env[name] || '').trim();
 export const voiceAvailable = () => !!env('ELEVENLABS_API_KEY');
@@ -32,8 +31,7 @@ export const warmUp = () => (voiceAvailable() ? eleven().then(() => true, () => 
 
 // audio: a Buffer of one utterance as the page recorded it (webm/opus from MediaRecorder)
 export function transcribe(audio, contentType, signal) {
-  return Sentry.startSpan({ op: 'voice.transcribe', name: 'ElevenLabs speech to text',
-                            attributes: { 'voice.model': STT_MODEL(), 'voice.bytes': audio.length } }, async span => {
+  return (async () => {
     const c = await eleven();
     const r = await c.speechToText.convert({
       file: { data: audio, filename: `speech.${contentType.includes('ogg') ? 'ogg' : contentType.includes('mp4') ? 'm4a' : 'webm'}`, contentType },
@@ -43,20 +41,17 @@ export function transcribe(audio, contentType, signal) {
       noVerbatim: true,        // drops "um" and false starts
       keyterms: KEYTERMS,
     }, { abortSignal: signal, timeoutInSeconds: 30 });
-    const text = String(r.text ?? r.transcripts?.[0]?.text ?? '').trim();
-    span.setAttribute('voice.text', text.slice(0, 200));
-    return text;
-  });
+    return String(r.text ?? r.transcripts?.[0]?.text ?? '').trim();
+  })();
 }
 
 // returns a Node stream of MP3 audio
 export function speak(text, signal) {
-  return Sentry.startSpan({ op: 'voice.speak', name: 'ElevenLabs text to speech',
-                            attributes: { 'voice.model': TTS_MODEL(), 'voice.chars': text.length } }, async () => {
+  return (async () => {
     const c = await eleven();
     const audio = await c.textToSpeech.convert(VOICE_ID(), {
       text, modelId: TTS_MODEL(), outputFormat: 'mp3_44100_128',
     }, { abortSignal: signal, timeoutInSeconds: 30 });
     return Readable.fromWeb(audio);
-  });
+  })();
 }

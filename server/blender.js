@@ -1,6 +1,5 @@
 // Voice -> Blender. Claude Fable 5.1 writes Blender Python, runs it in the server's hidden Blender through the
 // bridge, looks at renders of the result, and fixes what's off, until the model is done.
-import * as Sentry from '@sentry/node';   // spans and logs are no-ops until SENTRY_DSN is set
 import { blender, callBlender } from './blender-process.js';
 import { TEXTURE_TOOL, textureToolAvailable, runTextureTool } from './texture-tool.js';
 
@@ -21,7 +20,7 @@ const IDEMPOTENT = new Set(['ping', 'scene', 'fingerprint', 'render', 'export_gl
                             'restore', 'clear_scene', 'warm_up']);
 
 export function bridge(cmd, args = {}, { timeout = 180000 } = {}) {
-  return Sentry.startSpan({ op: 'blender.bridge', name: `blender ${cmd}` }, () => bridgeCall(cmd, args, timeout));
+  return bridgeCall(cmd, args, timeout);
 }
 
 async function ready(cmd, after, timeout) {
@@ -175,19 +174,7 @@ function execResultText(r) {
   return JSON.stringify(brief, null, 1);
 }
 
-// every tool call is a gen_ai.execute_tool span in Sentry (AI agent monitoring)
-function runTool(block, emit) {
-  return Sentry.startSpan({
-    op: 'gen_ai.execute_tool', name: `execute_tool ${block.name}`,
-    attributes: { 'gen_ai.operation.name': 'execute_tool', 'gen_ai.tool.name': block.name, 'gen_ai.tool.call.id': block.id,
-                  'gen_ai.tool.type': 'function', 'gen_ai.tool.input': JSON.stringify(block.input ?? {}).slice(0, 2000) },
-  }, async span => {
-    const r = await runToolInner(block, emit);
-    span.setAttribute('gen_ai.tool.output', (typeof r.content === 'string' ? r.content : '[image result]').slice(0, 2000));
-    if (r.is_error) span.setStatus({ code: 2, message: 'tool_error' });
-    return r;
-  });
-}
+const runTool = (block, emit) => runToolInner(block, emit);
 
 async function runToolInner(block, emit) {
   const input = block.input || {};
@@ -224,21 +211,11 @@ async function runToolInner(block, emit) {
 
 // ---------- the build loop ----------
 // emit(event) is called with progress: status, thinking, research, sources, step, look, cost, done.
-// The whole build is one gen_ai.invoke_agent span in Sentry, with a gen_ai.chat span per model turn
-// and a gen_ai.execute_tool span per tool call.
-export function buildInBlender({ prompt, mode = 'make', emit, signal }) {
+export async function buildInBlender({ prompt, mode = 'make', emit, signal }) {
   const model = blenderModel();
-  return Sentry.startSpan({
-    op: 'gen_ai.invoke_agent', name: `invoke_agent blender-modeler`, forceTransaction: true,
-    attributes: { 'gen_ai.operation.name': 'invoke_agent', 'gen_ai.agent.name': 'blender-modeler', 'gen_ai.system': 'anthropic',
-                  'gen_ai.request.model': model, 'holomodel.prompt': prompt, 'holomodel.mode': mode },
-  }, async span => {
-    const result = await runBuild({ prompt, mode, emit, signal, model });
-    span.setAttribute('holomodel.usd', Number((result.usd || 0).toFixed(4)));
-    span.setAttribute('holomodel.turns', result.turns || 0);
-    Sentry.logger.info(Sentry.logger.fmt`Blender build finished: ${prompt}`, { usd: result.usd, turns: result.turns, mode });
-    return result;
-  });
+  const result = await runBuild({ prompt, mode, emit, signal, model });
+  console.log(`[blender] build finished: "${prompt}" (${mode}), ${result.turns} turns, about $${(result.usd || 0).toFixed(2)}`);
+  return result;
 }
 
 async function runBuild({ prompt, mode, emit, signal, model }) {
@@ -253,11 +230,7 @@ async function runBuild({ prompt, mode, emit, signal, model }) {
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     emit({ type: 'status', text: turn === 0 ? 'Planning the model…' : 'Working…' });
-    const msg = await Sentry.startSpan({
-      op: 'gen_ai.chat', name: `chat ${model}`,
-      attributes: { 'gen_ai.operation.name': 'chat', 'gen_ai.system': 'anthropic', 'gen_ai.request.model': model,
-                    'gen_ai.request.stream': true, 'gen_ai.request.max_tokens': 64000, 'holomodel.turn': turn },
-    }, async span => {
+    const msg = await (async () => {
       const stream = client.beta.messages.stream({
         model,
         max_tokens: 64000,
@@ -297,18 +270,8 @@ async function runBuild({ prompt, mode, emit, signal, model }) {
         if (err instanceof Anthropic.APIError || signal?.aborted) throw err;
         return null;   // eager tool streaming cut a tool call's JSON short: ask again
       }
-      const u = m.usage || {};
-      span.setAttributes({
-        'gen_ai.response.model': m.model || model, 'gen_ai.response.id': m.id, 'gen_ai.response.stop_reason': m.stop_reason || '',
-        'gen_ai.usage.input_tokens': u.input_tokens || 0, 'gen_ai.usage.output_tokens': u.output_tokens || 0,
-        'gen_ai.usage.total_tokens': (u.input_tokens || 0) + (u.output_tokens || 0),
-        'gen_ai.usage.cache_read_input_tokens': u.cache_read_input_tokens || 0,
-        'gen_ai.usage.cache_creation_input_tokens': u.cache_creation_input_tokens || 0,
-        'gen_ai.response.tool_calls': JSON.stringify(m.content.filter(b => b.type === 'tool_use' || b.type === 'server_tool_use').map(b => b.name)),
-        'holomodel.web_searches': u.server_tool_use?.web_search_requests || 0,
-      });
       return m;
-    });
+    })();
     if (!msg) { emit({ type: 'status', text: 'A tool call arrived garbled; asking again…' }); continue; }
 
     usd += costOf(msg.usage, msg.model || model);
@@ -331,7 +294,7 @@ async function runBuild({ prompt, mode, emit, signal, model }) {
       try { r = await runTool(call, emit); }
       catch (err) {
         if (err instanceof BridgeError) throw err;   // Blender went away: stop the build
-        Sentry.captureException(err);
+        console.error('[blender] tool failed', err);
         r = { content: `Tool failed: ${err.message}`, is_error: true };
       }
       results.push({ type: 'tool_result', tool_use_id: call.id, content: r.content, ...(r.is_error ? { is_error: true } : {}) });

@@ -63,22 +63,6 @@ await check('ElevenLabs (voice in and out)', 'ELEVENLABS_API_KEY', async () => {
   return `spoke "Save version." (${Math.round(mp3.length / 1024)} KB of audio) and Scribe heard "${heard}"`;
 });
 
-await check('Sentry (errors, traces, AI agent monitoring)', 'SENTRY_DSN', async () => {
-  const Sentry = await import('@sentry/node');
-  const errors = [];
-  Sentry.init({ dsn: env('SENTRY_DSN'), environment: 'hackathon', release: 'holomodel@0.1.0', tracesSampleRate: 1 });
-  Sentry.getClient().on('afterSendEvent', (_event, response) => {
-    if (!response?.statusCode) errors.push("couldn't reach it");
-    else if (response.statusCode >= 400) errors.push(`HTTP ${response.statusCode}`);
-  });
-  const id = Sentry.captureMessage('holomodel: npm run check', 'info');
-  await Sentry.startSpan({ op: 'holomodel.check', name: 'npm run check' }, async () => {});
-  if (!(await Sentry.flush(8000))) throw new Error('timed out sending to Sentry');
-  if (errors.some(e => e.startsWith('HTTP'))) throw new Error(`Sentry refused the event (${errors.find(e => e.startsWith('HTTP'))}); check the DSN`);
-  if (errors.length) throw new Error("couldn't reach Sentry; check the DSN and the internet connection");
-  return `sent a test message (event ${id.slice(0, 8)}) and a trace; look for "npm run check" in Sentry`;
-});
-
 await check('OpenAI (textures, your part)', 'OPENAI_API_KEY', async () => {
   const { IMPLEMENTED } = await import('../server/textures.js');
   if (!IMPLEMENTED) throw new Error('key is set, but server/textures.js is still the stub (IMPLEMENTED = false)');

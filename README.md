@@ -27,7 +27,7 @@ Pick **Mouse mode** if you have no webcam. Everything local — looking at the m
   `Blender not found. Install Blender 5.2 or set BLENDER_PATH in .env.`
 - **`ANTHROPIC_API_KEY` in `.env`**, also for `make a ___`. Without it the server says so at startup and only the
   local commands work. Copy `.env.example` to `.env`: it documents every key the app can use (Anthropic, ElevenLabs
-  voice, MongoDB Atlas for version history, Sentry, OpenAI for generated textures). None of the others are needed.
+  voice, MongoDB Atlas for version history, OpenAI for generated textures). None of the others are needed.
 
 Optional: `npm run vendor -- --download` copies three.js and MediaPipe into `public/vendor` so the app runs with
 the network unplugged. Skipping it breaks nothing — the server redirects `/vendor/*` to jsDelivr.

@@ -5,7 +5,6 @@
 // restarts (in scene.js's state.json).
 import fs from 'node:fs';
 import path from 'node:path';
-import * as Sentry from '@sentry/node';
 import { bridge } from './blender.js';
 import { history, pruneHistory, SNAPSHOT_DIR, WORKING_DIR } from './history.js';
 import { publish, sceneVersion, sceneFingerprint, currentGlbPath, setVersion } from './scene.js';
@@ -20,7 +19,7 @@ async function currentVersion(store) {
 }
 
 export function saveVersion(meta) {
-  return Sentry.startSpan({ op: 'holomodel.version.save', name: 'save version' }, async () => {
+  return (async () => {
     const store = await history();
     const parent = await currentVersion(store);
     fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
@@ -57,7 +56,7 @@ export function saveVersion(meta) {
       fs.rmSync(tmp, { force: true });
       if (glbTmp) fs.rmSync(glbTmp, { force: true });
     }
-  });
+  })();
 }
 
 // Keep what's in Blender as a version before something replaces it, unless the scene is empty or is exactly the
@@ -85,7 +84,7 @@ async function resolve(store, which) {
 // Opens a saved version in Blender and publishes it to the page. The scene you're leaving is saved first (as a
 // checkpoint), so nothing is lost. Works for versions saved before the GLB existed: the .blend is the truth.
 export function restoreVersion(which) {
-  return Sentry.startSpan({ op: 'holomodel.version.restore', name: 'restore version' }, async () => {
+  return (async () => {
     const store = await history();
     const v = await resolve(store, which);
     if (!v) throw new VersionError(`There's no version ${which}.`);
@@ -103,7 +102,7 @@ export function restoreVersion(which) {
     const s = await publish(`version ${v.n}`);
     setVersion(v.n);
     return { version: v, checkpoint, rev: s.rev };
-  });
+  })();
 }
 
 export async function listVersions(limit = 50) {

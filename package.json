@@ -6,7 +6,7 @@
   "license": "GPL-3.0-or-later",
   "type": "module",
   "scripts": {
-    "start": "node --import ./server/instrument.js server.js",
+    "start": "node server.js",
     "test": "node --test",
     "test:blender": "node server/blender-process.js --python-exit-code 1 --python blender/test_bridge.py",
     "vendor": "node scripts/vendor.mjs",
@@ -20,8 +20,6 @@
     "@anthropic-ai/sdk": "^0.127.0",
     "@elevenlabs/elevenlabs-js": "^2.68.0",
     "@mediapipe/tasks-vision": "0.10.35",
-    "@sentry/node": "^10.75.0",
-    "@sentry/profiling-node": "^10.75.0",
     "mongodb": "^7.6.0",
     "openai": "^7.19.0",
     "three": "0.170.0"
