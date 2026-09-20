@@ -130,6 +130,54 @@ export function normalize(text) {
     .trim();
 }
 
+// ---------- the wake word ----------
+//
+// The microphone is always on, and a demo table is a room full of people saying "make it bigger"
+// about something else. So the voice path only acts when it hears the rig's name first.
+//
+// A recogniser does not hear a made-up name reliably: "narvis" comes back as nervous, jarvis,
+// marvis, novis, or split into "nar vis". So the test is a sound-alike one - an edit distance of
+// two against the name, on the first word and on the first two words run together - plus the short
+// list of mishears that are further away than that and still unmistakably it. Two is deliberate:
+// three would reach ordinary English ("marbles", "service") and the command behind it would run.
+export const WAKE = 'narvis';
+const WAKE_ALIASES = new Set([
+  'nervous', 'nervus', 'jarvis', 'marvis', 'harvis', 'carvis', 'novis', 'norvis', 'gnarvis',
+  'narvelous', 'nahvis', 'knarvis', 'narviss', 'nervice',
+]);
+
+function editDistance(a, b) {
+  const m = a.length, n = b.length;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const row = [i];
+    for (let j = 1; j <= n; j++) {
+      row[j] = Math.min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = row;
+  }
+  return prev[n];
+}
+
+const soundsLikeWake = (word) => !!word
+  && (word === WAKE || WAKE_ALIASES.has(word) || editDistance(word, WAKE) <= 2);
+
+/**
+ * What was said after the rig's name, or null if its name was not said.
+ * An empty string means the name and nothing else ("Narvis?"), which is worth answering.
+ */
+export function afterWake(text) {
+  const t = normalize(text);
+  if (!t) return null;
+  const words = t.split(' ');
+  if (soundsLikeWake(words[0].replace(/[^a-z]/g, ''))) return words.slice(1).join(' ');
+  // recognisers split an unfamiliar name as often as they mangle it: "nar vis", "gnar viss"
+  if (words.length > 1 && soundsLikeWake((words[0] + words[1]).replace(/[^a-z]/g, ''))) {
+    return words.slice(2).join(' ');
+  }
+  return null;
+}
+
 export function parseCommand(text) {
   const t = normalize(text);
   if (!t) return null;

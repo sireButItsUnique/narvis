@@ -13,7 +13,7 @@ import { fetchScene } from './scene/load.js';
 import { initBuild, build, cancelBuild, work, toggleLog } from './scene/build.js';
 import { initVersions, refreshVersions, noteCurrent, restoreVersion, saveVersion, showVersions } from './scene/versions.js';
 import { highlighted } from './scene/highlight.js';
-import { parseCommand, parseTyped } from './commands.js';
+import { parseCommand, parseTyped, afterWake, normalize, WAKE } from './commands.js';
 import { createVoice, createCloudVoice } from './voice.js';
 import { createSpeaker } from './speak.js';
 import { startSentry, tag } from './observability.js';
@@ -123,7 +123,7 @@ $('btn-mouse').addEventListener('click', async () => {
 // ---------- voice ----------
 const MIC_TEXT = {
   off: 'mic off, press V',
-  listening: 'listening',
+  listening: 'listening for "Narvis"',
   unsupported: 'no speech recognition here: open in Edge, or press / to type',
   blocked: 'mic blocked: allow it in the address bar, then press V',
   network: 'speech service unreachable (Brave blocks it): open in Edge, or press / to type',
@@ -135,10 +135,19 @@ function showMic(state) {
   el.dataset.state = state;
 }
 
+// How long the rig keeps listening after hearing its name, so a command split off into its own
+// recognition result still lands. Long enough for a breath, short enough that the next person's
+// sentence is not taken as an order.
+const AWAKE_MS = 8000;
+let awakeUntil = 0;
 let heardTimer = 0;
 function showHeard(text, kind) {
   const el = $('heard');
-  el.textContent = !text ? '' : kind === 'ignored' ? `“${text}” (not a command)` : `“${text}”`;
+  // 'asleep' is the common case once there is a wake word - everything anybody in the room says -
+  // so it reads as a quiet transcript rather than as a rejection, and says what to do about it.
+  el.textContent = !text ? ''
+    : kind === 'asleep' ? `“${text}” — say “${WAKE[0].toUpperCase()}${WAKE.slice(1)}” first`
+    : kind === 'ignored' ? `“${text}” (not a command)` : `“${text}”`;
   el.className = kind;
   clearTimeout(heardTimer);
   if (kind !== 'interim') heardTimer = setTimeout(() => el.classList.add('stale'), 5000);
@@ -148,9 +157,22 @@ const voiceHandlers = {
   onState: s => showMic(s),
   onInterim: text => { if (text) showHeard(text, 'interim'); },
   onFinal: text => {
-    const cmd = parseCommand(text);
-    showHeard(text, cmd ? 'command' : 'ignored');
-    if (cmd) runCommand(cmd);
+    // Nothing happens, and nothing is said back, until the rig hears its own name. Everything else
+    // in the room is somebody else's conversation, and this microphone cannot tell the difference.
+    //
+    // It stays awake for a few seconds afterwards, because a recogniser decides on its own where a
+    // sentence ends: say "Narvis" with a breath after it and the name arrives as one final result
+    // and "make a teapot" as the next one. Without the window that second half is thrown away, and
+    // the fix from the user's side is to talk faster, which is not a fix.
+    const now = performance.now();
+    let said = afterWake(text);
+    if (said !== null) awakeUntil = now + AWAKE_MS;
+    else if (now < awakeUntil) said = normalize(text);        // still listening from a moment ago
+    if (said === null) { showHeard(text, 'asleep'); return; }
+    if (!said) { showHeard('Narvis?', 'command'); flash('Narvis is listening', 2500); return; }
+    const cmd = parseCommand(said);
+    showHeard(said, cmd ? 'command' : 'ignored');
+    if (cmd) { awakeUntil = now + AWAKE_MS; runCommand(cmd); }
   },
 };
 let voice = createVoice(voiceHandlers);   // Edge's recogniser until /api/config says ElevenLabs is set up
@@ -544,6 +566,8 @@ window.htw = {
   pointed: () => pointedPart()?.name ?? null,
   highlighted: () => [...highlighted().keys()].map(m => parts.ofMesh(m)?.name ?? m.name),
   tick: now => tick(now ?? performance.now()),
+  // Say something without a microphone: the same handler the recogniser calls, wake word and all.
+  say: text => voiceHandlers.onFinal(text),
 };
 
 syncPanel();

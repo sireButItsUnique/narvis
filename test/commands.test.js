@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCommand, parseTyped, FINISHES } from '../public/js/commands.js';
+import { parseCommand, parseTyped, afterWake, WAKE, FINISHES } from '../public/js/commands.js';
 
 const cases = [
   ['Make a coffee mug.', { type: 'make', prompt: 'a coffee mug' }],
@@ -169,4 +169,41 @@ test('version history commands', () => {
   assert.deepEqual(parseCommand('go back'), { type: 'undo' });
   assert.deepEqual(parseCommand('save it'), { type: 'export' });
   assert.deepEqual(parseCommand('go back to sculpt mode'), { type: 'mode', mode: 'extrude' });
+});
+
+// ---------------------------------------------------------------- the wake word
+
+test('the rig only listens when it hears its own name', () => {
+  // The name itself, however the recogniser spelled it. A demo table is a room full of people
+  // saying "make it bigger" about something else, and a name is the only thing that separates them.
+  for (const heard of ['narvis', 'Narvis,', 'nervous', 'jarvis', 'marvis', 'narviss', 'novis',
+                       'norvis', 'nervis', 'narvus', 'nar vis', 'gnar viss']) {
+    assert.notEqual(afterWake(heard + ' make a teapot'), null, heard);
+    assert.equal(afterWake(heard + ' make a teapot'), 'make a teapot', heard);
+  }
+  // with the filler words people put in front of a name
+  assert.equal(afterWake('hey narvis make a teapot'), 'make a teapot');
+  assert.equal(afterWake('OK Narvis, smooth it out'), 'smooth it out');
+});
+
+test('and stays asleep for everything else in the room', () => {
+  for (const heard of ['make a teapot', 'smooth it out', 'bigger brush', 'undo', '',
+                       'so i was saying make it bigger', 'marbles are bigger', 'this service is slow']) {
+    assert.equal(afterWake(heard), null, heard);
+  }
+});
+
+test('its name on its own is an answerable thing, not a command', () => {
+  // '' means the name and nothing after it: the page says "Narvis?" rather than doing nothing,
+  // which is how you find out the microphone is working before you commit to a sentence.
+  assert.equal(afterWake('narvis'), '');
+  assert.equal(afterWake('hey narvis'), '');
+  assert.notEqual(afterWake('narvis'), null);
+});
+
+test('the wake word gates VOICE, and typing is still typing', () => {
+  // The name exists because the microphone cannot tell who is being spoken to. A keyboard can.
+  assert.deepEqual(parseTyped('make a teapot'), { type: 'make', prompt: 'a teapot' });
+  assert.deepEqual(parseCommand('smooth'), { type: 'mode', mode: 'smooth' });
+  assert.equal(WAKE, 'narvis');
 });
