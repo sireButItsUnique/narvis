@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Head tracking test</title>
+<style>
+  :root { --bg:#04060b; --panel:#07111c; --line:#1d3b55; --text:#cfe8ff; --dim:#7fa3bf; --cyan:#35d0ff; --green:#7cff9b; --amber:#ffb23e; --red:#ff6b7a; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); overflow:hidden;
+    font-family: system-ui, "Segoe UI", sans-serif; }
+  canvas#view { display:block; }
+  #panel { position:fixed; left:12px; top:12px; width:310px; background:rgba(7,17,28,.94); border:1px solid var(--line);
+    border-radius:10px; padding:12px 14px; font-size:13px; z-index:3; }
+  #panel h1 { margin:0 0 8px; font-size:14px; color:var(--cyan); }
+  #panel .row { display:flex; justify-content:space-between; gap:8px; margin:5px 0; color:var(--dim); }
+  #panel .row b { color:var(--text); font-weight:600; font-family:ui-monospace, Consolas, monospace; }
+  #panel .src { border-top:1px solid var(--line); margin-top:8px; padding-top:8px; }
+  #panel .src.live { border-left:3px solid var(--cyan); padding-left:8px; margin-left:-11px; }
+  #panel small { color:var(--dim); display:block; margin-top:6px; line-height:1.45; }
+  button { background:#0e2a40; color:var(--text); border:1px solid #2b5a80; border-radius:7px; padding:5px 9px;
+    font-size:12px; cursor:pointer; margin:6px 6px 0 0; }
+  button.on { background:#0f4a6e; border-color:var(--cyan); }
+  input { width:64px; background:#0b1a29; color:var(--text); border:1px solid var(--line); border-radius:5px; padding:3px 5px; }
+  select { max-width:170px; background:#0b1a29; color:var(--text); border:1px solid var(--line); border-radius:5px; padding:3px 5px; font-size:12px; }
+  #cams { position:fixed; right:12px; top:12px; z-index:3; display:flex; gap:8px; }
+  #cams video { width:150px; border:1px solid var(--line); border-radius:6px; background:#000; transform:scaleX(-1); }
+  .warn { color:var(--amber); } .bad { color:var(--red); } .ok { color:var(--green); }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="cams"></div>
+<div id="panel">
+  <h1>Head tracking test</h1>
+  <div class="row"><span>Screen diagonal</span><span><input id="diag" type="number" step="0.1" value="14"> in</span></div>
+  <div class="row"><span>Camera gap</span><span><input id="base" type="number" step="1" value="100"> cm</span></div>
+  <div class="row"><span>Lens angle</span><span><input id="fov" type="number" step="1" value="60"> deg</span></div>
+  <div id="sources"></div>
+  <div class="row"><span>camera A</span><select id="camA"></select></div>
+  <div class="row"><span>camera B</span><select id="camB"></select></div>
+  <div>
+    <button id="start">Start cameras</button>
+    <button id="cal">Calibrate scale</button>
+    <button id="swap">Swap L/R</button>
+  </div>
+  <small id="hint">One camera with a 6DOF face pose is how HoloDesk did it. Two cameras measure distance instead of
+  inferring it. Start the cameras, then press 1, 2 or 3 to choose which one drives the view, and watch the box:
+  the right one keeps the walls looking solid as you move.</small>
+</div>
+<script type="importmap">
+{ "imports": { "three": "/vendor/three/build/three.module.js", "three/addons/": "/vendor/three/examples/jsm/" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+// Three ways to find the eye, side by side, so they can be judged against each other on a screen whose
+// geometry we know exactly (the laptop's). Whichever wins here is what the rig should use.
+//   1 mono6  - MediaPipe's facial transformation matrix: a 3D face model fitted to the image, so position
+//              AND orientation, in the camera's own metric space. This is HoloDesk's method.
+//   2 stereo - the same eye seen by two cameras, triangulated. Needs no assumption about face size.
+//   3 mouse  - a stand-in for checking the rendering itself.
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35';
+const LOCAL = { bundle: '/vendor/mediapipe/vision_bundle.mjs', wasm: '/vendor/mediapipe/wasm',
+                face: '/vendor/models/face_landmarker.task' };
+const REMOTE = { bundle: `${MP}/vision_bundle.mjs`, wasm: `${MP}/wasm`,
+                 face: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task' };
+const pick = async (local, remote) => {
+  try { const r = await fetch(local, { method: 'HEAD' }); return r.ok ? local : remote; } catch { return remote; }
+};
+
+const $ = id => document.getElementById(id);
+const renderer = new THREE.WebGLRenderer({ canvas: $('view'), antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x04060b, 1);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 1, 600);
+
+// A box sunk into the screen: the illusion only holds if the eye is right, so this IS the test.
+const BOX = { w: 30, h: 20, d: 26 };   // centimetres
+{
+  const grid = (w, h, rows, cols) => {
+    const g = new THREE.BufferGeometry(), p = [];
+    for (let i = 0; i <= rows; i++) { const y = -h / 2 + (h * i) / rows; p.push(-w / 2, y, 0, w / 2, y, 0); }
+    for (let i = 0; i <= cols; i++) { const x = -w / 2 + (w * i) / cols; p.push(x, -h / 2, 0, x, h / 2, 0); }
+    g.setAttribute('position', new THREE.Float32BufferAttribute(p, 3));
+    return g;
+  };
+  const wall = new THREE.LineBasicMaterial({ color: 0x1d5f8a });
+  const back = new THREE.LineSegments(grid(BOX.w, BOX.h, 8, 10), wall);
+  back.position.z = -BOX.d; scene.add(back);
+  const side = (x, rot) => { const m = new THREE.LineSegments(grid(BOX.d, BOX.h, 8, 10), wall);
+    m.position.set(x, 0, -BOX.d / 2); m.rotation.y = rot; scene.add(m); };
+  side(-BOX.w / 2, Math.PI / 2); side(BOX.w / 2, Math.PI / 2);
+  const floor = new THREE.LineSegments(grid(BOX.w, BOX.d, 8, 10), wall);
+  floor.rotation.x = Math.PI / 2; floor.position.set(0, -BOX.h / 2, -BOX.d / 2); scene.add(floor);
+  const roof = floor.clone(); roof.position.y = BOX.h / 2; scene.add(roof);
+  // three posts at known depths: if the eye is right they stay put against the back wall's squares
+  for (const [x, z, c] of [[-9, -6, 0x35d0ff], [0, -14, 0x7cff9b], [9, -22, 0xffb23e]]) {
+    const post = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 9, 16),
+      new THREE.MeshBasicMaterial({ color: c }));
+    post.position.set(x, -BOX.h / 2 + 4.5, z); scene.add(post);
+    const ring = new THREE.Mesh(new THREE.RingGeometry(1.1, 1.5, 24), new THREE.MeshBasicMaterial({ color: c, side: THREE.DoubleSide }));
+    ring.rotation.x = -Math.PI / 2; ring.position.set(x, -BOX.h / 2 + 0.05, z); scene.add(ring);
+  }
+}
+
+// ---------- screen geometry: the laptop's own screen, in centimetres ----------
+const screenCm = () => {
+  const diag = Math.max(5, +$('diag').value || 14) * 2.54;
+  const w = screen.width, h = screen.height, k = diag / Math.hypot(w, h);
+  return { w: w * k, h: h * k, pxPerCm: w / (w * k) };
+};
+// the window's rectangle inside the screen, in cm, centred on the screen's centre
+function windowRect() {
+  const s = screenCm(), pxcm = screen.width / s.w;
+  return { w: innerWidth / pxcm, h: innerHeight / pxcm };
+}
+
+// off-axis (asymmetric) frustum: the screen is a window and the eye can be anywhere
+function project(eye) {
+  const r = windowRect(), near = 1, far = 600;
+  const n = near / Math.max(1, eye.z);
+  const l = (-r.w / 2 - eye.x) * n, rr = (r.w / 2 - eye.x) * n;
+  const b = (-r.h / 2 - eye.y) * n, t = (r.h / 2 - eye.y) * n;
+  camera.projectionMatrix.makePerspective(l, rr, t, b, near, far);
+  camera.position.set(eye.x, eye.y, eye.z);
+  camera.quaternion.identity();
+  camera.updateMatrixWorld();
+}
+
+// ---------- eye sources ----------
+const sources = {
+  mono6: { name: '1 mono 6DOF (HoloDesk)', eye: null, at: 0, n: 0 },
+  stereo: { name: '2 stereo triangulation', eye: null, at: 0, n: 0 },
+  mouse: { name: '3 mouse', eye: { x: 0, y: 0, z: 55 }, at: 0, n: 0 },
+};
+let driving = 'mouse';
+// A webcam image is mirrored relative to you: move your head to YOUR left and you move to the image's right,
+// so anything derived from image coordinates needs X negating, or the parallax comes out inside out.
+// Y too: image coordinates run downward, so a head that rises reads as falling.
+const flip = { x: -1, y: -1, z: 1 };
+// Z is not a mirror, it is a direction: if the tracker reports "further" when you lean in, flipping the
+// sign is wrong (distance is not negative) — what you want is the DELTA around the calibrated distance
+// reversed, which is what flip.z = -1 does.
+let restZ = 50;
+let monoScale = +(localStorage.getItem('headtest-scale') || 1);   // fixes the canonical face model's size
+
+addEventListener('mousemove', e => {
+  const s = windowRect();
+  sources.mouse.eye = { x: (e.clientX / innerWidth - 0.5) * s.w * 1.6,
+                        y: -(e.clientY / innerHeight - 0.5) * s.h * 1.6, z: 55 };
+  sources.mouse.at = performance.now();
+});
+
+// MediaPipe, one landmarker per camera
+const cams = [];
+async function startCameras() {
+  $('start').disabled = true;
+  const done = () => { $('start').disabled = false; };
+  const [bundle, wasm, model] = await Promise.all([
+    pick(LOCAL.bundle, REMOTE.bundle), pick(LOCAL.wasm, REMOTE.wasm), pick(LOCAL.face, REMOTE.face)]);
+  const { FilesetResolver, FaceLandmarker } = await import(bundle);
+  const fileset = await FilesetResolver.forVisionTasks(wasm);
+
+  let probe;
+  try { probe = await navigator.mediaDevices.getUserMedia({ video: true }); }
+  catch (err) { return note(`Camera refused: ${err.name}`, 'bad'); }
+  probe.getTracks().forEach(t => t.stop());
+  const all = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  // OBS/NDI/Snap register as cameras and hand back a blank frame unless their app is running, and they are
+  // usually what gets picked when something just takes "the first two cameras".
+  const VIRTUAL = /virtual|obs|ndi|xsplit|snap camera|droidcam|epoccam|manycam|unity/i;
+  const real = all.filter(d => !VIRTUAL.test(d.label || ''));
+  fillPickers(all, real);
+  const chosen = [$('camA').value, $('camB').value]
+    .filter((id, i, a) => id && a.indexOf(id) === i)
+    .map(id => all.find(d => d.deviceId === id))
+    .filter(Boolean);
+  note(`${all.length} listed, ${real.length} real; opening ${chosen.length}`, chosen.length > 1 ? 'ok' : 'warn');
+
+  for (const d of chosen) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: { exact: d.deviceId }, width: { ideal: 640 }, height: { ideal: 480 } } });
+      const video = document.createElement('video');
+      video.autoplay = true; video.muted = true; video.playsInline = true; video.srcObject = stream;
+      $('cams').appendChild(video);
+      await video.play();
+      const lm = await FaceLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: model, delegate: 'GPU' },
+        runningMode: 'VIDEO', numFaces: 1,
+        outputFacialTransformationMatrixes: true,   // the 6DOF pose HoloDesk's tracker gave them
+      });
+      cams.push({ dev: d, video, lm, last: 0, fps: 0, sees: false });
+    } catch (err) {
+      note(`${d.label || 'camera'}: ${err.name} — ${err.name === 'NotReadableError' ? 'USB bandwidth, try one on another port' : err.message}`, 'bad');
+    }
+  }
+  done();
+  if (!cams.length) return note('No camera opened', 'bad');
+  driving = cams.length ? 'mono6' : 'mouse';
+}
+
+const CANON_EYE = { l: 33, r: 263 };   // canonical face landmarks for the two iris centres
+
+function readCameras(now) {
+  const eyes = [];
+  for (const c of cams) {
+    if (c.video.readyState < 2 || c.video.currentTime === c.last) continue;
+    c.last = c.video.currentTime;
+    let res;
+    try { res = c.lm.detectForVideo(c.video, now); } catch { continue; }
+    const lms = res?.faceLandmarks?.[0];
+    c.sees = !!lms;
+    if (!lms) continue;
+    c.fps = c.fps * 0.9 + 0.1 * 1000 / Math.max(1, now - (c.tPrev || now - 33));
+    c.tPrev = now;
+    c.seen = { cam: c, at: now, lms, mat: res.facialTransformationMatrixes?.[0]?.data || null,
+               mid: { x: (lms[CANON_EYE.l].x + lms[CANON_EYE.r].x) / 2,
+                      y: (lms[CANON_EYE.l].y + lms[CANON_EYE.r].y) / 2 } };
+    eyes.push(c.seen);
+  }
+  if (!eyes.length) return;
+
+  // Two independent webcams never deliver frames on the same tick (ours run at 11 and 38 fps), so pair the
+  // most recent detection from each camera instead, as long as they are close enough in time that the head
+  // cannot have moved far: 60 ms of a head at 30 cm/s is under 2 cm.
+  const PAIR_MS = 200;   // slow cameras (or a busy machine) can be 300 ms apart; pairing nothing is worse
+  const recent = cams.map(c => c.seen).filter(s => s && now - s.at < PAIR_MS);
+
+  // 1. mono 6DOF: the face model's own transform, so the translation IS the head position in the
+  //    camera's metric space (times a per-face scale we calibrate once). Always camera A, so switching
+  //    cameras cannot silently change what mono means.
+  const m = (cams[0]?.seen && now - cams[0].seen.at < 200 ? cams[0].seen : eyes[0]).mat;
+  if (m) {
+    const e = { x: m[12] * monoScale * flip.x, y: m[13] * monoScale * flip.y, z: Math.abs(m[14]) * monoScale };
+    const z = flip.z < 0 ? Math.max(12, 2 * restZ - e.z) : e.z;
+    sources.mono6.eye = { x: e.x, y: e.y + 6, z };   // camera sits above the screen
+    sources.mono6.at = now; sources.mono6.n++;
+  }
+
+  // 2. stereo: the same eye midpoint in two views, triangulated with the measured gap
+  if (recent.length > 1) {
+    const B = Math.max(5, +$('base').value || 100);
+    const [a, b] = swapped ? [recent[1], recent[0]] : [recent[0], recent[1]];
+    const fov = Math.max(20, +$('fov').value || 60) * Math.PI / 180;
+    const f = 0.5 / Math.tan(fov / 2);       // normalised focal length (image half-width is 0.5)
+    const ax = (a.mid.x - 0.5), bx = (b.mid.x - 0.5);
+    const disp = (ax - bx);
+    // a tiny disparity means the two views are nearly identical (one camera actually seeing the other's
+    // picture, or a bad landmark), and that turns into a head several metres away: reject it outright
+    if (Math.abs(disp) > 0.01) {
+      const z = (B * f) / disp;                     // cm
+      const x = -B / 2 + (ax * z) / f;              // camera A sits at -B/2, so add its offset back
+      const y = -((a.mid.y - 0.5) * z) / f;
+      const zz = Math.abs(z);
+      if (zz > 15 && zz < 250) {   // a head is never 5 m from the screen you are looking at
+        sources.stereo.eye = { x: x * flip.x, y: y * flip.y + 6, z: zz };
+        sources.stereo.at = now; sources.stereo.n++;
+      }
+    }
+  }
+}
+let swapped = false;
+
+function note(text, cls = '') { $('hint').innerHTML = `<span class="${cls}">${text}</span>`; }
+
+// The pickers list every camera but default to the real ones, so a virtual camera is a deliberate choice.
+function fillPickers(all, real) {
+  for (const [id, fallback] of [['camA', real[0]], ['camB', real[1]]]) {
+    const sel = $(id);
+    if (sel.options.length) continue;
+    sel.innerHTML = '<option value="">(none)</option>' + all.map(d =>
+      `<option value="${d.deviceId}">${(d.label || 'camera').slice(0, 40)}</option>`).join('');
+    sel.value = fallback?.deviceId || '';
+    sel.addEventListener('change', () => note('Press Start cameras again to use the new choice', 'warn'));
+  }
+}
+
+function panel(now) {
+  const rows = [];
+  for (const [key, s] of Object.entries(sources)) {
+    const fresh = now - s.at < 500 && s.eye;
+    const e = fresh ? s.eye : null;   // a stale position is not data; showing it invites reading it as one
+    rows.push(`<div class="src ${driving === key ? 'live' : ''}">
+      <div class="row"><span>${s.name}</span><b class="${fresh ? 'ok' : 'warn'}">${fresh ? 'live' : '—'}</b></div>
+      <div class="row"><span>position</span><b>${e ? `${e.x.toFixed(1)}, ${e.y.toFixed(1)}, ${e.z.toFixed(1)} cm` : '—'}</b></div>
+    </div>`);
+  }
+  const both = sources.mono6.eye && sources.stereo.eye
+    && now - sources.mono6.at < 500 && now - sources.stereo.at < 500;
+  if (both) {
+    const d = Math.hypot(sources.mono6.eye.x - sources.stereo.eye.x, sources.mono6.eye.y - sources.stereo.eye.y,
+                         sources.mono6.eye.z - sources.stereo.eye.z);
+    rows.push(`<div class="src"><div class="row"><span>they disagree by</span><b>${d.toFixed(1)} cm</b></div></div>`);
+  }
+  rows.push(`<div class="src"><div class="row"><span>cameras seeing a face</span><b>${cams.filter(c => c.sees).length} / ${cams.length}</b></div></div>`);
+  $('sources').innerHTML = rows.join('');
+}
+
+// ---------- measuring how good a tracker actually is ----------
+// A trial holds still for a few seconds at a KNOWN place, so we get three numbers that matter: how much it
+// wobbles when nothing moves (jitter), whether the distance it reports is the real one (scale), and whether
+// turning your head shifts the reported position when your head has not actually moved (rotation coupling).
+const trials = [];
+let trial = null;
+
+function startTrial(label, truth = null, secs = 6) {
+  trial = { label, truth, samples: [], until: performance.now() + secs * 1000 };
+  note(`Recording "${label}" for ${secs}s — hold still`, 'warn');
+}
+
+function tickTrial(now) {
+  if (!trial) return;
+  const e = sources[driving].eye;
+  if (e && now - sources[driving].at < 300) trial.samples.push({ ...e });
+  if (now < trial.until) return;
+  const s = trial.samples;
+  const done = { label: trial.label, source: driving, n: s.length, truth: trial.truth };
+  if (s.length > 4) {
+    for (const ax of ['x', 'y', 'z']) {
+      const v = s.map(p => p[ax]);
+      const mean = v.reduce((a, b) => a + b, 0) / v.length;
+      const sd = Math.sqrt(v.reduce((a, b) => a + (b - mean) ** 2, 0) / v.length);
+      done[ax] = +mean.toFixed(2); done[ax + 'Jitter'] = +sd.toFixed(2);
+    }
+    if (trial.truth != null) done.errorCm = +(done.z - trial.truth).toFixed(2);
+  }
+  trials.push(done);
+  trial = null;
+  note(`"${done.label}": z ${done.z ?? '?'} cm, jitter ${done.zJitter ?? '?'} cm${done.errorCm != null ? `, off by ${done.errorCm} cm` : ''}`, 'ok');
+  console.table(trials);
+}
+
+// so a script can sample what the trackers are producing without scraping the panel
+window.headtest = {
+  sources, flip, start: startCameras, trials, startTrial,
+  get cams() { return cams.map(c => ({ label: c.dev.label, sees: c.sees, fps: Math.round(c.fps || 0) })); },
+  snapshot() {
+    const e = k => sources[k].eye ? { ...sources[k].eye } : null;
+    const m = e('mono6'), s = e('stereo');
+    return { t: performance.now(), mono6: m, stereo: s, mouse: e('mouse'),
+             disagreeCm: m && s ? Math.hypot(m.x - s.x, m.y - s.y, m.z - s.z) : null,
+             seeing: cams.filter(c => c.sees).length, of: cams.length };
+  },
+};
+
+$('start').addEventListener('click', startCameras);
+$('swap').addEventListener('click', () => { swapped = !swapped; note(`left/right ${swapped ? 'swapped' : 'normal'}`); });
+$('cal').addEventListener('click', () => {
+  const real = parseFloat(prompt('Sit still. How far is your face from the screen, in cm?', '55'));
+  const raw = sources.mono6.eye && sources.mono6.eye.z / monoScale;
+  if (!(real > 5) || !raw) return note('Need a face in view first', 'warn');
+  monoScale = real / raw;
+  restZ = real;   // the distance the depth flip pivots around, if it is ever needed
+  localStorage.setItem('headtest-scale', String(monoScale));
+  note(`Scale set: the face model now reads ${real} cm at this distance`, 'ok');
+});
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === '1') driving = 'mono6';
+  else if (e.key === '2') driving = 'stereo';
+  else if (e.key === '3') driving = 'mouse';
+  else if (e.key.toLowerCase() === 'x') { flip.x *= -1; note(`left/right ${flip.x < 0 ? 'mirrored (normal for a webcam)' : 'direct'}`, 'ok'); }
+  else if (e.key.toLowerCase() === 'y') { flip.y *= -1; note(`up/down ${flip.y < 0 ? 'flipped' : 'direct'}`, 'ok'); }
+  else if (e.key.toLowerCase() === 'r') {
+    const label = prompt('What is this trial? e.g. "still at 50", "turned left", "40 cm"', 'still');
+    if (label === null) return;
+    const truth = parseFloat(prompt('True distance to the screen in cm (blank if you are testing something else)', ''));
+    startTrial(label, Number.isFinite(truth) ? truth : null);
+  }
+  else if (e.key.toLowerCase() === 'z') { flip.z *= -1; note(`depth ${flip.z < 0 ? 'reversed around ' + restZ.toFixed(0) + ' cm' : 'direct'}`, 'ok'); }
+  else if (e.key.toLowerCase() === 'p') $('panel').hidden = !$('panel').hidden;
+  else if (e.key.toLowerCase() === 'c') $('cams').hidden = !$('cams').hidden;
+  else if (e.key.toLowerCase() === 'f') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+});
+
+function resize() { renderer.setSize(innerWidth, innerHeight); }
+addEventListener('resize', resize);
+resize();
+
+let lastPanel = 0;
+renderer.setAnimationLoop(now => {
+  if (cams.length) readCameras(now);
+  tickTrial(now);
+  const s = sources[driving];
+  const eye = (s.eye && now - s.at < 800) ? s.eye : (sources.mouse.eye || { x: 0, y: 0, z: 55 });
+  project(eye);
+  renderer.render(scene, camera);
+  if (now - lastPanel > 200) { panel(now); lastPanel = now; }
+});
+</script>
+</body>
+</html>

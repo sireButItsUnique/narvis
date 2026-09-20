@@ -114,6 +114,11 @@ const cone = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.ConeGeomet
   new THREE.LineBasicMaterial({ color: 0x7fa3bf, transparent: true, opacity: .45 }));
 rig.add(cone);
 
+const head5 = mk(new THREE.BoxGeometry(9, 3, 3), new THREE.MeshStandardMaterial({ color: 0x3a2a4a, roughness: .7 }));
+const headCone = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.ConeGeometry(1, 1, 4, 1, true)),
+  new THREE.LineBasicMaterial({ color: 0xc79bff, transparent: true, opacity: .5 }));
+rig.add(headCone);
+
 const hand = mk(new THREE.CapsuleGeometry(2.6, 9, 6, 12), new THREE.MeshStandardMaterial({ color: 0xc79bff, roughness: .6 }));
 hand.rotation.z = Math.PI / 2;
 
@@ -125,12 +130,12 @@ const rayMat = new THREE.LineBasicMaterial({ color: 0xEF9F27 });
 const rayMat2 = new THREE.LineDashedMaterial({ color: 0xEF9F27, dashSize: 2.4, gapSize: 2 });
 
 const tags = {};
-for (const id of ['monitor', 'sheet', 'image', 'band', 'zed', 'you']) {
+for (const id of ['monitor', 'sheet', 'image', 'band', 'zed', 'you', 'headcam']) {
   const el = document.createElement('div'); el.className = 'tag'; el.textContent = id; document.body.appendChild(el);
   tags[id] = el;
 }
 const TAG_TEXT = { monitor: 'monitor (45°)', sheet: 'acrylic', image: 'floating image', band: 'usable space',
-                   zed: 'ZED', you: 'you' };
+                   zed: 'ZED (hands)', you: 'you', headcam: 'head camera' };
 for (const k in tags) tags[k].textContent = TAG_TEXT[k];
 
 const view = { eye: false, rays: true, real: false };
@@ -191,6 +196,19 @@ function build() {
   cone.scale.set(15, 32, 15);
   cone.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), dir);
 
+  // the head camera clips to the monitor's lower edge and looks at the face: above the sheet, so it never
+  // shoots through the acrylic, and rigidly attached so its pose stays true
+  const headCam = new THREE.Vector3(0, H + G - 2, zFront - 4);   // just below the monitor's lower edge
+  head5.position.copy(headCam);
+  const eyeGuess = new THREE.Vector3(0, H + 28, zFront - 70);
+  const toEye = new THREE.Vector3().subVectors(eyeGuess, headCam).normalize();
+  head5.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), toEye);
+  headCone.position.copy(headCam).addScaledVector(toEye, 16);
+  headCone.scale.set(16, 32, 16);
+  headCone.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), toEye);
+  anchors.headcam = headCam.clone().add(new THREE.Vector3(-8, 4, 0));
+  window.headCamRig = { x: +(headCam.x).toFixed(1), y: +(headCam.y - H).toFixed(1), z: +(-(headCam.z)).toFixed(1) };
+
   hand.position.set(-6, Math.min(H - 4, Math.max(4, H / 2)), zFront + 14);
   const eye = new THREE.Vector3(0, H + 28, zFront - 70);
   head.position.copy(eye).add(new THREE.Vector3(0, 2, -6));
@@ -224,7 +242,7 @@ function build() {
   const usable = Math.max(0, Math.min(H, botY < 0 ? 0 : H - (H - botY)));
   const floatCm = Math.max(0, botY);
   read.innerHTML = floatCm > 0.5
-    ? `The near edge of the image floats <b>${floatCm.toFixed(0)} cm</b> above the paper, so a model up to about that tall sits clear in the open space. The far end is <b>${Math.abs(Math.min(0, topY)).toFixed(0)} cm below the paper</b> (red), which is wasted screen: keep that part black.`
+    ? `Head camera sits at x ${window.headCamRig.x}, y ${window.headCamRig.y}, z ${window.headCamRig.z} cm from the sheet centre (type these into rigtest2). The near edge of the image floats <b>${floatCm.toFixed(0)} cm</b> above the paper, so a model up to about that tall sits clear in the open space. The far end is <b>${Math.abs(Math.min(0, topY)).toFixed(0)} cm below the paper</b> (red), which is wasted screen: keep that part black.`
     : `Nothing floats: the monitor is ${gIn}" above the sheet but the sheet is only ${hIn}" above the paper, so the whole image lands at or under the paper. Drop the monitor closer to the sheet, or raise the sheet.`;
 }
 
