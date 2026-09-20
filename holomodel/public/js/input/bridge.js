@@ -88,20 +88,36 @@ export function bridgeTick(now) {
   state.gated = state.gate.update(fresh ? { points: state.hand.cam.map(handToRig), pinch: state.hand.pinch,
                                             conf: state.hand.quality?.conf ?? state.hand.score ?? null, id: state.hand.seq } : null, now);
   const pts = state.smooth.update(state.gated.points, now);
+  writeHand(state, pts, state.gated.pinch, now);
+  return state;
+}
+
+// The hand, as the app reads it, from 21 points in RIG centimetres (already gated and smoothed) and the
+// bridge's pinch reading. `s` carries the grab machine and the grip's memory between frames. Used by
+// bridgeTick above and by rigtest3, which has its own copy of the hand and no need of a second socket.
+export function makeHandWriter({ close = 0.40, open = 0.62 } = {}) {
+  return { grab: makeGrab({ close, open, wideOpen: open + 0.38 }), rel: null };
+}
+export function writeEye(eyeRig, tracked, now) {
+  input.eye.fromArray(worldFromRig(eyeRig));
+  if (tracked) input.faceSeenAt = now;
+}
+export function writeHand(s, pts, pinch, now) {
   const h = input.hands[0], other = input.hands[1];
   other.active = false; other.pinch = false; other.jointsWorld = null;
   if (!pts) {
-    const g = state.grab.update(null, now);
+    const g = s.grab.update(null, now);
     h.active = false; h.jointsWorld = null; h.pinch = g.held;      // a coasting grip outlives a lost hand, briefly
     if (!g.held) h.pinchRatio = 1;
-    state.rel = null;
-    return state;
+    s.rel = null;
+    return;
   }
+  const state = s;
   const world = pts.map(worldFromRig);
   const joints = h.jointsWorld && h.jointsWorld.length === 63 ? h.jointsWorld : new Float32Array(63);
   world.forEach((p, i) => joints.set(p, i * 3));
   // pinch: the bridge's fused reading through the hold logic that does not drop things (rig/demo.js makeGrab)
-  const p = state.gated.pinch, gap = Number.isFinite(p?.grab) ? p.grab : Number.isFinite(p?.gap) ? p.gap : null;
+  const p = pinch, gap = Number.isFinite(p?.grab) ? p.grab : Number.isFinite(p?.gap) ? p.gap : null;
   const g = state.grab.update(gap ?? ratio(world), now);
   // grip: carried on the palm, with the fingertips' offset from it smoothed hard while holding - they are the
   // shakiest joints there are, and whatever is held is hiding them
@@ -116,7 +132,6 @@ export function bridgeTick(now) {
   h.pinchRatio = g.gap ?? 1;
   h.seenAt = now;
   h.active = true;
-  return state;
 }
 const mid = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
 const d3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);

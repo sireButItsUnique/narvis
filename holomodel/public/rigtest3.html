@@ -553,8 +553,19 @@ scene.add(handMask.group);
 const handSmooth = makeHandSmoother({ holdMs: 0 });
 const handGate = makeHandGate({ minConf: setup.stability.minConf, holdMs: setup.stability.holdMs });
 let gated = { points: null, pinch: null, state: 'gone', conf: null, heldMs: 0 };
-const DEMO_SCENES = new Set(['grab', 'surface']), HAND_SCENES = new Set(['hands', 'grab', 'surface']);
+const DEMO_SCENES = new Set(['grab', 'surface']), HAND_SCENES = new Set(['hands', 'grab', 'surface', 'model']);
 let demo = null, demoView = null, handStyle = 'mask', handDrawn = null;
+// Scene 8: Holomodel - models made by voice, six tools, sculpting - hosted in THIS page (js/holo-host.js):
+// this page's hand and eye go in, its scene comes back and is drawn here, behind the black hand.
+let holo = null, holoLoading = false;
+function mountModelScene() {
+  if (holo || holoLoading) return;
+  holoLoading = true;
+  flash('Starting Holomodel...');
+  import('./js/holo-host.js').then(m => m.mountHolomodel({ renderer, grab: grabOptions(), ownFrame: frame }))
+    .then(h => { holo = h; flash('Say "Narvis, make a teapot". Keys 1-6 pick the tool; Y puts a test teapot down; 0 leaves.'); hint(); })
+    .catch(e => { holoLoading = false; console.error(e); flash('Holomodel could not start: ' + (e?.message || e) + ' - is this page served by holomodel (npm start, port 8765)?'); });
+}
 const grabOptions = () => ({ close: setup.demo.grabClose, open: setup.demo.grabOpen, wideOpen: setup.demo.grabOpen + 0.38 });
 
 const lineMat = (c, o = 1) => new THREE.LineBasicMaterial({ color: c, transparent: o < 1, opacity: o, toneMapped: false });
@@ -709,6 +720,7 @@ function buildScene() {
     // Your hand, and the mat grid to judge the display by. Neither needs the "usable volume" box, which is
     // empty on this rig, so these scenes are built before that box gets a say.
     if (gridOn) world.add(matGrid(DEMO_SCENES.has(sceneKind)));
+    if (sceneKind === 'model') mountModelScene();
     if (DEMO_SCENES.has(sceneKind)) {
       demo = DM.makeDemo(sceneKind, { floorY: -setup.rig.baseDropCm, grab: grabOptions() });
       demoView = DM.makeDemoView(THREE, demo);
@@ -848,7 +860,7 @@ function frame(now) {
   gated = handGate.update(freshHand ? { points: bridgeHand.cam.map(handToRig), pinch: bridgeHand.pinch,
                                         conf: bridgeHand.quality?.conf ?? bridgeHand.score ?? null, id: bridgeHand.seq } : null, now);
   handDrawn = handSmooth.update(gated.points, now);
-  const masked = !!demo && handStyle === 'mask';
+  const masked = (!!demo || sceneKind === 'model') && handStyle === 'mask';
   handRig.tint(gated.state !== 'tracking');
   handRig.update(masked ? null : handDrawn);
   handMask.update(masked ? handDrawn : null);
@@ -861,7 +873,29 @@ function frame(now) {
   applyFlips();
   // While the setup panel covers the screen there is nothing of the rig view to see (it is opaque and
   // inset:0), so the whole frame budget goes to the camera previews the user is aiming by.
-  if (!setupVisible()) renderer.render(scene, camera);
+  if (holo && sceneKind === 'model') {
+    // Holomodel is told where the hand and eye are, runs its own tools on them, and its scene is drawn here
+    // first; this page's scene - the black hand - goes over it with the depth kept, so a real hand in front
+    // of the model hides it and one behind does not.
+    holo.feed({ eyeRig, tracked: !!source.usable, handRig: handDrawn, pinch: handDrawn ? gated.pinch : null, now });
+    holo.tick(now);
+    holo.aim(rc);
+    if (!setupVisible()) {
+      const tone = renderer.toneMapping;
+      renderer.autoClear = false;
+      renderer.clear();
+      renderer.toneMapping = THREE.NeutralToneMapping;
+      renderer.render(holo.scene, holo.camera);
+      renderer.toneMapping = tone;
+      // a Scene whose background is a Color clears the canvas when it is drawn, autoClear or not - which
+      // would wipe the model that was just drawn. The canvas is already cleared to black.
+      const bg = scene.background;
+      scene.background = null;
+      renderer.render(scene, camera);
+      scene.background = bg;
+      renderer.autoClear = true;
+    }
+  } else if (!setupVisible()) renderer.render(scene, camera);
   frames++;
   if (now - fpsAt > 500) { fps = frames * 1000 / (now - fpsAt); frames = 0; fpsAt = now; paintChrome(); }
   requestAnimationFrame(frame);
@@ -975,7 +1009,8 @@ const escapeHtml = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '
 
 function hint() {
   $('hint').textContent = [
-    `scene: ${sceneKind}${droppedName ? ' (' + droppedName + ')' : ''}   1 cube · 2 posts · 3 teapot · 4 dropped .glb · 5 your hand only · 6 pick things up · 7 press the sheet`,
+    `scene: ${sceneKind}${droppedName ? ' (' + droppedName + ')' : ''}   1 cube · 2 posts · 3 teapot · 4 dropped .glb · 5 your hand only · 6 pick things up · 7 press the sheet · 8 model by voice`,
+    ...(sceneKind === 'model' ? [holo ? (() => { const st = holo.status(); return `Holomodel: ${st.tool || '-'}${st.heard ? '   heard: ' + st.heard : ''}${st.hasModel ? '' : '   (no model yet: say "Narvis, make a ...", or Y for a test teapot)'}   keys 1-6 tools · Y test teapot · O hand black / bones · 0 leave`; })() : 'Holomodel is starting...'] : []),
     ...(DEMO_SCENES.has(sceneKind) ? ['R start the demo again   O hand drawn in black (hides what is behind it) / as bones   ; \' grab less / more easily'] : []),
     'S setup   H readout   P place your hand by eye   Q tracking stability   G mat grid   D copy diagnostics   A measure the ZED’s tilt from your head   M mouse stand-in   T trim   F fullscreen   X panel mounted upside down   V flip the setup page too',
   ].join('\n');
@@ -1763,6 +1798,12 @@ addEventListener('keydown', e => {
     if (k === 'escape') { setup.trimCm = trimBackup.slice(); save(); setTrim(false); paintForm(); return; }
   }
   if (typing) return;
+  // In the model scene most keys are Holomodel's (1-6 tools, [ ] brush, arrows turn...). It has its own
+  // listener; this page keeps only the keys that are about the RIG, and must not also act on the others
+  // (C would start a calibration capture, X would flip the panel).
+  if (sceneKind === 'model' && !['s', 'h', 'p', 'q', 'f', 'o', 'g', 'y', '0', 'escape'].includes(k)) return;
+  if (sceneKind === 'model' && k === '0') { sceneKind = 'hands'; buildScene(); return; }
+  if (sceneKind === 'model' && k === 'y') { holo?.loadFixture().then(() => flash('A test teapot. Pinch it (tool 1 moves, 2 turns, 3 nearer, 4 bigger, 5 adds clay, 6 smooths).')); return; }
   if (k === 's') showSetup($('setup').classList.contains('hidden'));
   else if (k === 'escape') { showSetup(false); setTrim(false); }
   else if (k === 'h') { const on = $('readout').classList.toggle('hidden'); $('hint').classList.toggle('hidden', on); }
@@ -1795,8 +1836,9 @@ addEventListener('keydown', e => {
   else if (k === '5') { sceneKind = 'hands'; buildScene(); }
   else if (k === '6') { sceneKind = 'grab'; buildScene(); flash('Pinch a shape, carry it to the platform, let go over its outline. R starts again.'); }
   else if (k === '7') { sceneKind = 'surface'; buildScene(); flash('Press the sheet with your fingers: the marbles roll into the dents. R starts again.'); }
+  else if (k === '8') { sceneKind = 'model'; buildScene(); }
   else if (k === 'r' && demo) { demo.reset(); flash('Demo reset'); }
-  else if (k === 'o' && demo) { handStyle = handStyle === 'mask' ? 'bones' : 'mask';
+  else if (k === 'o' && (demo || sceneKind === 'model')) { handStyle = handStyle === 'mask' ? 'bones' : 'mask';
     flash(handStyle === 'mask' ? 'Hand drawn in black: it hides what is behind it, so your real hand is in front' : 'Hand drawn as bones'); }
   else if ((k === ';' || k === "'") && demo) {
     // one number: how closed a pinch has to be. The let-go threshold follows it at a fixed distance.
@@ -1885,6 +1927,9 @@ window.rigtest3 = window.rigtest2 = {
   gate: () => ({ ...gated, points: undefined, drawn: !!handDrawn, options: { ...handGate.options }, stats: handGate.stats(),
                  quality: bridgeHand?.quality ?? null, landmarker: landmarkerNow(), saved: { ...setup.stability },
                  wrist: handDrawn ? handDrawn[0].map(v => +v.toFixed(2)) : null, tintHeld: gated.state !== 'tracking' }),
+  holo: () => holo && ({ ...holo.status() }),
+  // run frames by hand: a browser that is not showing the page runs no animation frames at all
+  step: (n = 1) => { for (let i = 0; i < n; i++) frame(performance.now()); return n; },
   demo: () => demo && ({ kind: demo.kind, state: demo.state, point: demo.point, handStyle, options: demo.machine.options,
                          held: demo.world.held ?? null, hot: demo.world.hot ?? null, doneAt: demo.world.doneAt ?? null,
                          bodies: (demo.world.bodies || []).map(b => ({ id: b.id, pos: b.pos.map(n => +n.toFixed(2)), socket: b.socket })),
