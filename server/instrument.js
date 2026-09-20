@@ -7,6 +7,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as Sentry from '@sentry/node';
+import { nodeProfilingIntegration } from '@sentry/profiling-node';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 try { process.loadEnvFile(path.join(root, '.env')); } catch {}
@@ -20,10 +21,13 @@ if (dsn) {
     tracesSampleRate: 1.0,   // every build is interesting at a hackathon
     enableLogs: true,
     sendDefaultPii: false,
+    profileSessionSampleRate: 1.0,   // profiles run alongside traces, so a slow build shows which code was slow
+    profileLifecycle: 'trace',
     integrations: [
       Sentry.anthropicAIIntegration({ recordInputs: true, recordOutputs: true }),
       Sentry.consoleLoggingIntegration({ levels: ['warn', 'error'] }),
+      nodeProfilingIntegration(),
     ],
   });
-  console.log('Sentry: on (tracing, AI agent monitoring, logs)');
+  console.log('Sentry: on (tracing, AI agent monitoring, profiling, logs)');
 }

@@ -21,6 +21,7 @@
     "@elevenlabs/elevenlabs-js": "^2.68.0",
     "@mediapipe/tasks-vision": "0.10.35",
     "@sentry/node": "^10.75.0",
+    "@sentry/profiling-node": "^10.75.0",
     "mongodb": "^7.6.0",
     "openai": "^7.19.0",
     "three": "0.170.0"
