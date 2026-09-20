@@ -38,12 +38,17 @@ const Z = new THREE.Vector3(0, 0, 1);
 
 // pointers: [{ active, dir, pinch, end (world point the beam reaches), hand (input hand or null) }]
 // brush: { point, normal, radius } in world units, or null
+// On the rig the hand is not drawn as bones: the real hand is right there under the glass, and what the
+// picture owes it is OCCLUSION (rig/hands.js makeHandMask, driven from main.js). The cursor, the beam and
+// the brush ring stay - they say what the hand is pointing at, which the real hand cannot.
+let bonesOn = true;
+export function setBonesVisible(on) { bonesOn = !!on; }
 export function updateViz(pointers, eye, brush) {
   vis.forEach((v, i) => {
     const p = pointers[i];
     const show = !!p && p.active && p.dir.z < -1e-3;
     v.cursor.visible = v.beam.visible = show;
-    v.bones.visible = v.joints.visible = show && !!p.hand?.jointsWorld;
+    v.bones.visible = v.joints.visible = bonesOn && show && !!p.hand?.jointsWorld;
     if (!show) return;
     const onGlass = eye.clone().addScaledVector(p.dir, -eye.z / p.dir.z);
     v.cursor.position.set(onGlass.x, onGlass.y, 0.05);

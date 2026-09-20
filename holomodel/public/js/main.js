@@ -9,6 +9,8 @@ import { input } from './input/state.js';
 import { startBridge, bridgeTick, bridgeStatus, bridgeState, STAGE, WORLD_FROM_RIG, loadSetup, rigFromSetup } from './input/bridge.js';
 import { RigView } from './rig/output.js';
 import { applyRigCamera } from './rig/geometry.js';
+import { makeHandMask } from './rig/hands.js';
+import { setBonesVisible } from './handviz.js';
 import { updateInteraction, pointedPart, tool, TOOLS, SCULPT_TOOLS, setBrush, setNotify, zoomState } from './interaction.js';
 import * as sculpt from './sculpting.js';
 import { model, parts, showScene, clearScene, scaleBy, setSpin, turnBy, undo, undoDepth, resetPlacement, focusPart,
@@ -113,7 +115,7 @@ function setTool(mode) {
 // The app's world is a box behind "the display". On the rig that box is a stage in the slot under the sheet
 // (input/bridge.js STAGE): the display's size becomes the stage's front face, the room's walls go (every lit
 // pixel is hologram), and the camera is the rig's off-axis one, handed the stage's place in the rig.
-let rigView = null;
+let rigView = null, handMask = null;
 const params = new URLSearchParams(location.search);
 function startRig() {
   S.diagIn = STAGE.diagIn;
@@ -127,6 +129,12 @@ function startRig() {
   rigView.enter();
   views.length = 0;
   views.push({ camera: rigView.camera, viewport: null });
+  // Your hand, the way the rig page draws it: in BLACK, with depth. A Pepper's ghost only adds light, so a
+  // model shines straight through real fingers; black is no light, so where the drawn hand is nearer the
+  // eye than the model, the model goes dark there and the real hand is what you see. O swaps it for bones.
+  handMask = makeHandMask(THREE);
+  scene.add(handMask.group);
+  setBonesVisible(false);
 }
 $('btn-cam').addEventListener('click', async () => {
   startRig();
@@ -566,6 +574,7 @@ addEventListener('keydown', async e => {
   else if (k === 'v') { if (started) { S.mic = voice.toggle(); saveSettings(); } }
   else if (k === 't') { S.talk = !S.talk; saveSettings(); if (!S.talk) speaker.stop(); flash(`Spoken replies ${S.talk ? 'on' : 'off'}`); }
   else if (k === 'l') { if (started) toggleLog(); }
+  else if (k === 'o' && handMask) { maskOn = !maskOn; setBonesVisible(!maskOn); flash(maskOn ? 'Hand drawn in black: it hides what is behind it' : 'Hand drawn as bones'); }
   else if (k === 'k') { if (started) runCommand({ type: 'clay', on: !clayOn }); }
   else if (k >= '1' && k <= '6') { if (started) setTool(TOOLS[+k - 1]); }
   else if (k === '[' || k === ']') { if (started) runCommand({ type: 'brush', factor: k === ']' ? 1.35 : 1 / 1.35 }); }
@@ -581,7 +590,7 @@ addEventListener('resize', onResize);
 document.addEventListener('fullscreenchange', onResize);
 
 // ---------- main loop ----------
-let fps = 0, frames = 0, fpsT0 = performance.now(), lastT = performance.now();
+let fps = 0, frames = 0, fpsT0 = performance.now(), lastT = performance.now(), maskOn = true;
 function frame(now) {
   requestAnimationFrame(frame);
   tick(now);
@@ -596,6 +605,10 @@ function tick(now) {
 
   updateInteraction();
   updateModel(dt);
+  if (handMask) {
+    const h = input.hands[0], j = h.active && maskOn ? h.jointsWorld : null;
+    handMask.update(j ? Array.from({ length: 21 }, (_, i) => [j[i * 3], j[i * 3 + 1], j[i * 3 + 2]]) : null);
+  }
   if (rigView) {
     // the eye is already in rig centimetres; the scene is in the app's own frame, one translation away
     rigView.update(bridgeState().eyeRig, { rigFrame: true });
