@@ -1,0 +1,5 @@
+# secrets and installs never go in the repo
+.env
+.env.*
+!.env.example
+node_modules/
