@@ -13,6 +13,8 @@ from repo_triage_agent.reasoner import reason
 from repo_triage_agent.provider import from_config, ProviderError
 from repo_triage_agent import workingcopy
 from repo_triage_agent.adapters import adapter_for
+from repo_triage_agent import intent as intents
+from .voice import from_config as voice_from_config, VoiceError
 from .contracts import (DEFAULT_HAND_FRAME, DEFAULT_RIG, DEFAULT_VOLUME, validate_eye,
                         validate_graph, validate_hand_frame, validate_rig, validate_view,
                         validate_volume)
@@ -32,7 +34,7 @@ def atomic_json(path, value):
 
 
 class State:
-    def __init__(self, runtime, demo=False, model=None, endpoint="", model_name=""):
+    def __init__(self, runtime, demo=False, model=None, endpoint="", model_name="", voice_id=""):
         self.runtime = Path(runtime)
         self.runtime.mkdir(parents=True,exist_ok=True)
         self.token = secrets.token_urlsafe(32)
@@ -51,6 +53,8 @@ class State:
         self.view = []
         self.eye = None
         self.eye_received = 0.
+        self.voice = voice_from_config(voice_id)
+        self.heard = []
         # Rig geometry, unlike the graph, survives a restart: it describes the desk, not the session.
         self.rig = self._restore("rig.json", validate_rig, DEFAULT_RIG)
         self.volume = self._restore("volume.json", validate_volume, DEFAULT_VOLUME)
@@ -200,6 +204,214 @@ class State:
             return {"node": node, "citations": [ev] if ev.get("path") else [],
                     "incoming": incoming, "outgoing": outgoing,
                     "provenance": "indexed_evidence"}
+
+    # ---- spoken interaction ------------------------------------------------------------------
+    # An utterance becomes exactly one verb. The grammar answers first and cannot invent; only what it
+    # does not recognise reaches the provider, and that answer is checked against the loaded graph before
+    # anything happens. Reading verbs run. The one verb that writes is proposed and never executed here:
+    # a microphone is not a good enough witness for starting a task that runs a repository's test command.
+    def ask(self, utterance, trail=None):
+        if not isinstance(utterance, str) or not utterance.strip():
+            raise ValueError("say something")
+        if len(utterance) > 600:
+            raise ValueError("utterance too long")
+        parsed = intents.parse(utterance)
+        if parsed is None:
+            parsed = self._ask_provider(utterance)
+        return self._ground(parsed, trail if isinstance(trail, list) else list(self.view))
+
+    def _ask_provider(self, utterance):
+        try:
+            text = self.provider.complete([
+                {"role": "system", "content": intents.SYSTEM_PROMPT},
+                {"role": "user", "content": utterance[:600]}])
+        except ProviderError as exc:
+            return dict(verb="describe", argument="", source="unavailable",
+                        say=f"I did not understand that, and the language model is unavailable: {exc}",
+                        utterance=utterance)
+        try:
+            start, end = text.index("{"), text.rindex("}") + 1
+            value = intents.validate_model_intent(json.loads(text[start:end]))
+        except (ValueError, KeyError):
+            return dict(verb="describe", argument="", source="unparsed",
+                        say="I did not catch that.", utterance=utterance)
+        value["utterance"] = utterance
+        return value
+
+    def _paths(self, nodes):
+        return {n["id"]: (n["evidence"] or {}).get("path", "") if n["kind"] == "module"
+                else (n.get("scope") or {}).get("module", "") for n in nodes}
+
+    def _ground(self, parsed, trail):
+        """Turn a verb into something the desk can do, against the graph that is actually loaded."""
+        with self.lock:
+            nodes = list(self.graph["nodes"])
+        verb, argument = parsed["verb"], parsed.get("argument", "")
+        out = dict(verb=verb, argument=argument, source=parsed.get("source", "grammar"),
+                   utterance=parsed.get("utterance", ""), trail=list(trail), acts=False,
+                   needs_confirmation=False, say=parsed.get("say", ""), candidates=[])
+        paths = self._paths(nodes)
+        here = trail[-1] if trail else ""
+
+        if verb in ("ascend", "root"):
+            out["trail"] = [] if verb == "root" else list(trail[:-1])
+            out["say"] = out["say"] or ("Back to the system view." if verb == "root" else "Going up.")
+            return out
+        if verb == "zoom":
+            out["zoom"] = argument if argument in ("in", "out", "fit") else "fit"
+            out["say"] = out["say"] or f"Zooming {out['zoom']}."
+            return out
+        if verb == "tasks":
+            tasks = self.store.list_tasks(limit=5)
+            out["tasks"] = [{"id": t["id"], "status": t["status"]} for t in tasks]
+            out["say"] = out["say"] or (f"{len(tasks)} task{'s' if len(tasks) != 1 else ''}: " +
+                                        ", ".join(f"{t['id']} {t['status']}" for t in tasks)
+                                        if tasks else "No tasks.")
+            return out
+        if verb == "cancel":
+            running = [t for t in self.store.list_tasks(limit=10) if t["status"] == "running"]
+            if not running:
+                out["say"] = out["say"] or "Nothing is running."
+                return out
+            self.cancel_task(running[0]["id"])
+            out["cancelled"] = running[0]["id"]
+            out["say"] = out["say"] or f"Cancelling task {running[0]['id']}."
+            return out
+        if verb == "describe":
+            out["say"] = out["say"] or self._describe(here, nodes)
+            return out
+
+        if verb == "search":
+            found = intents.resolve(intents.normalise(argument), nodes, paths, limit=6)
+            out["candidates"] = [self._candidate(c, paths) for c in found]
+            out["say"] = out["say"] or (f"{len(found)} match{'es' if len(found) != 1 else ''} for {argument}."
+                                        if found else f"Nothing indexed matches {argument}.")
+            return out
+
+        if verb == "implement":
+            # The argument is a DESCRIPTION of a change, not the name of a node: resolving "add a retry
+            # around the provider" as if it named one thing produces a confident, wrong target.
+            out["acts"] = True
+            out["needs_confirmation"] = True
+            focus_node = self._node_at(here, nodes)
+            out["proposal"] = {"description": argument, "node_id": focus_node["id"] if focus_node else "",
+                               "scope": here or "the repository root"}
+            out["say"] = out["say"] or (
+                f"I can propose that against {out['proposal']['scope']}. Confirm and I will open a task.")
+            return out
+
+        if verb in ("navigate", "explain"):
+            # Navigation may land on a folder; explaining cannot, because a folder has no evidence.
+            searchable = nodes + (intents.directories(paths) if verb == "navigate" else [])
+            target = None
+            if argument:
+                found = intents.resolve(intents.normalise(argument), searchable, paths, limit=4)
+                out["candidates"] = [self._candidate(c, paths) for c in found]
+                # An ambiguous name asks rather than guessing: two things with nearly equal claim to a
+                # phrase is not a decision a microphone should make. The test is a RATIO, not a
+                # difference — a clear leader at 0.9 against 0.7 is clear, and at 0.3 against 0.1 it is
+                # not, though the gap is the same.
+                if found and (len(found) == 1 or
+                              (found[0]["score"] >= .5 and found[0]["score"] >= found[1]["score"] * 1.25)):
+                    target = found[0]["node"]
+                elif found:
+                    out["ambiguous"] = True
+                    out["say"] = out["say"] or ("Which one: " +
+                        ", ".join(c["node"]["label"] for c in found[:3]) + "?")
+                    return out
+                else:
+                    out["say"] = out["say"] or f"I have nothing indexed called {argument}."
+                    return out
+            if verb == "navigate":
+                if not target:
+                    out["say"] = out["say"] or "Where to?"
+                    return out
+                out["trail"] = self._trail_to(target, paths)
+                out["say"] = out["say"] or f"Opening {target['label']}."
+                return out
+            if verb == "explain":
+                node = target or self._node_at(here, nodes)
+                if node is None:
+                    out["say"] = out["say"] or "Point at something first."
+                    return out
+                explained = self.explain_node(node["id"])
+                out["explain"] = explained
+                out["node_id"] = node["id"]
+                evidence = (explained["citations"] or [{}])[0]
+                where = f"{evidence.get('path', '')}:{evidence.get('line', '')}".strip(":")
+                out["say"] = out["say"] or (
+                    f"{node['label']} is a {node['kind']}"
+                    + (f" in {where}" if where else "")
+                    + f", with {len(explained['incoming'])} callers and {len(explained['outgoing'])} calls out.")
+                return out
+            # implement: proposed, never started from here.
+            out["acts"] = True
+            out["needs_confirmation"] = True
+            out["proposal"] = {"description": argument, "node_id": target["id"] if target else "",
+                               "scope": here or "the repository root"}
+            out["say"] = out["say"] or (
+                f"I can propose that against {out['proposal']['scope']}. Confirm and I will open a task.")
+            return out
+
+        out["say"] = out["say"] or "I did not catch that."
+        return out
+
+    def _candidate(self, found, paths):
+        node = found["node"]
+        return {"id": node["id"], "label": node["label"], "kind": node["kind"],
+                "path": paths.get(node["id"], ""), "score": found["score"],
+                "node": {"id": node["id"], "label": node["label"], "kind": node["kind"]}}
+
+    def _node_at(self, here, nodes):
+        if not here:
+            return None
+        for node in nodes:
+            if node["id"] == here:
+                return node
+        paths = self._paths(nodes)
+        for node in nodes:
+            if node["kind"] == "module" and paths.get(node["id"]) == here:
+                return node
+        return None
+
+    def _trail_to(self, node, paths):
+        if node.get("directory"):
+            parts = [p for p in node["directory"].split("/") if p]
+            return ["/".join(parts[:i + 1]) for i in range(len(parts))][:8]
+        path = paths.get(node["id"], "")
+        parts = [p for p in path.split("/") if p]
+        trail = ["/".join(parts[:i + 1]) for i in range(len(parts))]
+        if node["kind"] != "module":
+            trail.append(node["id"])
+        return trail[:8]
+
+    def _describe(self, here, nodes):
+        if not here:
+            return (f"The system view, {len({(self._paths(nodes).get(n['id']) or '').split('/')[0] for n in nodes if n['kind'] == 'module'})}"
+                    f" top level folders, {len(nodes)} indexed nodes.")
+        node = self._node_at(here, nodes)
+        if node is None:
+            return f"Looking at {here}."
+        return f"{node['label']}, a {node['kind']}."
+
+    def voice_status(self):
+        status = dict(self.voice.status())
+        status["provider"] = self.provider.name
+        return status
+
+    def listen(self, audio, content_type):
+        """Audio in, transcript and intent out. The one path that leaves this machine."""
+        heard = self.voice.transcribe(audio, content_type)
+        answer = self.ask(heard["text"]) if heard["text"] else dict(
+            verb="describe", say="I did not hear anything.", argument="", source="silence",
+            utterance="", trail=list(self.view), acts=False, needs_confirmation=False, candidates=[])
+        answer["heard"] = heard["text"]
+        with self.lock:
+            self.heard = ([{"text": heard["text"], "verb": answer["verb"]}] + self.heard)[:20]
+        return answer
+
+    def say(self, text):
+        return self.voice.speak(text)
 
     def provider_status(self):
         return {"name": self.provider.name, "endpoint": getattr(self.provider, "endpoint", ""),

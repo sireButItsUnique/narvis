@@ -28,6 +28,8 @@ Installation may need internet for packaging dependencies; the installed demo an
 | `synapsedesk/` | Loopback HTTP service, versioned contracts, latest-state SSE at 30 Hz, bounded requests, graph publication, session token, SQLite persistence (`store.py`), agent task lifecycle (`state.py`) |
 | `laptop_hand_tracking/` | Optional Windows camera worker, local MediaPipe palm/landmark inference, pinch gating, simulator, calibrated depth-point filtering |
 | `web_ar_canvas/` | Dependency-free HTML5 Canvas, skeletal HUD, homography calibration, pinch/mouse dragging, animated wires, evidence panel, component search, chrome-free `/display` route |
+| `repo_triage_agent/intent.py` | Spoken sentence → one grounded verb; grammar first, provider only for what it cannot parse |
+| `synapsedesk/voice.py` | ElevenLabs speech, gated off by default; the one path that leaves the machine |
 | `repo_triage_agent/` | Polyglot evidence extraction (`analyze.py`, `adapters.py`, `universal.py`, `rust.py`, `tsplugins.py`), source/doc reconciliation, import-cycle detection, optional local LLM review (`reasoner.py`), scoped agent tasks (`provider.py`, `workingcopy.py`) |
 | `web_ar_canvas/public/hologram.mjs` | Rig view: off-axis projection through the vendored `rig-geometry.mjs`, level placement, touch and pointing in the volume |
 | `frontend/` | Pinned React/Monaco/Three.js toolchain, dormant until [the tripwire](frontend/TRIPWIRE.md) trips; vendored builds serve from `/vendored/*` |
@@ -181,6 +183,32 @@ position that cannot be trusted freezes the volume instead of drawing a confiden
 
 `.\scripts\Start-SynapseDesk.ps1 -Demo` simulates both a head and a hand in the volume, so the whole
 interaction can be rehearsed with no cameras attached. See [the protocol](docs/PROTOCOL.md).
+
+## Asking it things
+
+The **ASK** box takes a sentence and turns it into one action on the desk. *Open the triage agent.* *Go
+up.* *Explain store.* *Find rollback.* *What is this?* A grammar handles these with no model call, so they
+cannot be misread into something else, and names are resolved against the index: one match opens it,
+several ask which, none says so.
+
+*Implement a retry around the provider* is different. It writes into a working copy and runs that
+repository's test command, so it comes back as a **proposal with a Confirm button** and never starts on
+its own. Something has to say yes, and a microphone is not a good enough witness.
+
+Hold the **●** button to talk. Speech goes through ElevenLabs, called from the service so your key never
+reaches the browser:
+
+```powershell
+$env:SYNAPSEDESK_ELEVENLABS_API_KEY = 'your-key'
+.\scripts\Start-SynapseDesk.ps1 -Repo 'C:\projects\my-repo' -Voice 'your-voice-id'
+```
+
+`GET /api/voice/voices` lists the voices on your account. Without a key and a voice the box still works by
+typing, and the panel says plainly that voice is off rather than failing quietly.
+
+**This is the one thing here that leaves your machine.** Analysis never does, the local reasoner is pinned
+to 127.0.0.1, and hand and head tracking are yours. Audio is sent to ElevenLabs to be transcribed and
+replies are synthesised there. The browser records only while the button is held.
 
 ## Optional Kinect/depth input
 

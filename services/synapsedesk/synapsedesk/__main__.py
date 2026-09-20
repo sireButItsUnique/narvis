@@ -22,6 +22,7 @@ def build_parser():
     serve.add_argument("--model",help="optional installed local Ollama model name")
     serve.add_argument("--model-endpoint",default="",help="Chat Completions-compatible base URL (live-agent gate)")
     serve.add_argument("--model-name",default="",help="model name for the Chat Completions endpoint")
+    serve.add_argument("--voice",default="",help="ElevenLabs voice id (GET /api/voice/voices lists them)")
     track=commands.add_parser("track",help="run a real local camera worker")
     track.add_argument("--camera",type=int,default=0)
     track.add_argument("--backend",choices=("dshow","msmf","auto"),default="dshow")

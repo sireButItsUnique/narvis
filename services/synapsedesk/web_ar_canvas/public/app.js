@@ -325,11 +325,97 @@ function wireSearchAndAgent(){
   const described=$('agentDesc').value||'scoped change';
   const r=await api('/api/agent/tasks',{source:src,description:`[${focusKind()} ${scope}] ${described}`,node_id:selectedId&&!selectedId.startsWith('d:')&&!selectedId.startsWith('f:')?selectedId:''});
   $('agentOut').textContent=`Task ${r.id} running against ${scope}`;}catch(e){notify(e.message);}};
+ wireAsk();
  const ts=$('agentTasks');
  if(ts)ts.onclick=async()=>{try{const r=await fetch('/api/agent/tasks');const j=await r.json();$('agentOut').textContent=j.tasks.map(t=>`#${t.id} ${t.status}${t.detail?.error?' · '+t.detail.error.slice(0,80):''}`).join(' | ')||'No tasks';}catch(e){notify(e.message);}};
 }
+// ---- ask -------------------------------------------------------------------------------------
+// One utterance, one verb. Reading verbs are applied here; the verb that writes comes back needing a
+// confirmation, and the confirmation is a click — not a sentence the microphone thought it heard.
+let pendingProposal=null,recorder=null,chunks=[];
+async function applyAnswer(answer){
+ const out=$('askOut');
+ pendingProposal=null;
+ if(out)out.textContent=(answer.heard?`“${answer.heard}” · `:'')+answer.say;
+ if(answer.verb==='navigate'||answer.verb==='ascend'||answer.verb==='root'){
+  if(Array.isArray(answer.trail)&&!answer.ambiguous){trail=answer.trail.slice(0,8);selectedId=null;rebuild();publishView();}
+ } else if(answer.verb==='explain'&&answer.node_id){selectedId=answer.node_id;}
+ else if(answer.verb==='search'){
+  const box=$('searchResults');
+  if(box){box.replaceChildren();
+   for(const c of answer.candidates||[]){const b=document.createElement('button');b.className='hit';
+    b.textContent=`${c.kind} ${c.label}`;b.onclick=()=>{jumpTo(c.path||'');selectedId=c.id;};box.append(b);}}
+ } else if(answer.ambiguous){
+  const box=$('searchResults');
+  if(box){box.replaceChildren();
+   for(const c of answer.candidates||[]){const b=document.createElement('button');b.className='hit';
+    b.textContent=`${c.kind} ${c.label}`;b.onclick=()=>ask(`open ${c.label}`);box.append(b);}}
+ } else if(answer.needs_confirmation&&answer.proposal){
+  pendingProposal=answer.proposal;
+  if(out){const go=document.createElement('button');go.className='hit';go.textContent='Confirm — open a task';
+   go.onclick=confirmProposal;out.append(document.createElement('br'),go);}
+ }
+ if(answer.say)speak(answer.say);
+}
+async function ask(utterance){
+ try{await applyAnswer(await api('/api/agent/ask',{utterance,trail}));}catch(e){notify(e.message);}
+}
+async function confirmProposal(){
+ if(!pendingProposal)return;
+ const src=$('source').value;
+ if(!src){notify('Set repository first');return;}
+ try{const r=await api('/api/agent/tasks',{source:src,description:pendingProposal.description,
+   node_id:pendingProposal.node_id||''});
+  $('askOut').textContent=`Task ${r.id} running against ${pendingProposal.scope}`;pendingProposal=null;
+ }catch(e){notify(e.message);}
+}
+// Speech is optional and remote; a desk with no voice configured stays silent rather than complaining.
+async function speak(text){
+ if(!voiceLive||!text)return;
+ try{const res=await fetch('/api/voice/say',{method:'POST',headers:{'Content-Type':'application/json',
+   'X-Synapse-Token':token},body:JSON.stringify({text})});
+  if(!res.ok)return;
+  const audio=new Audio(URL.createObjectURL(await res.blob()));audio.play().catch(()=>{});
+ }catch{}
+}
+let voiceLive=false;
+function wireAsk(){
+ on('askGo','onclick',()=>{const t=$('askText').value.trim();if(t)ask(t);});
+ const box=$('askText');
+ if(box)box.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();const t=box.value.trim();if(t)ask(t);}};
+ const talk=$('askTalk');
+ if(!talk)return;
+ // Push to talk: holding the button records, releasing sends. No hot mic — the desk listens when asked.
+ const start=async()=>{
+  if(!voiceLive){notify('Voice is off. Set SYNAPSEDESK_ELEVENLABS_API_KEY and choose a voice.');return;}
+  try{
+   const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+   chunks=[];recorder=new MediaRecorder(stream);
+   recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};
+   recorder.onstop=async()=>{
+    stream.getTracks().forEach(t=>t.stop());
+    const blob=new Blob(chunks,{type:recorder.mimeType||'audio/webm'});
+    if(!blob.size)return;
+    try{
+     const res=await fetch('/api/voice/listen',{method:'POST',
+      headers:{'Content-Type':blob.type,'X-Synapse-Token':token},body:blob});
+     const answer=await res.json();
+     if(!res.ok)throw Error(answer.error||'Listening failed');
+     applyAnswer(answer);
+    }catch(e){notify(e.message);}
+   };
+   recorder.start();talk.classList.add('active');
+  }catch(e){notify('Microphone unavailable: '+e.message);}
+ };
+ const stop=()=>{talk.classList.remove('active');if(recorder&&recorder.state==='recording')recorder.stop();recorder=null;};
+ talk.onpointerdown=e=>{e.preventDefault();start();};
+ talk.onpointerup=talk.onpointerleave=stop;
+}
+
 async function syncPositions(force=false){try{const p=await fetch('/api/positions');if(!p.ok)return;const pj=await p.json();for(const [k,v] of Object.entries(pj.positions||{})){if(!scoped(k))continue;if(force||!positions.has(k))positions.set(k,v);placed.add(k);}}catch{}}
-async function boot(){try{const res=await fetch('/api/session');if(!res.ok)throw Error('Session unavailable');const session=await res.json();token=session.token;set('demo','hidden',!session.demo);set('mode','textContent',session.demo?'SIMULATED HAND':'LOCAL CAMERA');await syncPositions();if(DISPLAY)setInterval(()=>syncPositions(true),1500);try{const ps=await fetch('/api/provider/status');if(ps.ok){const st=await ps.json();const el=$('providerState');if(el)el.textContent=st.live?`${st.name} · live`:'stub · blocked';}}catch{}
+async function boot(){try{const res=await fetch('/api/session');if(!res.ok)throw Error('Session unavailable');const session=await res.json();token=session.token;set('demo','hidden',!session.demo);set('mode','textContent',session.demo?'SIMULATED HAND':'LOCAL CAMERA');await syncPositions();if(DISPLAY)setInterval(()=>syncPositions(true),1500);try{const vs=await fetch('/api/voice/status');if(vs.ok){const v=await vs.json();voiceLive=!!v.live;
+ set('voiceState','textContent',v.live?`${v.name} · live`:`voice off${v.reason?' · '+v.reason:''}`);}}catch{}
+try{const ps=await fetch('/api/provider/status');if(ps.ok){const st=await ps.json();const el=$('providerState');if(el)el.textContent=st.live?`${st.name} · live`:'stub · blocked';}}catch{}
 wireSearchAndAgent();const events=new EventSource('/events');events.addEventListener('state',e=>{const data=JSON.parse(e.data);tracking=data.tracking;lastEvent=performance.now();if(data.demo_fault)set('fault','value',data.demo_fault);obstacles=data.spatial?.obstacles||[];set('tracking','textContent',tracking.reason.replaceAll('_',' ').toUpperCase());const ind=$('indicator');if(ind)ind.style.background=tracking.enabled?'#56edd4':'#f4b975';set('job','textContent',data.job.message);const go=$('analyze')?.querySelector('button');if(go)go.disabled=data.job.status==='running';
  // The projector follows whichever level the editor is looking at.
  if(DISPLAY&&Array.isArray(data.view)&&data.view.join('>')!==trail.join('>')){trail=data.view.slice(0,8);rebuild();}

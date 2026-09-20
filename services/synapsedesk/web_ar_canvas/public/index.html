@@ -22,6 +22,9 @@
  <div id="demo" hidden><label for="fault">Simulated tracking fault</label><select id="fault"><option value="none">Healthy hand</option><option value="lost">Hand lost</option><option value="stale">Stale camera frame</option><option value="boundary">Outside workspace</option></select></div>
   <div class="section-title">EVIDENCE & CONFLICTS <span id="findingCount">0</span></div>
   <div id="findings"><p class="muted">Analysis results will appear here.</p></div>
+  <div class="section-title">ASK <span id="voiceState" class="muted">voice off</span></div>
+  <div class="row"><input id="askText" placeholder="Open the triage agent" autocomplete="off"><button id="askGo">Ask</button><button id="askTalk" title="Hold to talk">●</button></div>
+  <div id="askOut" class="muted"></div>
   <div class="section-title">AGENT <span id="providerState" class="muted">stub</span></div>
   <div class="row"><input id="agentDesc" placeholder="Scoped change description" autocomplete="off"><button id="agentRun">Implement</button></div>
   <div class="row"><button id="agentExplain">Explain selection</button><button id="agentTasks">Tasks</button></div>

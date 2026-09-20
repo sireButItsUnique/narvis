@@ -36,6 +36,11 @@ All traffic stays on `127.0.0.1:8770`. The port is 8770 rather than 8765 so this
 | `/api/hand-frame` | GET/POST | How your tracker's coordinates become rig centimetres. Set once |
 | `/api/hands` | POST | Hand landmarks from your tracker; refused in demo mode |
 | `/api/eye` | POST | Head position, already registered to `rig_cm` |
+| `/api/agent/ask` | POST | `{utterance, trail?}` → one grounded verb; text in, no audio |
+| `/api/voice/status` | GET | `{name, live, reason, voice_id}` for speech |
+| `/api/voice/voices` | GET | The voices your ElevenLabs account can use |
+| `/api/voice/listen` | POST | **Audio bytes**, not JSON: `Content-Type: audio/*`, at most 2 MB |
+| `/api/voice/say` | POST | `{text}` → `audio/mpeg` |
 
 POSTs require `Content-Type: application/json`, Content-Length, and at most 64 KB. Success is `{ok:true}`; errors use `{error:"..."}` with 400/403/404/500 status. Accepted analysis returns immediately; observe `job.status` (`running`, `complete`, `error`). Graph revision advances on publication and wiring. Invalid analysis leaves the last valid graph available.
 
@@ -143,6 +148,37 @@ Touching decides what a gesture means when the hand is among the cards, and a ra
 fingertip takes over when it is not — a finger held below the content would otherwise aim above it. A
 pinch that does not move opens a card; one that moves places it. A hand that goes stale, leaves the volume
 or disappears disarms rather than keeping its grip.
+
+## Asking
+
+`POST /api/agent/ask` turns one sentence into exactly one verb, against the graph that is loaded.
+
+A grammar answers first — *open X*, *go up*, *take me home*, *explain X*, *find X*, *zoom out*, *list
+tasks*, *cancel* — with no model call and therefore no possibility of invention. Only a sentence it does
+not recognise reaches the provider, which must answer in a fixed shape that is then checked: an intent
+naming a node that does not exist is refused, exactly as a model review citing a nonexistent finding is.
+
+Names are resolved against the index and never guessed. A phrase matching one thing navigates; a phrase
+matching several comes back with `ambiguous: true` and the candidates, and nothing moves. A phrase
+matching nothing says so. Folders are targets even though the graph has no folder nodes — the levels
+derive them, so `intent.directories()` does too.
+
+The verbs are not equal. Reading verbs run. `implement` writes into a working copy and runs that
+repository's test command, so it returns `needs_confirmation: true` and a proposal, and **never starts a
+task**. Something has to say yes, and a microphone is not a good enough witness for that. Confirming means
+`POST /api/agent/tasks` as usual.
+
+## Speech
+
+`/api/voice/*` is ElevenLabs, called from the service so the key is never in a browser. It is **off by
+default**: without `SYNAPSEDESK_ELEVENLABS_API_KEY` and a voice id every call refuses and says which is
+missing. `GET /api/voice/voices` lists the voices on your account; pass the id with `--voice`.
+
+**This is the one path that leaves the machine.** Analysis never does, the optional reasoner is pinned to
+127.0.0.1, and hand and head tracking are yours. Speech is not: audio goes to ElevenLabs to be transcribed
+and replies are synthesised there. Turning it on is a deliberate choice and it is written down rather than
+buried. Audio is capped at 2 MB per turn, upstream errors are scrubbed of anything key-shaped before they
+are returned, and the browser records only while the talk control is held — there is no hot microphone.
 
 ## Graph artifacts
 

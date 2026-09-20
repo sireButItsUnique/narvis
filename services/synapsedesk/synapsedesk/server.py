@@ -113,6 +113,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(dict(events=self.server.state.events_since(since),revision=self.server.state.revision))
         elif path=="/api/state":
             self.json(self.server.state.snapshot())
+        elif path=="/api/voice/status":
+            self.json(self.server.state.voice_status())
+        elif path=="/api/voice/voices":
+            from .voice import VoiceError
+            try:
+                self.json({"voices":self.server.state.voice.voices()})
+            except VoiceError as exc:
+                self.json({"error":str(exc)},503)
         elif path=="/api/provider/status":
             self.json(self.server.state.provider_status())
         elif path=="/api/provider/test":
@@ -177,6 +185,32 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.json({"error":"not found"},404)
 
+    def listen(self):
+        """Speech is audio, so this route takes bytes rather than JSON, on its own budget."""
+        from .voice import MAX_AUDIO_BYTES, VoiceError
+        try:
+            if self.headers.get("Transfer-Encoding"):
+                raise ValueError("Content-Length required")
+            length=int(self.headers.get("Content-Length","0"))
+            if not 0<length<=MAX_AUDIO_BYTES:
+                # Drain what the client is already sending before answering. Replying and closing mid-body
+                # resets the connection, and the caller sees a transport error instead of the reason.
+                remaining=min(length,MAX_AUDIO_BYTES*2)
+                while remaining>0:
+                    chunk=self.rfile.read(min(65536,remaining))
+                    if not chunk: break
+                    remaining-=len(chunk)
+                raise ValueError("audio must be between 1 byte and 2 MB")
+            audio=self.rfile.read(length)
+            answer=self.server.state.listen(audio,self.headers.get_content_type() or "audio/webm")
+            self.json(answer)
+        except VoiceError as exc:
+            self.json({"error":str(exc)},503)
+        except (ValueError,TypeError,KeyError) as exc:
+            self.json({"error":str(exc)},400)
+        except OSError:
+            self.json({"error":"local I/O failed"},500)
+
     def events(self):
         if not self.server.streams.acquire(blocking=False):
             self.json({"error":"too many projection clients; close a browser tab and this one will reconnect"},503)
@@ -196,6 +230,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.allowed() or not secrets.compare_digest(self.headers.get("X-Synapse-Token",""),self.server.state.token):
             self.json({"error":"invalid session or origin"},403)
+            return
+        if urlsplit(self.path).path=="/api/voice/listen":
+            self.listen()
             return
         try:
             if self.headers.get_content_type()!="application/json" or self.headers.get("Transfer-Encoding"):
@@ -253,6 +290,19 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("invalid demo fault")
                 with state.lock:
                     state.demo_fault=data["fault"]
+            elif path=="/api/agent/ask":
+                self.json(state.ask(data.get("utterance",""),data.get("trail")))
+                return
+            elif path=="/api/voice/say":
+                from .voice import VoiceError
+                try:
+                    mime,audio=state.say(data.get("text",""))
+                except VoiceError as exc:
+                    self.json({"error":str(exc)},503)
+                    return
+                self.headers_out(200,mime,len(audio))
+                self.wfile.write(audio)
+                return
             elif path=="/api/agent/explain":
                 if not isinstance(data.get("node_id"),str):
                     raise ValueError("node_id must be a string")

@@ -1,5 +1,6 @@
 param([switch]$Demo, [string]$Repo = "", [string]$Model = "", [int]$Port = 8770,
-      [string]$ModelEndpoint = "", [string]$ModelName = "", [string]$Runtime = "")
+      [string]$ModelEndpoint = "", [string]$ModelName = "", [string]$Runtime = "",
+      [string]$Voice = "")
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 $Python = Join-Path (Get-Location) ".venv\Scripts\python.exe"
@@ -11,6 +12,10 @@ if ($Model) { $Arguments += @("--model", $Model) }
 if ($ModelEndpoint) { $Arguments += @("--model-endpoint", $ModelEndpoint) }
 if ($ModelName) { $Arguments += @("--model-name", $ModelName) }
 if ($Runtime) { $Arguments += @("--runtime", $Runtime) }
+if ($Voice) { $Arguments += @("--voice", $Voice) }
+if ($Voice -and -not $env:SYNAPSEDESK_ELEVENLABS_API_KEY) {
+  Write-Warning "SYNAPSEDESK_ELEVENLABS_API_KEY is not set; speech stays off."
+}
 if ($ModelEndpoint -and -not $env:SYNAPSEDESK_API_KEY) {
   Write-Warning "SYNAPSEDESK_API_KEY is not set; the live agent gate stays blocked."
 }

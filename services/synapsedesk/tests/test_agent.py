@@ -366,6 +366,15 @@ class ManifestTests(unittest.TestCase):
     """The CLI, the launchers and the docs must agree on the port they advertise."""
     ROOT = Path(__file__).resolve().parent.parent
 
+    def test_every_cli_flag_can_be_reached_from_the_launcher(self):
+        """A flag no shipped script can pass is a feature nobody can turn on."""
+        parser = build_parser()
+        serve = {action.option_strings[0] for action in parser._subparsers._group_actions[0]
+                 .choices['serve']._actions if action.option_strings}
+        script = (self.ROOT/'scripts'/'Start-SynapseDesk.ps1').read_text(encoding='utf-8')
+        for flag in serve - {'-h'}:
+            self.assertIn(flag, script, f'{flag} cannot be passed from Start-SynapseDesk.ps1')
+
     def test_default_port_is_consistent_and_clear_of_holomodel(self):
         parser = build_parser()
         self.assertEqual(parser.parse_args(['serve']).port, DEFAULT_PORT)
