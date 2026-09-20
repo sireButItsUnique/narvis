@@ -18,6 +18,7 @@ import { createSculptEngine } from './sculpt/index.js';
 import { loadPresets } from './sculpt/presets.js';
 import { getBrushForPreset } from './sculpt/brushes/registry.js';
 import { parts, model, beginStroke as modelBeginStroke, endStroke as modelEndStroke } from './model.js';
+import * as edits from './edits.js';
 
 const CM_PER_M = 100;
 
@@ -85,6 +86,46 @@ export function syncParts() {
   for (const handle of [...engine.parts.values()]) if (!live.has(handle.id)) handle.detach();
   return engine.parts.size;
 }
+
+/**
+ * Put back everything sculpted on this revision of the scene.
+ *
+ * Blender hands the page a model with no sculpting in it, because Blender has never had any; the
+ * strokes live in the database (js/edits.js). Replaying them in order rebuilds the surface exactly,
+ * because a stroke record is the vertices it moved and what it moved them to, and applying it is
+ * the same operation as redo.
+ *
+ * A stroke belongs to ONE revision's mesh - the vertex indices are that mesh's indices - so this
+ * only ever replays the stream for the revision now on screen. A new build means new geometry and
+ * the old strokes are simply not offered for it.
+ *
+ * @returns {Promise<{applied: number, failed: number}>}
+ */
+export async function restore(rev) {
+  edits.forRev(rev);
+  syncParts();
+  const records = await edits.loadStrokes(rev);
+  let applied = 0, failed = 0;
+  for (const rec of records) {
+    const handle = engine.part(rec.part);
+    if (!handle) { failed++; continue; }   // that part is not on screen any more
+    try {
+      engine.applyHistory(rec, 'redo');
+      // The stack IS the stream: a restored stroke goes back on the undo history too, or the work
+      // would come back after a reload as something that could never be taken off again. Pushed in
+      // the order they were made, so the newest is still the first thing undo reaches.
+      modelEndStroke(undoStep([rec], rec.type === 'mask' ? 'smooth' : 'extrude'));
+      applied++;
+    } catch { failed++; }
+  }
+  for (const id of new Set(records.map(r => r.part))) {
+    const part = parts.get(id);
+    if (part) part.dirty.mesh = true;
+  }
+  return { applied, failed };
+}
+
+export const streamState = () => edits.editsState();
 
 // ---------------------------------------------------------------- brush
 
@@ -186,6 +227,9 @@ export function end(o = {}) {
   stroke.live = false;
   if (all.length) {
     markDirty();
+    // Out to the database as it finishes, not awaited: see js/edits.js. This is the only copy of
+    // the stroke that exists anywhere, because Blender never sees one.
+    for (const r of all) edits.saveStroke(r);
     modelEndStroke(undoStep(all, mode));
   } else {
     modelEndStroke(null);
@@ -203,15 +247,23 @@ export function abort() {
 // One undo step for the app's history, however many engine records the stroke produced. The label is
 // what the HUD says when it is undone.
 function undoStep(records, kind) {
+  // The parts these records are about, taken from the records themselves. Reading the live stroke
+  // instead would mark nothing on a step that was rebuilt from the database after a reload, where
+  // there is no live stroke to read.
+  const ids = [...new Set(records.map(r => r.part).filter(Boolean))];
+  const mark = () => { for (const id of ids) { const p = parts.get(id); if (p) p.dirty.mesh = true; } };
   return {
     label: kind === 'smooth' ? 'smooth' : 'extrude',
     undo() {
       for (let i = records.length - 1; i >= 0; i--) engine.applyHistory(records[i], 'undo');
-      markDirty();
+      // The database forgets it too, or the next reload would put it back on the model.
+      for (let i = 0; i < records.length; i++) edits.dropLastStroke();
+      mark();
     },
     redo() {
       for (const r of records) engine.applyHistory(r, 'redo');
-      markDirty();
+      for (const r of records) edits.saveStroke(r);
+      mark();
     },
   };
 }

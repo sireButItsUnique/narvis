@@ -10,6 +10,7 @@ import { blender } from './server/blender-process.js';
 import { loadScene, watchBlender, sceneRoute, sceneInfo, publish, lock, busyWith, SceneError } from './server/scene.js';
 import { saveVersion, restoreVersion, checkpointIfChanged, listVersions, versionThumb, versionGlb, VersionError } from './server/versions.js';
 import { history, historyInfo, LOCAL_DIR } from './server/history.js';
+import { addEdit, listEdits, dropLastEdit, clearEdits, editsInfo, EditsError } from './server/edits.js';
 import { voiceAvailable, transcribe, speak, warmUp } from './server/voice.js';
 import { textureToolAvailable } from './server/texture-tool.js';
 import { onlineUrl } from './server/vendor.js';
@@ -117,6 +118,32 @@ async function blenderDetail(req, res) {
     return sendJson(res, status, { error: 'blender', message: err.message });
   } finally {
     release();
+  }
+}
+
+// The sculpt stream (server/edits.js): the only copy of a brush stroke that exists anywhere, since
+// Blender never sees one. GET reads a revision's strokes back in order, POST appends one, DELETE
+// takes the newest off (undo) or the lot (?all=1).
+async function editsRoute(req, res) {
+  const rev = Number(new URL(req.url, 'http://x').searchParams.get('rev'));
+  if (!Number.isFinite(rev)) return sendJson(res, 400, { error: 'bad_request', message: 'which scene revision?' });
+  try {
+    if (req.method === 'GET') {
+      const rows = await listEdits(rev);
+      return sendJson(res, 200, { ok: true, rev, edits: rows.map(r => ({ part: r.part, type: r.type, bytes: r.bytes, payload: r.payload })), ...(await editsInfo(rev)) });
+    }
+    if (req.method === 'POST') {
+      const body = await readJson(req, 12 * 1024 * 1024);
+      return sendJson(res, 200, { ok: true, ...(await addEdit(rev, body)) });
+    }
+    if (req.method === 'DELETE') {
+      const all = new URL(req.url, 'http://x').searchParams.get('all') === '1';
+      return sendJson(res, 200, { ok: true, ...(all ? await clearEdits(rev) : await dropLastEdit(rev)) });
+    }
+    return sendJson(res, 405, { error: 'method_not_allowed' });
+  } catch (err) {
+    const status = err instanceof EditsError ? 400 : 500;
+    return sendJson(res, status, { error: 'edits', message: err.message });
   }
 }
 
@@ -349,6 +376,7 @@ http.createServer((req, res) => {
   if (pathname === '/api/blender/detail') {
     return req.method === 'POST' ? blenderDetail(req, res) : sendJson(res, 405, { error: 'method_not_allowed', message: 'POST only' });
   }
+  if (pathname === '/api/edits') return editsRoute(req, res);
   if (pathname === '/api/history' || pathname.startsWith('/api/history/')) return historyRoute(req, res, pathname);
   if (pathname.startsWith('/api/voice/')) return voiceRoute(req, res, pathname);
   if (pathname === '/api/config') return config(res);

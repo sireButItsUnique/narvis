@@ -272,7 +272,10 @@ async function pollScene() {
     // Weld the new parts into sculpt proxies now rather than at the first pinch: it costs tens of
     // milliseconds on a normal model, and paying it here (where "Loading the model" is already on
     // screen) is invisible, while paying it on the pinch is a stutter at the worst moment.
-    sculpt.syncParts();
+    // Then put the sculpting back: Blender's model has none in it, and the strokes are in the
+    // database (js/edits.js). This is what makes a reload keep the work.
+    const back = await sculpt.restore(s.rev);
+    if (back.applied) flash(`${back.applied} sculpt stroke${back.applied === 1 ? '' : 's'} restored from MongoDB`, 3500);
     model.rev = s.rev;
     loadError = '';
   } catch (err) {
