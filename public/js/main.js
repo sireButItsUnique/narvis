@@ -5,7 +5,8 @@ import { S, saveSettings } from './settings.js';
 import { renderer, scene, camera, rect, buildRoom, applyOffAxis, renderViews, clayMaterial } from './view.js';
 import { input } from './input/state.js';
 import { startCamera, track, drawDebug, eyeFilt, cam } from './input/webcam.js';
-import { updateInteraction, pointedPart, tool, TOOLS, setBrush, setNotify, SCULPT_SOON } from './interaction.js';
+import { updateInteraction, pointedPart, tool, TOOLS, setBrush, setNotify } from './interaction.js';
+import * as sculpt from './sculpting.js';
 import { model, parts, showScene, clearScene, scaleBy, setSpin, turnBy, undo, resetPlacement, focusPart,
          deletePart, duplicatePart, quickColor, quickFinish, layout, update as updateModel } from './model.js';
 import { fetchScene } from './scene/load.js';
@@ -59,6 +60,9 @@ function begin() {
   started = true;
   $('voice-bar').hidden = false;
   $('tool-badge').hidden = false;
+  // The measured Blender brush settings, fetched once and in the background: the engine runs on its
+  // own fallback until they land, so a slow fetch delays nothing and a failed one breaks nothing.
+  sculpt.ready().then(() => showTool());
   showTool();
   showSceneState();
   refreshVersions();
@@ -68,21 +72,33 @@ function begin() {
 // ---------- tool badge: what a pinch does right now ----------
 const TOOL_HINT = {
   move: 'pinch to move it · two hands: turn and resize',
-  sculpt: 'sculpting arrives in the next build',
-  smooth: 'sculpting arrives in the next build',
+  sculpt: 'pinch on the model and drag to shape it',
+  smooth: 'pinch on the model and drag to smooth it out',
   part: 'pinch a part to move just that part (this view only for now)',
 };
 function showTool() {
   const brush = tool.mode === 'sculpt' || tool.mode === 'smooth';
+  const name = tool.mode === 'smooth' ? 'Smooth' : sculpt.brushes.sculpt;
   $('tool-name').textContent = tool.mode.toUpperCase() +
-    (brush ? ` · brush ${tool.brush.toFixed(1)} cm${tool.mirror ? ' · mirror' : ''}` : '') +
+    (brush ? ` · ${name} ${tool.brush.toFixed(1)} cm${tool.mirror ? ' · mirror' : ''}` : '') +
     (clayOn ? ' · clay view' : '');
   $('tool-hint').textContent = TOOL_HINT[tool.mode];
 }
 function setTool(mode) {
   tool.mode = mode;
+  // The engine is told the brush, the radius and the mirror on every switch rather than only when
+  // they change: the tool badge and the engine disagreeing about which brush is loaded is the one
+  // bug nobody can see until the clay moves the wrong way.
+  if (mode === 'sculpt' || mode === 'smooth') {
+    sculpt.setMode(mode);
+    sculpt.setRadiusCm(tool.brush);
+    sculpt.setMirror(tool.mirror);
+  }
   showTool();
-  flash(mode === 'sculpt' || mode === 'smooth' ? SCULPT_SOON : `${mode[0].toUpperCase()}${mode.slice(1)} mode`, 3500);
+  if (mode === 'sculpt' || mode === 'smooth') {
+    const name = mode === 'smooth' ? 'Smooth' : sculpt.brushes.sculpt;
+    flash(`${name} brush, ${tool.brush.toFixed(1)} cm. Pinch on the model and drag.`, 3500);
+  } else flash(`${mode[0].toUpperCase()}${mode.slice(1)} mode`, 3500);
 }
 $('btn-cam').addEventListener('click', async () => {
   const v = parseFloat($('s-diag').value); if (v > 5) { S.diagIn = v; saveSettings(); }
@@ -221,6 +237,10 @@ async function pollScene() {
   try {
     if (!s.glb) clearScene();
     else showScene({ ...(await fetchScene(s.glb)), rev: s.rev });
+    // Weld the new parts into sculpt proxies now rather than at the first pinch: it costs tens of
+    // milliseconds on a normal model, and paying it here (where "Loading the model" is already on
+    // screen) is invisible, while paying it on the pinch is a stutter at the worst moment.
+    sculpt.syncParts();
     model.rev = s.rev;
     loadError = '';
   } catch (err) {
@@ -349,13 +369,19 @@ function runCommand(cmd) {
     case 'unfocus': return flash(model.focusId && focusPart(null) ? 'Whole model' : 'Already showing the whole model');
     case 'clay':   return setClay(cmd.on);
     case 'mode':   return setTool(cmd.mode === 'edit' ? 'part' : cmd.mode);
-    case 'brush_pick': return flash('Blender brushes arrive in the next build', 3500);
+    case 'brush_pick': {
+      if (!sculpt.setPreset(cmd.name)) return flash(`No brush called "${cmd.name}" here yet`, 3500);
+      if (tool.mode !== 'sculpt') setTool('sculpt'); else { showTool(); flash(`${cmd.name} brush`, 3000); }
+      return;
+    }
     case 'redo':   return flash('Redo arrives in the next build', 3500);
     case 'save_version':    return saveVersion(cmd.label);
     case 'restore_version': return restoreVersion(cmd.which);
     case 'versions':        return showVersions();
-    case 'mirror': tool.mirror = cmd.on; showTool(); return flash(`Mirror ${cmd.on ? 'on: sculpting copies across the middle' : 'off'}`);
-    case 'brush':  setBrush(tool.brush * cmd.factor); showTool(); return flash(`Brush ${tool.brush.toFixed(1)} cm`);
+    case 'mirror': tool.mirror = cmd.on; sculpt.setMirror(cmd.on); showTool();
+                   return flash(`Mirror ${cmd.on ? 'on: sculpting copies across the middle' : 'off'}`);
+    case 'brush':  setBrush(tool.brush * cmd.factor); sculpt.setRadiusCm(tool.brush); showTool();
+                   return flash(`Brush ${tool.brush.toFixed(1)} cm`);
     case 'turn':   return flash(turnBy(cmd.deg) ? `Turned ${cmd.deg === 180 ? 'around' : cmd.deg < 0 ? 'left' : 'right'}` : 'Nothing to turn');
     case 'clear':  return flash('Say "make ___" to start a new model, or "go back a version"', 4000);
     case 'undo':   return flash(undo() ? 'Undone' : 'Nothing to undo here. "Go back a version" undoes a build.', 3500);
@@ -464,8 +490,14 @@ function tick(now) {
 
 // handy in the devtools console: htw.run('make a lamp'), htw.parts.list(); tests drive htw.tick() with fake hands
 window.htw = {
-  THREE, scene, camera, renderer, model, parts, input, S, tool, rect: () => rect,
+  THREE, scene, camera, renderer, model, parts, input, S, tool, sculpt, rect: () => rect,
   run: text => { const cmd = parseTyped(text); if (cmd) runCommand(cmd); return cmd; },
+  // Put a .glb on screen without Blender: the fixture the tests use, or anything else being tried.
+  load: async (url = '/fixtures/teapot.glb') => {
+    showScene({ ...(await fetchScene(url)), rev: -1 });
+    sculpt.syncParts();
+    return parts.stats();
+  },
   reload: () => refreshScene(),
   pointed: () => pointedPart()?.name ?? null,
   highlighted: () => [...highlighted().keys()].map(m => parts.ofMesh(m)?.name ?? m.name),

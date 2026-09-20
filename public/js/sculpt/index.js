@@ -211,12 +211,20 @@ export function createSculptEngine(engineOptions = {}) {
   // the page's timeline. Without this they were simply dropped, and the edits became permanent.
   const pendingRecords = [];
 
+  // How many world units are in a metre. The hand-override radius limits (3 mm to 12 cm) are
+  // PHYSICAL — a brush you cannot see or aim in the box is no use — so they have to be expressed in
+  // whatever unit the page's world is in. The app's box is centimetres (js/model.js), and a page
+  // that passed 2.5 (meaning 2.5 cm) into a clamp written in metres got 0.12 back: a 1.2 mm brush
+  // that looked like sculpting was broken. Tests and parity replays leave it at 1.
+  const unit = engineOptions.worldUnitsPerMetre ?? 1;
+  const clampWorld = (r) => clampRadius(r / unit) * unit;
+
   const state = {
     brushKey: 'draw',
     brush: getBrush('draw'),
     settings: null,           // Blender-named brush settings (presets.js or injected)
     overrides: engineOptions.handOverrides !== false,
-    radiusWorld: RADIUS_DEFAULT_M,
+    radiusWorld: RADIUS_DEFAULT_M * unit,
     strength: null,           // null = the preset's own strength
     invert: false,
     falloff: null,
@@ -1108,7 +1116,8 @@ export function createSculptEngine(engineOptions = {}) {
     getBrushKey: () => state.brushKey,
     // The 0.3-12 cm clamp is a hand override (a brush you cannot see or aim is no use in the box),
     // so parity replays with the overrides off set the radius Blender recorded.
-    setRadiusWorld: (m) => { state.radiusWorld = state.overrides ? clampRadius(m) : m; state.stroke?.stepper.setRadiusWorld(state.radiusWorld); return state.radiusWorld; },
+    setRadiusWorld: (m) => { state.radiusWorld = state.overrides ? clampWorld(m) : m; state.stroke?.stepper.setRadiusWorld(state.radiusWorld); return state.radiusWorld; },
+    worldUnitsPerMetre: unit,
     getRadiusWorld: () => state.radiusWorld,
     setStrength: (s) => { state.strength = s === null ? null : Math.min(Math.max(s, 0), 1); },
     setInvert: (v) => { state.invert = !!v; },

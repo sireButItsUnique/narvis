@@ -272,6 +272,18 @@ export function cancelEdit() {
 // beginEdit pushed, so undo brings the spin back with the placement.
 export function endGrab() { editing = false; editSnap = null; model.spinning = false; if (model.group) syncPlace(); }
 
+// A brush stroke is a gesture too - the turntable has to hold still while you sculpt, or the surface
+// slides out from under the brush - but it is NOT a placement change, so it must not push the
+// placement step beginEdit does: the user would then have to press undo twice to take one stroke back,
+// and the first press would move the model instead of changing the clay. The stroke's own undo record
+// arrives at the end, from the engine, through endStroke().
+export function beginStroke() { editing = true; model.spinning = false; }
+export function endStroke(step) {
+  editing = false;
+  if (step) push(step);
+  return !!step;
+}
+
 // A gesture that changed nothing (a touch, a pinch without moving): leave no empty step in undo.
 export function discardEdit() {
   if (editSnap && history.at(-1) === editSnap) history.pop();

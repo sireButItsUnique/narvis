@@ -1,7 +1,7 @@
 // Hands (or the mouse) -> what you're pointing at, and what a pinch does in the current tool:
 //   move    pinch the model and drag it; push toward the screen to send it deeper
 //   part    the same, but only the part you pinched (in this view only until sync arrives in M4)
-//   sculpt  / smooth: the Blender brush engine arrives in M2; until then a pinch says so
+//   sculpt / smooth: the Blender brush engine (js/sculpt, through js/sculpting.js) - pinch and drag to brush
 // Pinching with both hands (in any tool) turns, resizes and moves the whole model.
 // Pointing uses the ray from your eye through your index fingertip; a pinch holds the point between thumb and index.
 import * as THREE from 'three';
@@ -11,11 +11,11 @@ import { model, parts, beginEdit, cancelEdit, discardEdit, endGrab, commitPartPo
          setTransform, setGestureFlush } from './model.js';
 import { highlight } from './scene/highlight.js';
 import { updateViz } from './handviz.js';
+import * as sculpt from './sculpting.js';
 
 export const TOOLS = ['move', 'sculpt', 'smooth', 'part'];
 export const tool = { mode: 'move', brush: 2.5, mirror: false };   // brush: radius in cm as seen on screen
 export const setBrush = r => (tool.brush = THREE.MathUtils.clamp(r, 0.5, 12));
-export const SCULPT_SOON = 'Sculpting arrives in the next build. Pinch in move or part mode for now.';
 
 const PUSH_GAIN = 2.0;          // hand toward the screen -> object deeper (move, part)
 const TURN_GAIN = 1.5;          // two-hand turn
@@ -63,7 +63,21 @@ function worldNormal(hit) {
 // ---------- one-hand gestures ----------
 function startAction(p, target, now) {
   const root = model.group, base = { pid: p.id, root, dist: target.dist, handZ0: p.handZ, t0: now };
-  if (tool.mode === 'sculpt' || tool.mode === 'smooth') { notify(SCULPT_SOON); return false; }
+  if (tool.mode === 'sculpt' || tool.mode === 'smooth') {
+    // The brush is locked to the part the pinch landed on, the way Blender locks a stroke to the
+    // active object: a stroke that wandered onto a neighbouring part halfway through would leave
+    // two half-edits and one undo step that cannot put either of them back.
+    const part = parts.ofMesh(target.mesh);
+    sculpt.setMode(tool.mode);
+    sculpt.setRadiusCm(tool.brush);
+    sculpt.setMirror(tool.mirror);
+    if (!sculpt.begin(input.eye, p.dir, { part, point3D: p.grip, timeMs: now })) {
+      notify(part?.bindError ? `That part cannot be sculpted: ${part.bindError}` : 'Point at the model, then pinch to sculpt');
+      return false;
+    }
+    action = { ...base, kind: 'stroke', mesh: target.mesh, mode: tool.mode };
+    return true;
+  }
   if (tool.mode === 'move') {
     beginEdit();
     action = { ...base, kind: 'grab', startPos: root.position.clone(), offset: root.position.clone().sub(rayPoint(p, target.dist)) };
@@ -79,6 +93,13 @@ function startAction(p, target, now) {
 
 function updateAction(p) {
   const root = action.root;
+  if (action.kind === 'stroke') {
+    // Every frame, not every hand sample: the engine does its own spacing along the stroke, so a
+    // fast drag lays down as many dabs as the distance calls for and a still hand lays down none.
+    if (sculpt.sample(input.eye, p.dir, { point3D: p.grip, timeMs: performance.now() })) action.moved = true;
+    p.end = p.hit ? p.hit.point.clone() : p.end;
+    return;
+  }
   if (action.kind === 'grab') {
     const t = action.dist + (action.handZ0 - p.handZ) * PUSH_GAIN;
     root.position.lerp(clampPosition(rayPoint(p, t).add(action.offset)), 0.5);
@@ -93,6 +114,7 @@ function updateAction(p) {
 // did the gesture actually change anything?
 function changed(a) {
   const moved = (p, q, eps) => p.distanceTo(q) > eps;
+  if (a.kind === 'stroke') return !!a.moved;
   if (a.kind === 'grab') return moved(a.root.position, a.startPos, 0.01);
   if (a.kind === 'part') return moved(a.mesh.position, a.startPos, 1e-4);   // metres
   return moved(a.root.position, a.pos0, 0.01) || Math.abs(model.rotY - a.rot0) > 1e-3 || Math.abs(model.userScale - a.scale0) > 1e-3;
@@ -102,6 +124,14 @@ function endAction() {
   const a = action;
   action = null;
   if (!a) return;
+  // A stroke's undo step comes from the engine, not from a placement snapshot, so it banks itself
+  // (sculpting.end -> model.endStroke) whether or not any clay actually moved.
+  if (a.kind === 'stroke') {
+    const r = sculpt.end({ timeMs: performance.now() });
+    if (!r.moved) notify(a.mode === 'smooth' ? 'Nothing to smooth there — pinch on the model and drag'
+                                             : 'Nothing sculpted there — pinch on the model and drag');
+    return;
+  }
   if (!changed(a)) discardEdit();
   else if (a.kind === 'part') commitPartPosition(a.mesh);
   else endGrab();
@@ -116,6 +146,9 @@ function cancelAction() {
   const a = action;
   action = null;
   if (!a) return;
+  // A stroke cannot be thrown away as if it never happened - the clay has already moved - so it is
+  // banked like any other stroke and stays undoable.
+  if (a.kind === 'stroke') { sculpt.end({ timeMs: performance.now() }); return; }
   if (a.kind === 'part') a.mesh.position.copy(a.startPos);
   cancelEdit();
 }
@@ -156,8 +189,14 @@ export function updateInteraction() {
   const now = performance.now(), eye = input.eye;
   const ps = readPointers();
   const meshes = model.meshes;
-  // the model went away, or the part being moved did (a new rev from Blender): drop the gesture
-  if (action && (action.root !== model.group || (action.mesh && !meshes.includes(action.mesh)))) { action = null; endGrab(); }
+  // the model went away, or the part being moved did (a new rev from Blender): drop the gesture.
+  // A stroke has to be closed at the engine as well, or it stays live over a part that is gone and
+  // the next pinch begins on top of it.
+  if (action && (action.root !== model.group || (action.mesh && !meshes.includes(action.mesh)))) {
+    const wasStroke = action.kind === 'stroke';
+    action = null;
+    if (wasStroke) sculpt.abort(); else endGrab();
+  }
 
   for (const p of ps) {
     const st = per[p.id];
@@ -216,10 +255,17 @@ export function updateInteraction() {
     }
   }
 
-  // the brush ring previews the size you'll sculpt with (M2)
-  if ((tool.mode === 'sculpt' || tool.mode === 'smooth') && !action) {
-    const p = ps.find(q => q.hit);
-    if (p) brush = { point: p.hit.point, normal: p.normal, radius: tool.brush };
+  // The brush ring: where the clay will move, and how much of it. It stays up DURING a stroke as
+  // well - that is when you most need to see whether the brush is still on the model - which is why
+  // the hover raycast above skips the busy hand but this reads the stroke's own hit instead.
+  if (tool.mode === 'sculpt' || tool.mode === 'smooth') {
+    const p = ps.find(q => q.hit) || (action?.kind === 'stroke' ? ps[action.pid] : null);
+    const hit = p?.hit || (action?.kind === 'stroke' ? sculpt.overPart(eye, p?.dir || ps[0].dir) : null);
+    if (p && hit) {
+      const point = hit.point?.isVector3 ? hit.point : new THREE.Vector3(...hit.point);
+      const normal = hit === p.hit ? p.normal : new THREE.Vector3(...hit.normal);
+      brush = { point, normal, radius: tool.brush };
+    }
   }
   highlight(meshes, { hovered: action ? null : hovered, active: action?.mesh || null,
                       all: action?.kind === 'grab' || action?.kind === 'two' });
