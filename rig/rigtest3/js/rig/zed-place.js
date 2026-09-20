@@ -163,10 +163,12 @@ export function sheetBlocks(ext, pointRig, sheet = { widthCm: 44, depthCm: 40 })
 // The whole verdict on a placement, in the words the page prints: the tilt to prop the camera at, and for
 // every plausible head position whether the ZED sees it with both eyes, how far off its own axis it is,
 // and how close to the frame edge it gets.
-export function checkPlacement(p = {}, { eyes = HEAD_RANGE, conf = null, sheet } = {}) {
+// `calib`, when given, beats both the factory file and the typical-ZED guess: it is what the bridge reads
+// off the running camera (the SDK's rectified intrinsics), which is the camera actually doing the looking.
+export function checkPlacement(p = {}, { eyes = HEAD_RANGE, conf = null, sheet, calib: given = null } = {}) {
   const q = merge(p);
   const ext = zedExtrinsics(q, eyes);
-  const calib = zedCalib(q, conf);
+  const calib = given || zedCalib(q, conf);
   const warnings = [];
   const rows = eyes.map(eye => {
     const pr = projectZed(ext, calib, eye);
@@ -204,6 +206,7 @@ export function depthErrorCmPerPx(calib, distCm) {
 export function describe(p = {}, eyes = HEAD_RANGE) {
   const q = merge(p), ext = zedExtrinsics(q, eyes);
   const [x, y, z] = ext.posCm;
-  return `ZED on the base, centred: lens ${q.lensHeightCm} cm above the board = ${y.toFixed(1)} cm from the `
+  // toFixed on the lens height too: it is a sum of a block and a body, so it arrives as 5.3100000000000005.
+  return `ZED on the base, centred: lens ${q.lensHeightCm.toFixed(1)} cm above the board = ${y.toFixed(1)} cm from the `
        + `sheet (x ${x.toFixed(1)}, z ${z.toFixed(1)}), tilted up ${ext.tiltDeg.toFixed(0)}°`;
 }

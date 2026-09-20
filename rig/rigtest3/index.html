@@ -63,6 +63,9 @@
   #trimflag, #calflag { position:fixed; left:50%; top:6%; transform:translateX(-50%); z-index:9; text-align:center;
     background:rgba(4,6,11,.92); border:1px solid #35d0ff; border-radius:10px; padding:12px 16px; max-width:560px; }
   #trimflag b, #calflag b { color:#35d0ff; }
+  /* placing the hand: you have to SEE the hand to place it, so this one keeps to a corner and lets it show through */
+  #trimflag.tune { left:1.5%; top:3%; transform:none; text-align:left; max-width:400px; font-size:12px; line-height:1.45;
+                   padding:8px 12px; background:rgba(4,6,11,.72); }
   /* the calibration wants the user moving round the volume, so its progress has to be readable from there */
   #calflag { font-size:15px; }
   #calflag .bar { height:6px; background:#0b1a29; border-radius:3px; margin:8px 0 4px; overflow:hidden; }
@@ -307,6 +310,10 @@ import * as ZP from './js/rig/zed-place.js';
 import { startCameras, stopCameras, camerasStatus, setExtrinsics, cams } from './js/input/cameras.js';
 import * as devices from './js/input/devices.js';
 import { input } from './js/input/state.js';
+import { ZedClient } from './js/input/zed-client.js';
+import { camToWorld } from './js/input/stereo.js';
+import { makeHand, makeHandMask, makeHandSmoother, makeHandGate, GATE_DEFAULTS, scaleAboutLens } from './js/rig/hands.js';
+import * as DM from './js/rig/demo.js';
 
 const $ = id => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -326,11 +333,11 @@ let setup = RT.loadSetup(STORE);
 setup.pair.baselineCm = ZP.DEFAULT_PLACEMENT.baselineCm;
 setup.pair.toeInDeg = 0;
 setup.pair.solved = null;
-if (!Number.isFinite(setup.pair.heightCm) || setup.pair.heightCm === 0) {
-  // first run: the camera as described — on the base, its own body above the board, at the front edge
-  setup.pair.heightCm = ZP.DEFAULT_PLACEMENT.lensHeightCm - setup.rig.baseDropCm;
-  setup.pair.depthCm = ZP.DEFAULT_PLACEMENT.zCm;
-}
+// Where the camera stands comes from the setup and nowhere else. This used to fall back to zed-place's own
+// default - the FRONT edge of the sheet, z +22 - whenever the height read 0, and that guess was then saved
+// as if it had been typed; the camera on this rig stands at the BACK. See rigtest2.js mergeSetup, version 7.
+if (!Number.isFinite(setup.pair.heightCm)) setup.pair.heightCm = RT.DEFAULT_SETUP.pair.heightCm;
+if (!Number.isFinite(setup.pair.depthCm)) setup.pair.depthCm = RT.DEFAULT_SETUP.pair.depthCm;
 // The placement, in zed-place's words, derived from the setup numbers rather than duplicated beside them.
 const placement = () => ({ sheetHeightCm: setup.rig.baseDropCm,
                            lensHeightCm: setup.rig.baseDropCm + setup.pair.heightCm,
@@ -369,23 +376,54 @@ function savedConf() {
   return confCache.conf;
 }
 
+// The aim check. It used to ask "does the lens POINT at the head", because the camera was propped by hand at
+// an angle nobody knew and pointing at the seat was how that angle got guessed. The tilt is now a stated fact
+// (rigtest2.js DEFAULT_SETUP), and for a camera that is level on purpose that question has one answer for
+// ever - "no, by 39 degrees" - under a title blaming angles that are not wrong. What actually decides
+// whether the head is tracked is whether the frame HOLDS it, so that is what is asked, in both modes; with the
+// bridge on there is also a hand to hold. The acrylic standing between lens and face is not reported here:
+// this rig's camera lives under the sheet by design.
 function zedAimCheck() {
-  const used = zedAngles(), aimed = used.aimed;
-  const dTilt = +(used.tiltUpDeg - aimed.tiltUpDeg).toFixed(2);
-  const v = ZP.checkPlacement(placement(), { eyes: [setup.head.positionCm], sheet: rig?.sheet, conf: savedConf() });
-  const row = v.rows[0];
-  const ok = Math.abs(dTilt) <= RT.AIM_TOLERANCE_DEG && row.both && !v.warnings.length;
+  const used = zedAngles();
+  // Bridge mode, and the bridge is not there, or is there and cannot look for a head at all (no face model,
+  // no right view): THAT is the thing to fix, and the head-source banner says how. A lecture about the seat
+  // would be about a camera that is not looking - and the banner shows this check before that one.
+  const eyes = bridge ? [setup.head.positionCm, SLOT_POINT] : [setup.head.positionCm];
+  const v = ZP.checkPlacement(placement(), { eyes, sheet: rig?.sheet, conf: savedConf(), calib: bridgeCalib() });
+  if (bridge && (bridgeStats?.state !== 'live' || /no face model|no right view/i.test(bridgeHead?.src || '')))
+    return { ok: true, title: '', used, aimed: used.aimed, dToe: 0, dTilt: 0, convergeRig: null, missCm: null,
+             placement: v, message: '' };
+  const head = v.rows[0], slot = v.rows[1] || { both: true };
+  // A face is not a point: the forehead is ~10 cm above the eyes, and a landmarker handed half a face
+  // finds no face. So the eye point has to clear the top of the frame by that much, not merely be inside it.
+  const calib = v.calib, faceTopPx = calib.left.fy * 10 / Math.max(head.distCm, 1);
+  // A head that IS being tracked settles it, wherever step 2 says the seat is: the seat is only a guess at
+  // where you will sit, and warning about the guess while following the real thing is a false alarm.
+  const headOk = source.usable || (head.both && head.marginPx >= faceTopPx);
+  const ok = headOk && (slot.both || (!!bridgeHand && performance.now() - bridgeHand.at < BRIDGE_HAND_MS));
+  const lens = ZP.zedPosition(placement()), seat = setup.head.positionCm;
+  const elev = Math.atan2(seat[1] - lens[1], Math.hypot(seat[0] - lens[0], seat[2] - lens[2])) * 180 / Math.PI;
+  const top = used.tiltUpDeg + Math.atan2(calib.eyeH / 2, calib.left.fy) * 180 / Math.PI;
+  // the smallest prop that would hold the seat's whole face, to the next 5 degrees
+  const faceDeg = Math.atan2(10, Math.max(head.distCm, 1)) * 180 / Math.PI;
+  const need = Math.max(0, Math.ceil((elev + faceDeg - (top - used.tiltUpDeg) + 2) / 5) * 5);
+  // The slot test above is a PREDICTION from the numbers in step 2; a hand arriving from the bridge is
+  // EVIDENCE, and evidence wins: the camera plainly sees a hand, so there is nothing to warn about. Whether
+  // that hand is drawn in the right PLACE is for the viewer's own eyes, and P is how they fix it.
+  const handLive = !!bridgeHand && performance.now() - bridgeHand.at < BRIDGE_HAND_MS;
+  if (handLive) slot.both = true;
+  const title = !slot.both ? 'The ZED cannot see your hands' : 'The ZED cannot see your head from your seat';
   const message = ok ? ''
-    : !row.both
-      ? `A head at ${setup.head.positionCm.map(n => n.toFixed(0)).join(', ')} cm does not land in both eyes of `
-        + `the ZED with the camera tilted ${used.tiltUpDeg}°. It needs about ${aimed.tiltUpDeg}° to point there: `
-        + 'prop the front up (or down) and press A in the rig view to measure it.'
-      : v.warnings.length ? v.warnings.join(' ')
-      : `The ZED is told it is tilted up ${used.tiltUpDeg}°, but pointing at where you said you sit needs `
-        + `${aimed.tiltUpDeg}°. ${Math.abs(dTilt).toFixed(0)}° of tilt error puts your tracked head roughly `
-        + `${(row.distCm * Math.abs(dTilt) * Math.PI / 180).toFixed(0)} cm from where it really is. `
-        + 'Press A in the rig view while sitting normally and it will measure the prop angle from your own head.';
-  return { ok, used, aimed, dToe: 0, dTilt, convergeRig: null, missCm: null, placement: v, message };
+    : !slot.both
+      ? `Tilted up ${used.tiltUpDeg}°, the ZED cannot see a hand in the slot with both eyes - it is looking over it. `
+        + 'Lower the front of the camera and set the new angle in step 2 (flat on its block is 0°).'
+      : `Your seat is ${elev.toFixed(0)}° above the lens. Tilted ${used.tiltUpDeg}°, the ZED sees ${top.toFixed(0)}° up, and it needs `
+        + `your whole face, forehead included - so your head is not tracked and the picture holds still instead of `
+        + `following you. Your hands are unaffected. Either prop the front of the camera up about ${need}° and set that `
+        + `in step 2 (the hands stay in frame to 25°), or sit lower and further back and tell step 2 where - though from `
+        + `back there most sightlines to your hand pass in front of the acrylic, so propping is the better fix.`;
+  return { ok, title, used, aimed: used.aimed, dToe: 0, dTilt: +(used.tiltUpDeg - used.aimed.tiltUpDeg).toFixed(2),
+           convergeRig: null, missCm: null, placement: v, message };
 }
 
 // One press, sitting where you normally sit. The ZED measures how FAR your head is on its own (its
@@ -393,7 +431,8 @@ function zedAimCheck() {
 // points — one angle, and one angle can be read off one known head position. This is HoloDesk's
 // "calibrate the camera against a fixed world origin", with your own seat as the origin.
 function aimAtSeat() {
-  const st = cams.running ? camerasStatus() : null;
+  const st = bridge ? { eyeSource: source.reason === 'stereo' ? 'stereo' : 'none' }
+                    : (cams.running ? camerasStatus() : null);
   if (!st || st.eyeSource !== 'stereo') {
     flash('Aim needs a stereo fix on your face: sit in front of the ZED until the head is tracked, then press A.');
     return;
@@ -408,6 +447,62 @@ function aimAtSeat() {
   flash(`Tilt measured: ${setup.pair.tiltUpDeg}°. That moved your tracked head by ${(want - got).toFixed(1)}° `
       + `onto the seat you set in step 2. Lean about and check it stays put; press A again to redo it.`);
 }
+// ---------------------------------------------------------------- the bridge
+// ?bridge=1 (or ?bridge=ws://host:port): the ZED belongs to gesture_detect.py --rig-bridge, which finds the
+// hand AND the head in the same frames and sends both in the camera's own frame. This page then opens no
+// camera at all - it cannot, a camera has one owner - and places what it is sent with the one camera pose
+// it already calibrates. Head and hand going through the SAME pose is the point: what is still wrong with
+// that pose moves them together, which is the error the picture forgives most.
+const bridgeParam = params.get('bridge');
+const bridgeUrl = !bridgeParam || bridgeParam === '0' ? ''
+  : /^wss?:/.test(bridgeParam) ? bridgeParam : 'ws://127.0.0.1:8902';
+const BRIDGE_HAND_MS = 150;        // a hand older than this is not where the hand is
+let bridge = null, bridgeHead = null, bridgeHeadSeenAt = -1e9, bridgeStereoAt = -1e9, bridgeHand = null;
+let bridgeStats = null;
+// A camera-frame point (cm) in the rig. Trim included, for the reason eyeToRig gives: it corrects where the
+// TRACKER thinks it stands, and the hand is measured by the same tracker from the same place.
+const toRig = (camCm) => {
+  const w = camToWorld(camCm, zedExt()), t = setup.trimCm;
+  return [w[0] + t[0], w[1] + t[1], w[2] + t[2]];
+};
+// The ZED's tilt is STATED (rigtest2.js DEFAULT_SETUP: 15, propped on its block), not derived from where the
+// head is supposed to be. This is only the fallback for a setup that somehow has no number at all.
+const LEVEL_TILT_DEG = 15;
+const SLOT_POINT = [0, -6, 8];       // a hand where hands go: mid-slot, a little toward the viewer
+if (bridgeUrl && !Number.isFinite(setup.pair.tiltUpDeg)) setup.pair.tiltUpDeg = LEVEL_TILT_DEG;
+// The camera the bridge is actually running, once it has said hello: the SDK's rectified intrinsics. The
+// page's own typical-ZED guess is a third narrower, which at tilt 0 is the difference between "your head is
+// in frame" and a warning that it is not.
+function bridgeCalib() {
+  const c = bridgeStats?.camera;
+  if (!c) return null;
+  const eye = { fx: c.fx, fy: c.fy, cx: c.cx, cy: c.cy, k1: 0, k2: 0, k3: 0, p1: 0, p2: 0 };
+  return { left: eye, right: eye, eyeW: c.eyeW, eyeH: c.eyeH, baselineCm: c.baselineCm ?? setup.pair.baselineCm,
+           source: 'the running camera, as the bridge reports it', metric: true };
+}
+// The HAND's way into the rig: the shared camera pose, plus the manual placement from P (rig/hands.js).
+const handToRig = (camCm) => {
+  const w = toRig(scaleAboutLens(camCm, setup.handTune.scale)), o = setup.handTune.offsetCm;
+  return [w[0] + o[0], w[1] + o[1], w[2] + o[2]];
+};
+if (bridgeUrl) {
+  bridge = new ZedClient({
+    url: bridgeUrl,
+    onHead: h => { bridgeHead = h; bridgeHeadSeenAt = performance.now(); if (h.eye) bridgeStereoAt = bridgeHeadSeenAt; },
+    onHands: m => { bridgeHand = m.hands.length ? { cam: m.hands[0].cam, handedness: m.hands[0].handedness,
+                                                   pinch: m.hands[0].pinch || null, quality: m.hands[0].quality || null,
+                                                   score: m.hands[0].score, seq: m.seq, at: performance.now() } : null; },
+    onStatus: st => {
+      const was = bridgeStats?.state; bridgeStats = st;
+      // The landmarker's thresholds live in the bridge and die with it; the ones saved here are sent each
+      // time it comes up, so a calibrated rig stays calibrated across restarts of gesture_detect.py.
+      if (st.state === 'live' && was !== 'live' && (setup.stability.detect !== null || setup.stability.track !== null))
+        bridge.sendConfig({ detect: setup.stability.detect ?? undefined, track: setup.stability.track ?? undefined });
+    },
+  });
+  bridge.connect();
+}
+
 let rig = RT.rigFromSetup(setup);
 let vol = null, posts = [], marks = [];
 let eyeRig = setup.head.positionCm.slice();
@@ -446,6 +541,21 @@ const probeDot = new THREE.Mesh(new THREE.SphereGeometry(0.35, 16, 12),
   new THREE.MeshBasicMaterial({ color: 0xff00ff, toneMapped: false }));   // magenta: nothing else is
 probeDot.visible = false;
 scene.add(probeDot);
+
+const handRig = makeHand(THREE);
+scene.add(handRig.group);
+// The demo scenes (6, 7; rig/demo.js). There the hand is drawn in BLACK, which on a Pepper's ghost is how a
+// real hand gets to be in FRONT of a virtual cube (rig/hands.js makeHandMask); O swaps it for the bones.
+// Everything drawn of the hand, in any scene, goes through one smoother first (makeHandSmoother).
+const handMask = makeHandMask(THREE);
+scene.add(handMask.group);
+// The smoother's own hold is off: holding is the gate's job now, for a time the user chooses (Q).
+const handSmooth = makeHandSmoother({ holdMs: 0 });
+const handGate = makeHandGate({ minConf: setup.stability.minConf, holdMs: setup.stability.holdMs });
+let gated = { points: null, pinch: null, state: 'gone', conf: null, heldMs: 0 };
+const DEMO_SCENES = new Set(['grab', 'surface']), HAND_SCENES = new Set(['hands', 'grab', 'surface']);
+let demo = null, demoView = null, handStyle = 'mask', handDrawn = null;
+const grabOptions = () => ({ close: setup.demo.grabClose, open: setup.demo.grabOpen, wideOpen: setup.demo.grabOpen + 0.38 });
 
 const lineMat = (c, o = 1) => new THREE.LineBasicMaterial({ color: c, transparent: o < 1, opacity: o, toneMapped: false });
 const seg = (pts, mat) => new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts.map(p => new THREE.Vector3(...p))), mat);
@@ -563,6 +673,27 @@ function placeOnBase(root) {
   root.updateMatrixWorld(true);
 }
 
+// A grid drawn ON THE MAT: 5 cm squares, every second line bright (10 cm), a cross under the sheet's centre.
+// It is the test that does not involve the hand at all. The mat is real and does not move, so a grid that
+// is drawn in the right place looks PAINTED on it: it stays put when you move your head, and a bright
+// square measures 10 cm against a real ruler laid on the mat. If it slides over the mat as you move, or
+// measures wrong, the PANEL's numbers are wrong (where it is, how it is tilted) - and no amount of fiddling
+// with the hand can be right until they are. If the grid is rock solid and the hand still misses, the fault
+// is on the camera's side: where the ZED stands, how it is tilted, or the tracking itself.
+let gridOn = true;
+function matGrid(quiet = false) {
+  const y = -setup.rig.baseDropCm + 0.05, x0 = -25, x1 = 25, z0 = -15, z1 = 25, fine = [], bold = [];
+  for (let x = x0; x <= x1; x += 5) (x % 10 === 0 ? bold : fine).push([x, y, z0], [x, y, z1]);
+  for (let z = z0; z <= z1; z += 5) (z % 10 === 0 ? bold : fine).push([x0, y, z], [x1, y, z]);
+  const g = new THREE.Group();
+  // under a demo it is the floor, not the subject: faint, and without the measuring marks
+  if (quiet) { g.add(seg(fine.concat(bold), lineMat(0x2a6f8f, 0.4))); return g; }
+  g.add(seg(fine, lineMat(0x2a6f8f, 0.55)), seg(bold, lineMat(0x6fd6ff, 0.9)));
+  g.add(seg([[-3, y, 0], [3, y, 0], [0, y, -3], [0, y, 3]], lineMat(0xffc84a)));          // under the sheet's centre
+  g.add(ring([0, y, 10], 1.5, lineMat(0xffc84a)));                                         // 10 cm toward you from it
+  return g;
+}
+
 function buildScene() {
   clear(world);
   modelRoot = null;
@@ -573,6 +704,20 @@ function buildScene() {
   // An empty volume must LOOK empty. Drawing it anyway gives a degenerate outline collapsed to one stray
   // line, or three posts stacked in a single column: a lit, plausible, meaningless picture, which is worse
   // than a black screen because it looks like something. The banner says what is wrong instead.
+  demo = demoView = null;
+  if (HAND_SCENES.has(sceneKind)) {
+    // Your hand, and the mat grid to judge the display by. Neither needs the "usable volume" box, which is
+    // empty on this rig, so these scenes are built before that box gets a say.
+    if (gridOn) world.add(matGrid(DEMO_SCENES.has(sceneKind)));
+    if (DEMO_SCENES.has(sceneKind)) {
+      demo = DM.makeDemo(sceneKind, { floorY: -setup.rig.baseDropCm, grab: grabOptions() });
+      demoView = DM.makeDemoView(THREE, demo);
+      world.add(demoView.group);
+    }
+    if (!bridge) flash('The hand comes from gesture_detect.py --rig-bridge: open this page with ?bridge=1');
+    hint();
+    return;
+  }
   if (vol.empty) { hint(); return; }
   if (sceneKind === 'cube') world.add(cubeScene(vol));
   else if (sceneKind === 'posts') world.add(postScene(vol, posts, marks));
@@ -608,7 +753,32 @@ function zedHeadSource(args) {
   return s.reason in ZED_WORDS ? { ...s, message: ZED_WORDS[s.reason] } : s;
 }
 
+// The bridge's head through the SAME gate the page's own tracker goes through: it still has to be stereo,
+// fresh, and somewhere a head could be. Stereo-or-nothing is decided at the bridge (headtrack.py); here a
+// head message with no eye is "looked, none usable", and no message at all is a bridge that is not there.
+function updateEyeFromBridge() {
+  const now = performance.now();
+  const connected = bridgeStats && bridgeStats.state === 'live' && now - bridgeHeadSeenAt < 1000;
+  const live = connected && !!bridgeHead?.eye && now - bridgeStereoAt < BRIDGE_HAND_MS;
+  const candidate = bridgeHead?.eye ? toRig(bridgeHead.eye) : null;
+  source = zedHeadSource({
+    cameras: connected ? 2 : 0, chosen: 2,
+    seeingHead: live || now - bridgeStereoAt < RT.STEREO_GRACE_MS ? 2 : (connected ? 1 : 0),
+    eyeSource: live ? 'stereo' : 'none', msSinceStereo: now - bridgeStereoAt,
+    residualCm: null, swapHint: false, eyeRig: candidate, headRig: setup.head.positionCm,
+  });
+  if (!connected) source = { ...source, message:
+    `No rig bridge at ${bridgeUrl}. Run  python gesture_detect.py --rig-bridge  in gesture_detection/ `
+    + '(it owns the ZED, so do NOT press Start here), or press M for the mouse stand-in.' };
+  else if (!live && bridgeHead && !bridgeHead.eye && source.reason !== 'blink')
+    source = { ...source, message: `The bridge cannot place your head: ${bridgeHead.src}.` };
+  if (pinnedEye) { eyeRig = pinnedEye.slice(); return; }
+  if (mouseMode) { eyeRig = RT.mouseEye(mouseN.x, mouseN.y, setup); return; }
+  if (source.usable && candidate) eyeRig = candidate;
+}
+
 function updateEye() {
+  if (bridge) return updateEyeFromBridge();
   const st = cams.running ? camerasStatus() : null;
   // One ZED IS the pair: two eyes, one exposure, a factory baseline. It counts as two wherever rigtest2
   // counted cameras, and as seeing the head twice exactly when the stereo fuse actually happened.
@@ -670,6 +840,21 @@ addEventListener('fullscreenchange', () => layout());
 let frames = 0, fpsAt = performance.now(), fps = 0;
 function frame(now) {
   updateEye();
+  // One hand, smoothed once, drawn one of two ways, and (in a demo) the thing that picks cubes up. The pinch
+  // rides with the pose: while the smoother is holding a pose through a missed frame, the last pinch holds too.
+  // ...and before any of that, the gate: a frame the bridge is not confident of is not drawn at all - the
+  // hand stays exactly where it last was, pinch included, until a trusted frame arrives or the hold runs out.
+  const freshHand = bridgeHand && now - bridgeHand.at < BRIDGE_HAND_MS;
+  gated = handGate.update(freshHand ? { points: bridgeHand.cam.map(handToRig), pinch: bridgeHand.pinch,
+                                        conf: bridgeHand.quality?.conf ?? bridgeHand.score ?? null, id: bridgeHand.seq } : null, now);
+  handDrawn = handSmooth.update(gated.points, now);
+  const masked = !!demo && handStyle === 'mask';
+  handRig.tint(gated.state !== 'tracking');
+  handRig.update(masked ? null : handDrawn);
+  handMask.update(masked ? handDrawn : null);
+  // the panel is a gauge: it has to say HOLDING while the hand is amber, not half a second later
+  if (stabMode && now - stabPaintedAt > 90) { stabPaintedAt = now; paintStab(); }
+  if (demo) { demo.frozen = gated.state !== 'tracking'; demo.step(handDrawn, handDrawn ? gated.pinch : null, now); demoView.sync(); }
   calibTick(now);
   rc = rigCamera(rig, eyeRig, { viewport });
   applyRigCamera(camera, rc);
@@ -705,7 +890,11 @@ function paintChrome() {
   // One banner, chosen in the order a person would have to fix things. The hard rigCheck warnings and an
   // empty volume used to reach only #readout, which starts hidden - so the commonest way to see this page
   // fail was a black screen with nothing on it and a readout nobody had pressed H for.
-  const msg = RT.bannerFor({ volume: vol, warnings: check.warnings, aim, source, mouse: mouseMode });
+  // The hands scene draws the hand where the hand IS, so the "usable volume" - a box centred on the sheet
+  // that every seat can see all of - is not what decides whether it shows. On this rig that box is empty
+  // (nothing behind the sheet's centre line lands on the panel) while the front half of the slot, where a
+  // hand actually reaches, draws fine; the banner would cover a working picture to report a box nobody needs.
+  const msg = RT.bannerFor({ volume: HAND_SCENES.has(sceneKind) ? null : vol, warnings: check.warnings, aim, source, mouse: mouseMode });
   if (performance.now() < flashUntil) {
     b.className = ''; b.innerHTML = `<b>${escapeHtml(flashText)}</b>`;
   } else if (msg) {
@@ -721,16 +910,74 @@ function paintChrome() {
     // derived value (what a camera half a baseline off the centre line would need) is about nothing.
     r.textContent = RT.readoutLines({ setup: zedSetupForReadout(), rig, eyeRig, source,
                                       status: cams.running ? camerasStatus() : null,
-                                      fps, check, mouse: mouseMode, volume: vol, aim }).join('\n');
+                                      fps, check, mouse: mouseMode, volume: vol, aim }).concat(bridgeLines()).join('\n');
   if (trimMode) paintTrim();
+  if (tuneMode) paintTune();
+  if (stabMode) paintStab();
   if (capturing || hold) paintCalib();
 }
+function bridgeLines() {
+  if (!bridge) return [];
+  const st = bridgeStats || {}, now = performance.now();
+  const hand = bridgeHand && now - bridgeHand.at < BRIDGE_HAND_MS ? bridgeHand.cam.map(handToRig) : null;
+  const f = p => p.map(n => n.toFixed(1).padStart(6)).join(' ');
+  return ['',
+    `bridge ${bridgeUrl}: ${st.state || 'off'}  ${st.fps || 0} fps  ${Math.round(st.latencyMs || 0)} ms old`
+      + (st.error ? `  (${st.error})` : ''),
+    `  head  ${bridgeHead?.eye ? f(toRig(bridgeHead.eye)) + ' cm rig' + (bridgeHead.ipdCm ? `   eyes ${bridgeHead.ipdCm.toFixed(1)} cm apart` : '')
+                              : 'none' + (bridgeHead ? ` - ${bridgeHead.src}` : '')}`,
+    `  hand  ${hand ? `${bridgeHand.handedness}  wrist ${f(hand[0])}   index tip ${f(hand[8])} cm rig` : 'none'}`,
+    `  the page believes: ${whereZed()}, tilted up ${zedAngles().tiltUpDeg}°  (S step 2, or P then - =)`,
+    stabilityLine(), ...demoLines(), ...rulerLines()];
+}
+// The gate, in one line: what this frame's confidence is, against the threshold, and what came of it.
+const GATE_WORDS = { tracking: 'TRACKING', 'holding-unsure': 'HOLDING - not confident, hand kept where it was',
+                     'holding-lost': 'HOLDING - hand not seen, kept where it was', gone: 'no hand' };
+function stabilityLine() {
+  const st = handGate.stats(), q = bridgeHand?.quality, n = v => (Number.isFinite(v) ? v.toFixed(2) : ' -- ');
+  return `  trust  confidence ${n(gated.conf)} against ${setup.stability.minConf.toFixed(2)}  ${GATE_WORDS[gated.state]}`
+    + (st.frames ? `   last 5 s: ${Math.round(st.trusted * 100)}% trusted, lowest ${n(st.lowest)}, typical ${n(st.typical)}` : '')
+    + (q ? `   (${q.views === 2 ? 'both lenses' : 'ONE lens'}, ${q.tri}/21 triangulated)` : '') + '   Q tunes';
+}
+// The grab, in numbers: what the pinch reads right now against the two thresholds, so "it will not pick
+// up" and "it keeps dropping it" can be fixed by looking (; and ' move the thresholds) rather than guessing.
+function demoLines() {
+  if (!demo || demo.kind !== 'grab') return [];
+  const p = bridgeHand?.pinch, st = demo.state, o = demo.machine.options, n = v => (Number.isFinite(v) ? v.toFixed(2) : ' -- ');
+  return [`  grab  gap ${n(st.gap)}  (takes hold below ${o.close.toFixed(2)}, lets go above ${o.open.toFixed(2)};  ; and ' move them)   `
+    + `${st.held ? (st.coasting ? 'HOLDING - hand lost, waiting' : 'HOLDING ' + (demo.world.held || 'nothing')) : demo.world.hot ? 'over ' + demo.world.hot : 'open'}`
+    + (p ? `   bridge: pinch ${n(p.gap)} grab ${n(p.grab)} from ${p.views} view${p.views === 1 ? '' : 's'}` : '   (no pinch on the wire: measured off the joints)')];
+}
+// Numbers a RULER can check, because they involve no rig geometry at all - only what the ZED measured. If
+// these are wrong, or will not hold still, the fault is the tracking and no placement can fix it; if they are
+// right and steady, the tracking is fine and what is left is where things stand in the rig.
+//   - along the bones, wrist to middle fingertip: lay a ruler along the back of your hand. It is the sum of
+//     bone lengths, so it should not change as you curl or turn the hand.
+//   - across the knuckles, index to little finger.
+//   - how far the wrist and the eyes are from the lens: a tape from the front of the ZED.
+function rulerLines() {
+  const now = performance.now(), d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+  const c = bridgeHand && now - bridgeHand.at < BRIDGE_HAND_MS ? bridgeHand.cam : null;
+  const out = ['  check with a ruler (straight from the ZED, no rig numbers in these):'];
+  if (c) {
+    const along = d(c[0], c[9]) + d(c[9], c[10]) + d(c[10], c[11]) + d(c[11], c[12]);
+    handLog.push({ at: now, along }); while (handLog.length && now - handLog[0].at > 2000) handLog.shift();
+    const v = handLog.map(h => h.along), jitter = Math.max(...v) - Math.min(...v);
+    out.push(`    hand   wrist to middle fingertip, along the bones ${along.toFixed(1)} cm  (wandered ${jitter.toFixed(1)} cm in 2 s)`
+           + `   across the knuckles ${d(c[5], c[17]).toFixed(1)} cm   wrist ${d(c[0], [0, 0, 0]).toFixed(0)} cm from the lens`);
+  } else out.push('    hand   none');
+  if (bridgeHead?.eye) out.push(`    head   eyes ${d(bridgeHead.eye, [0, 0, 0]).toFixed(0)} cm from the lens`
+                              + (bridgeHead.ipdCm ? `, ${bridgeHead.ipdCm.toFixed(1)} cm apart` : ''));
+  return out;
+}
+const handLog = [];
 const escapeHtml = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
 function hint() {
   $('hint').textContent = [
-    `scene: ${sceneKind}${droppedName ? ' (' + droppedName + ')' : ''}   1 cube · 2 posts · 3 teapot · 4 dropped .glb`,
-    'S setup   H readout   A measure the ZED’s tilt from your head   M mouse stand-in   T trim   F fullscreen   X panel mounted upside down   V flip the setup page too',
+    `scene: ${sceneKind}${droppedName ? ' (' + droppedName + ')' : ''}   1 cube · 2 posts · 3 teapot · 4 dropped .glb · 5 your hand only · 6 pick things up · 7 press the sheet`,
+    ...(DEMO_SCENES.has(sceneKind) ? ['R start the demo again   O hand drawn in black (hides what is behind it) / as bones   ; \' grab less / more easily'] : []),
+    'S setup   H readout   P place your hand by eye   Q tracking stability   G mat grid   D copy diagnostics   A measure the ZED’s tilt from your head   M mouse stand-in   T trim   F fullscreen   X panel mounted upside down   V flip the setup page too',
   ].join('\n');
 }
 
@@ -752,9 +999,17 @@ function paintTrim() {
 
 let devList = [];
 
+// enumerateDevices() answers a page that has not been granted a camera yet with the right NUMBER of
+// devices and no names at all. This page finds the ZED BY its name, so a nameless list is not "no ZED", it
+// is "not allowed to look yet" - and the only thing that puts the names back is opening some camera once.
+// `some`, not `every`: a devicechange can land while one name has arrived and the other has not, and one
+// readable webcam is not evidence that the ZED beside it is readable too.
 async function refreshDevices() {
   devList = await devices.listCameras();
-  if (devList.length && devList.every(d => !d.label)) {
+  // Not in bridge mode. The probe below OPENS a camera to learn the names, and "some camera" on this rig is
+  // the ZED - which gesture_detect.py is holding through the SDK. At best the probe fails; at worst it wins,
+  // and the bridge loses the camera it is tracking the hand with. A bridged page has no use for the names.
+  if (!bridge && devList.length && devList.some(d => !d.label)) {
     try { const s = await navigator.mediaDevices.getUserMedia({ video: true }); s.getTracks().forEach(t => t.stop()); } catch {}
     devList = await devices.listCameras();
   }
@@ -885,18 +1140,46 @@ const findZed = () => devList.find(d => (d.cls || devices.classifyCamera(d, null
 
 // The ZED's extrinsics, in the TRACKER frame — the same frame rigtest2's webcam pair uses, whose origin is
 // the midpoint between the two lenses, so RT.eyeToRig() and step 4's trim keep working unchanged.
-// cameras.js is handed the LEFT eye: viewsForCamera() puts the other one a baseline along the camera's own
-// +x, which the 180 degree roll sends to the viewer's left, so the left lens is at +baseline/2.
+//
+// The roll used to be 180, on the reasoning that a camera pointed at the viewer sees their right hand on
+// the image's left. At the rig that came out backwards in BOTH axes at once - lean left and the model went
+// right, sit up and it sank - which is exactly what a spurious 180 degree roll about the optical axis does,
+// since Rz(180) is nothing but "negate x and y". So the roll is gone, and two things move with it:
+//   the tilt flips sign, because Rx runs BEFORE Rz in camToWorld's Rz*Ry*Rx - with the roll there, +tilt
+//   pitched the lens up, and without it +tilt pitches it down, so -tilt keeps the camera aimed at the face;
+//   the left lens crosses to -baseline/2, because viewsForCamera() puts the second eye a baseline along the
+//   camera's own +x, and that now runs along the rig's +X instead of against it. Get that one wrong and the
+//   pair is symmetric about the wrong point and everything is 12 cm wide of true.
+// This is a measured sign, not a derived one: it is what the rig does. Put 180 back and the tilt and the
+// lens offset have to go back with it, or the two changes will not cancel.
 function zedTrackerExt() {
   const tilt = zedExt().tiltDeg;
-  return { posCm: [setup.pair.baselineCm / 2, 0, 0], rotDeg: [tilt, 0, 180] };
+  return { posCm: [-setup.pair.baselineCm / 2, 0, 0], rotDeg: [-tilt, 0, 0] };
 }
 
+// Always re-list, never only when the list is empty. gesture_detect.py OPENS the ZED and then reports what
+// it got (`status = cam.open()`, and the message names what could be holding the stream); this page has to
+// identify the camera BEFORE it opens it, and identifying it needs names that only opening one can grant.
+// Gating the refresh on an empty list froze that knot shut: the first enumerate returns one nameless entry
+// per camera, so `devList.length` is truthy, the refresh - and with it the permission prompt that supplies
+// the names - is skipped, findZed() matches nothing, and Start returns before startCameras() ever asks for
+// a camera. The prompt never appears, so "press Start again" takes the same branch for ever. Re-listing
+// costs one enumerateDevices() per press and is exactly what pressing Start again promises to do.
 async function start() {
-  if (!devList.length) await refreshDevices();
+  if (bridge) {
+    flash('Bridge mode: the ZED belongs to gesture_detect.py --rig-bridge, and a camera has one owner. '
+        + 'Nothing to start here - reload without ?bridge=1 to let this page open it instead.');
+    return;
+  }
+  await refreshDevices();
   const zed = findZed();
   if (!zed) {
-    flash('No ZED found. It opens as an ordinary side-by-side webcam — plug it in, allow the camera, and press Start again.');
+    // Which of the two it is matters: one is answered by allowing the camera, the other by plugging it in.
+    flash(devList.some(d => !d.label)
+      ? 'The camera names are hidden until this page has been allowed a camera once, and the ZED is found by '
+        + 'its name. Allow it when the browser asks, then press Start again.'
+      : `No ZED among the ${devList.length} camera(s) here. It opens as an ordinary side-by-side webcam named `
+        + 'ZED — plug it in, check it is not held by ZED Explorer or gesture_detect.py, and press Start again.');
     return;
   }
   setup.cameras.left = setup.cameras.right =
@@ -1075,8 +1358,131 @@ function showSetup(on) {
 function setTrim(on) {
   trimMode = on;
   $('trimflag').classList.toggle('hidden', !on);
-  if (on) { if (capturing) setCapture(false); trimBackup = setup.trimCm.slice(); paintTrim(); }
+  $('trimflag').classList.remove('tune');
+  if (on) { if (capturing) setCapture(false); if (stabMode) setStab(false); trimBackup = setup.trimCm.slice(); paintTrim(); }
 }
+// Where the page believes the ZED's lenses are, in words a tape measure can check. It is on screen because
+// for weeks it was not, and the page spent them believing the camera stood at the other end of the sheet.
+function whereZed() {
+  const y = setup.pair.heightCm, z = setup.pair.depthCm;
+  return `ZED ${Math.abs(z).toFixed(1)} cm ${z < 0 ? 'BEHIND' : 'IN FRONT of'} the sheet centre, ${Math.abs(y).toFixed(1)} cm ${y < 0 ? 'below' : 'ABOVE'} the sheet`;
+}
+// P: place the drawn hand on the real one, by eye. Shares the trim's flag on the glass, one at a time.
+let tuneMode = false, tuneBackup = null;
+function setTune(on) {
+  if (on && !bridge) { flash('The hand comes from gesture_detect.py --rig-bridge: open this page with ?bridge=1'); return; }
+  if (on && trimMode) setTrim(false);
+  tuneMode = on;
+  $('trimflag').classList.toggle('hidden', !on);
+  $('trimflag').classList.toggle('tune', on);
+  if (on) { tuneBackup = { tune: JSON.parse(JSON.stringify(setup.handTune)), tilt: setup.pair.tiltUpDeg, depth: setup.pair.depthCm }; paintTune(); }
+}
+function paintTune() {
+  const t = setup.handTune;
+  $('trimflag').innerHTML = `<b>Placing your hand</b> &nbsp; Enter saves &middot; Esc cancels &middot; 0 resets &middot; shift = fine<br>`
+    + `arrows move it &middot; PgUp/PgDn height &middot; [ ] scale &middot; , . camera tilt &middot; - = camera back / forward<br>`
+    + `<span class="mono">offset ${t.offsetCm.map(n => n.toFixed(1).padStart(5)).join(' ')} cm &nbsp; scale ${t.scale.toFixed(3)} &nbsp; tilt ${zedAngles().tiltUpDeg.toFixed(1)}° &nbsp; ${whereZed()}</span><br>`
+    + `0 FIRST the camera: drawn hand BELOW yours and moving too far &rarr; - &nbsp; above and too little &rarr; =<br>`
+    + `1 sweep sideways: drawn hand still travels further than yours &rarr; [<br>`
+    + `2 hold still: arrows and PgUp/PgDn until it sits on your hand<br>`
+    + `3 push in, pull out: drawn hand climbs or sinks &rarr; , . (moves your head too)`
+    + (bridgeHand && performance.now() - bridgeHand.at < BRIDGE_HAND_MS ? '' : `<br><span class="bad">No hand is arriving from the bridge, so nothing here moves anything.</span>`);
+}
+function tuneKey(e, k) {
+  const fine = e.shiftKey, t = setup.handTune, cm = fine ? 0.1 : 0.5;
+  const move = (axis, d) => { t.offsetCm[axis] = +(t.offsetCm[axis] + d).toFixed(2); };
+  if (k === 'arrowleft') move(0, -cm); else if (k === 'arrowright') move(0, cm);
+  else if (k === 'arrowup') move(2, -cm); else if (k === 'arrowdown') move(2, cm);
+  else if (k === 'pageup') move(1, cm); else if (k === 'pagedown') move(1, -cm);
+  else if (k === '[' || k === '{') t.scale = +Math.max(0.4, t.scale - (fine ? 0.002 : 0.01)).toFixed(3);
+  else if (k === ']' || k === '}') t.scale = +Math.min(2.5, t.scale + (fine ? 0.002 : 0.01)).toFixed(3);
+  else if (k === ',' || k === '<' || k === '.' || k === '>') {
+    const d = (k === ',' || k === '<' ? -1 : 1) * (fine ? 0.1 : 0.5);
+    setup.pair.tiltUpDeg = +Math.max(-20, Math.min(60, zedAngles().tiltUpDeg + d)).toFixed(1);
+    setup.pair.aimManual = true;
+    rebuild();
+  }
+  else if (k === '-' || k === '_' || k === '=' || k === '+') {
+    // Where the camera stands along your line of sight: the number nobody has measured, and the one the
+    // picture is most sensitive to. It moves your head and your hand together, as the real camera would.
+    const d = (k === '-' || k === '_' ? -1 : 1) * (fine ? 0.2 : 1);
+    setup.pair.depthCm = +Math.max(-60, Math.min(60, setup.pair.depthCm + d)).toFixed(1);
+    rebuild();
+  }
+  else if (k === '0') { t.offsetCm = [0, 0, 0]; t.scale = 1; }
+  else if (k === 'enter') { save(); setTune(false); flash('Hand placement saved'); return true; }
+  else if (k === 'escape') {
+    setup.handTune = tuneBackup.tune; setup.pair.tiltUpDeg = tuneBackup.tilt; setup.pair.depthCm = tuneBackup.depth;
+    save(); rebuild(); setTune(false); return true;
+  }
+  else return false;
+  save(); paintTune();
+  return true;
+}
+
+// Q: how much of what the ZED says to believe. Shares the flag on the glass with T and P, one at a time.
+//   up / down      the trust threshold. A frame whose confidence is under it is not drawn: the hand stays
+//                  where it last was. Raise it until the jumps stop; if "trusted" falls much under ~80% the
+//                  hand will feel stuck, and the better cure is light, or the hand nearer the middle.
+//   left / right   how long a held hand stays before it goes.
+//   [ ]  , .       MediaPipe's own thresholds, which live in the bridge: the palm DETECTOR (how sure before a
+//                  hand is picked up at all) and the TRACKER (how sure before a hand it is following is
+//                  dropped and looked for again). Changing one makes the bridge rebuild its landmarkers.
+let stabMode = false, stabBackup = null, configTimer = 0, stabPaintedAt = 0;
+const landmarkerNow = () => bridgeStats?.landmarker || null;
+function setStab(on) {
+  if (on && !bridge) { flash('The hand comes from gesture_detect.py --rig-bridge: open this page with ?bridge=1'); return; }
+  if (on && trimMode) setTrim(false);
+  if (on && tuneMode) setTune(false);
+  stabMode = on;
+  $('trimflag').classList.toggle('hidden', !on);
+  $('trimflag').classList.toggle('tune', on);
+  if (on) { stabBackup = { ...setup.stability, running: landmarkerNow() }; paintStab(); }
+}
+function applyGate() { handGate.options.minConf = setup.stability.minConf; handGate.options.holdMs = setup.stability.holdMs; }
+// The bridge rebuilds two neural networks when asked, so ask once the key has stopped being pressed.
+function askLandmarker() {
+  clearTimeout(configTimer);
+  configTimer = setTimeout(() => {
+    if (!bridge.sendConfig({ detect: setup.stability.detect ?? undefined, track: setup.stability.track ?? undefined }))
+      flash('The bridge is not connected, so its thresholds did not change');
+  }, 350);
+}
+function paintStab() {
+  const s = setup.stability, st = handGate.stats(), q = bridgeHand?.quality, lm = landmarkerNow();
+  const n = v => (Number.isFinite(v) ? v.toFixed(2) : '--'), bar = v => { const k = Math.round(Math.min(1, Math.max(0, v || 0)) * 20); return '#'.repeat(k) + '.'.repeat(20 - k); };
+  const mark = Math.round(s.minConf * 20);
+  $('trimflag').innerHTML = `<b>Tracking stability</b> &nbsp; Enter saves &middot; Esc cancels &middot; 0 resets &middot; shift = big steps<br>`
+    + `<span class="mono">confidence ${n(gated.conf)} [${bar(gated.conf)}]</span> &nbsp; <b>${GATE_WORDS[gated.state]}</b><br>`
+    + `<span class="mono">threshold  ${n(s.minConf)} [${' '.repeat(Math.max(0, mark - 1))}^${' '.repeat(Math.max(0, 20 - mark))}]</span><br>`
+    + (q ? `landmarker ${n(q.score)}${q.other !== null ? ' / ' + n(q.other) : ''} &middot; ${q.views === 2 ? 'both lenses' : '<span class="warn">ONE lens: distance is a guess</span>'} &middot; ${q.tri}/21 joints triangulated<br>` : '')
+    + (st.frames ? `last 5 s: <b>${Math.round(st.trusted * 100)}%</b> of frames trusted &middot; lowest ${n(st.lowest)} &middot; typical ${n(st.typical)}<br>` : '')
+    + `up/down threshold &middot; left/right hold <b>${(s.holdMs / 1000).toFixed(1)} s</b> before a held hand goes<br>`
+    + `[ ] detector <b>${n(s.detect ?? lm?.detect)}</b> &middot; , . tracker <b>${n(s.track ?? lm?.track)}</b>`
+    + (lm ? ` &nbsp; <span class="mono">(bridge is running ${n(lm.detect)} / ${n(lm.track)})</span>` : ' &nbsp; <span class="warn">(bridge has not said what it runs: restart gesture_detect.py)</span>');
+}
+function stabKey(e, k) {
+  const s = setup.stability, big = e.shiftKey, lm = landmarkerNow();
+  const unit = (v, d) => +Math.min(0.95, Math.max(0.05, v + d)).toFixed(2);
+  if (k === 'arrowup' || k === 'arrowdown') s.minConf = +Math.min(1, Math.max(0, s.minConf + (k === 'arrowup' ? 1 : -1) * (big ? 0.05 : 0.01))).toFixed(2);
+  else if (k === 'arrowleft' || k === 'arrowright') s.holdMs = Math.round(Math.min(10000, Math.max(0, s.holdMs + (k === 'arrowright' ? 1 : -1) * (big ? 1000 : 100))));
+  else if (k === '[' || k === '{' || k === ']' || k === '}') { s.detect = unit(s.detect ?? lm?.detect ?? 0.5, (k === '[' || k === '{' ? -1 : 1) * 0.05); askLandmarker(); }
+  else if (k === ',' || k === '<' || k === '.' || k === '>') { s.track = unit(s.track ?? lm?.track ?? 0.3, (k === ',' || k === '<' ? -1 : 1) * 0.05); askLandmarker(); }
+  else if (k === '0') { s.minConf = GATE_DEFAULTS.minConf; s.holdMs = GATE_DEFAULTS.holdMs; }
+  else if (k === 'enter') { save(); setStab(false); flash('Tracking stability saved'); return true; }
+  else if (k === 'escape') {
+    const { running, ...was } = stabBackup;
+    const moved = was.detect !== s.detect || was.track !== s.track;
+    setup.stability = was; applyGate(); save();
+    // put the bridge back too: to what was saved, or - if nothing was - to what it was running when Q opened
+    if (moved && (was.detect ?? running?.detect) != null) bridge.sendConfig({ detect: was.detect ?? running.detect, track: was.track ?? running.track });
+    setStab(false); return true;
+  }
+  else return false;
+  applyGate(); save(); paintStab();
+  return true;
+}
+
 let trimBackup = [0, 0, 0];
 function nudge(axis, amount) {
   setup.trimCm[axis] += amount;
@@ -1345,6 +1751,8 @@ addEventListener('keydown', e => {
   // Back and Ctrl+Left is a word jump, so the trim nudges have to be inside this guard too. Shift is NOT
   // tested: it is the fine step in the trim block. Same guard as js/main.js.
   if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (tuneMode && !typing && tuneKey(e, k)) { e.preventDefault(); paintChrome(); return; }
+  if (stabMode && !typing && stabKey(e, k)) { e.preventDefault(); paintChrome(); return; }
   if (trimMode && !typing) {
     const step = e.shiftKey ? 0.1 : 0.5;
     if (k === 'arrowleft') return nudge(0, -step), e.preventDefault();
@@ -1359,10 +1767,12 @@ addEventListener('keydown', e => {
   else if (k === 'escape') { showSetup(false); setTrim(false); }
   else if (k === 'h') { const on = $('readout').classList.toggle('hidden'); $('hint').classList.toggle('hidden', on); }
   else if (k === 'm') { mouseMode = !mouseMode; pinnedEye = null; flash(mouseMode ? 'Mouse stand-in ON — not head tracking' : 'Mouse stand-in off'); }
-  else if (k === 't') setTrim(!trimMode);
+  else if (k === 't') { if (tuneMode) setTune(false); if (stabMode) setStab(false); setTrim(!trimMode); }
   // The one calibration this rig still has, and it is one key: sit where you sit, press A, and the prop
   // angle is measured from your own head. Everything else about a ZED came from the factory.
   else if (k === 'a') aimAtSeat();
+  else if (k === 'p') { if (stabMode) setStab(false); setTune(!tuneMode); }
+  else if (k === 'q') setStab(!stabMode);
   // Calibration is done on your feet, moving about the volume, so it has to start and stop from the rig
   // view as well as from the setup page.
   else if (k === 'c') setCapture(!capturing);
@@ -1382,8 +1792,65 @@ addEventListener('keydown', e => {
   else if (k === '2') { sceneKind = 'posts'; buildScene(); }
   else if (k === '3') { sceneKind = 'teapot'; buildScene(); }
   else if (k === '4') { sceneKind = 'drop'; buildScene(); }
+  else if (k === '5') { sceneKind = 'hands'; buildScene(); }
+  else if (k === '6') { sceneKind = 'grab'; buildScene(); flash('Pinch a shape, carry it to the platform, let go over its outline. R starts again.'); }
+  else if (k === '7') { sceneKind = 'surface'; buildScene(); flash('Press the sheet with your fingers: the marbles roll into the dents. R starts again.'); }
+  else if (k === 'r' && demo) { demo.reset(); flash('Demo reset'); }
+  else if (k === 'o' && demo) { handStyle = handStyle === 'mask' ? 'bones' : 'mask';
+    flash(handStyle === 'mask' ? 'Hand drawn in black: it hides what is behind it, so your real hand is in front' : 'Hand drawn as bones'); }
+  else if ((k === ';' || k === "'") && demo) {
+    // one number: how closed a pinch has to be. The let-go threshold follows it at a fixed distance.
+    const c = Math.min(0.7, Math.max(0.2, +(setup.demo.grabClose + (k === ';' ? -0.02 : 0.02)).toFixed(2)));
+    setup.demo = { grabClose: c, grabOpen: +(c + 0.22).toFixed(2) }; save();
+    Object.assign(demo.machine.options, grabOptions());
+    flash(`Grab takes hold below ${c.toFixed(2)} and lets go above ${setup.demo.grabOpen.toFixed(2)} - your pinch reads ${Number.isFinite(demo.state.gap) ? demo.state.gap.toFixed(2) : '--'} now (H shows it live)`);
+  }
+  else if (k === 'd') copyDiagnostics();
+  else if (k === 'g') { gridOn = !gridOn; buildScene(); flash(gridOn ? 'Mat grid on (scene 5): 5 cm squares, bright lines every 10' : 'Mat grid off'); }
   paintChrome();      // the banners repaint twice a second otherwise, which reads as a key that did nothing
 });
+
+// D: everything this page believes and everything it is being told, as one block of JSON on the clipboard.
+// The rig is on one desk and whoever is debugging it is somewhere else; a symptom described in words
+// ("the squares are 11.2 cm") fits several causes at once, and the saved setup in THIS browser - which
+// nobody else can see - is often the cause. Pasting this settles in one message what guessing does not.
+function diagnostics() {
+  const now = performance.now(), r3 = a => a && a.map(n => +(+n).toFixed(2));
+  const V = rc?.virtual, hand = bridgeHand && now - bridgeHand.at < BRIDGE_HAND_MS ? bridgeHand : null;
+  const d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+  return {
+    when: new Date().toISOString(), url: location.search,
+    setup,                                                   // the saved numbers: what the page BELIEVES
+    panelCm: RT.monitorSizeCm(setup.rig),
+    window: { inner: [innerWidth, innerHeight], screen: [screen.width, screen.height], dpr: devicePixelRatio,
+              fullscreen: !!document.fullscreenElement, coversPanel: coversPanel(), viewport },
+    virtualImage: V && { tl: r3(V.tl), tr: r3(V.tr), bl: r3(V.bl), br: r3(V.br) },
+    zed: { lensRig: r3(ZP.zedPosition(placement())), tiltUpDeg: zedAngles().tiltUpDeg, camera: bridgeStats?.camera || null },
+    bridge: bridgeStats && { state: bridgeStats.state, fps: bridgeStats.fps, latencyMs: Math.round(bridgeStats.latencyMs || 0), stale: bridgeStats.stale },
+    head: { source, eyeUsedRig: r3(eyeRig), mouse: mouseMode, pinned: !!pinnedEye,
+            bridgeEyeCam: r3(bridgeHead?.eye), bridgeEyeRig: bridgeHead?.eye ? r3(toRig(bridgeHead.eye)) : null,
+            cmFromLens: bridgeHead?.eye ? +d(bridgeHead.eye, [0, 0, 0]).toFixed(1) : null,
+            ipdCm: bridgeHead?.ipdCm ?? null, why: bridgeHead?.src ?? null, msSinceStereo: Math.round(now - bridgeStereoAt) },
+    trust: { state: gated.state, confidence: gated.conf, quality: bridgeHand?.quality ?? null, last5s: handGate.stats(),
+             landmarkerRunning: bridgeStats?.landmarker ?? null },
+    hand: hand && { handedness: hand.handedness, wristCam: r3(hand.cam[0]), wristRig: r3(handToRig(hand.cam[0])),
+                    indexTipRig: r3(handToRig(hand.cam[8])),
+                    alongBonesCm: +(d(hand.cam[0], hand.cam[9]) + d(hand.cam[9], hand.cam[10]) + d(hand.cam[10], hand.cam[11]) + d(hand.cam[11], hand.cam[12])).toFixed(1),
+                    knucklesCm: +d(hand.cam[5], hand.cam[17]).toFixed(1), wristCmFromLens: +d(hand.cam[0], [0, 0, 0]).toFixed(1) },
+    warnings: check?.warnings || [],
+  };
+}
+async function copyDiagnostics() {
+  const text = JSON.stringify(diagnostics(), null, 1);
+  console.log(text);
+  try { await navigator.clipboard.writeText(text); flash('Diagnostics copied to the clipboard - paste them into the chat.'); }
+  catch {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    a.download = 'rig-diagnostics.json'; a.click(); URL.revokeObjectURL(a.href);
+    flash('The clipboard was refused, so the diagnostics were saved as rig-diagnostics.json instead.');
+  }
+}
 
 // Fullscreen on the RIG monitor when the browser will say which screen is which; otherwise on whichever
 // screen this window is on, which is the user's job to get right.
@@ -1407,10 +1874,24 @@ window.rigtest3 = window.rigtest2 = {
   get rig() { return rig; },
   get volume() { return vol; },
   eyeRig: () => eyeRig.slice(),
+  bridge: () => ({ url: bridgeUrl, stats: bridgeStats, head: bridgeHead, source,
+                   handRig: bridgeHand ? bridgeHand.cam.map(handToRig) : null, handVisible: handRig.group.visible }),
+  toRig: p => toRig(p),
+  diagnostics: () => diagnostics(),
   posts: () => posts,
   marks: () => marks,
   probePointRig: () => RT.probePoint(vol),
   scene: k => { sceneKind = k; buildScene(); return sceneKind; },
+  gate: () => ({ ...gated, points: undefined, drawn: !!handDrawn, options: { ...handGate.options }, stats: handGate.stats(),
+                 quality: bridgeHand?.quality ?? null, landmarker: landmarkerNow(), saved: { ...setup.stability },
+                 wrist: handDrawn ? handDrawn[0].map(v => +v.toFixed(2)) : null, tintHeld: gated.state !== 'tracking' }),
+  demo: () => demo && ({ kind: demo.kind, state: demo.state, point: demo.point, handStyle, options: demo.machine.options,
+                         held: demo.world.held ?? null, hot: demo.world.hot ?? null, doneAt: demo.world.doneAt ?? null,
+                         bodies: (demo.world.bodies || []).map(b => ({ id: b.id, pos: b.pos.map(n => +n.toFixed(2)), socket: b.socket })),
+                         sockets: (demo.world.sockets || []).map(q => ({ id: q.id, filledBy: q.filledBy })),
+                         marbles: (demo.world.marbles || []).map(b => ({ id: b.id, pos: b.pos.map(n => +n.toFixed(2)) })),
+                         deepest: demo.world.membrane ? Math.min(...demo.world.membrane.h) : null,
+                         handDrawn: !!handDrawn, maskVisible: handMask.group.visible, bonesVisible: handRig.group.visible }),
   showProbe: on => { probeDot.visible = !!on; return probeDot.visible; },
   // Put the virtual eye exactly here, in rig cm. This is the mouse stand-in with a number instead of a
   // mouse: it is how the maths is proved with no hardware, and it is not tracking.

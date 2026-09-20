@@ -1,0 +1,6 @@
+{
+  "name": "rigtest3",
+  "private": true,
+  "type": "module",
+  "//": "Node-only. Every .js here is an ES module (the page loads them with <script type=\"module\">), but node --test reads a bare .js as CommonJS unless a package.json says otherwise, so `node --test zed-place.test.js` died on its first import line. Nothing is served from this file; it exists so the README's test command works."
+}

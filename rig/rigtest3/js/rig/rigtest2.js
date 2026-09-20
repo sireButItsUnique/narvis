@@ -34,21 +34,36 @@ const round = (x, n = 2) => Math.round(x * 10 ** n) / 10 ** n;
 // Lengths are stored in CENTIMETRES whatever the user typed; `units` only says how to show them, so a
 // switch between inches and cm can never quietly rescale the rig.
 //
-// The defaults ARE this rig, as the user measured it: a 16:9 panel above at 45 degrees facing down and
-// toward them, the acrylic sheet 6 inches below the panel, black paper 6 inches below the sheet, the whole
-// screen used, the picture sent flipped; and the head tracker is two 1080p webcams at sheet height, 40
-// inches apart, angled in.
-export const SETUP_VERSION = 4;
+// The defaults ARE this rig, as the user measured it (2026-09-20, tape measure on the built frame): a 27"
+// 16:9 panel above at 42 degrees facing down and toward them, its BOTTOM edge 13.5 cm above the acrylic,
+// the acrylic 13.5 cm above the mat, the whole screen used, the picture sent flipped; and the head tracker
+// is the one ZED 2 standing under the panel on a 1.5 inch block.
+//
+// Only monitorDropCm is derived rather than measured, because the form asks for the panel CENTRE and a
+// tape measure can only reach the bottom edge: centre = bottom + (h/2)*sin(tilt), which for this panel is
+// 13.5 + 16.81*sin(42) = 24.75. Same step gives the top edge (36.0) that the head position is quoted from.
+//
+// monitorForwardCm and pair.depthCm are the two numbers NOBODY HAS MEASURED: every length on this rig was
+// taken vertically, and nothing fixes where the panel and the camera sit ALONG the viewer's line of sight.
+// They are left at the shipped "centred over the sheet" reading. It is not a harmless default - sweeping it
+// from -6 to +6 cm takes the drawable volume from 20x10 cm to nothing at all - so it is marked here rather
+// than buried: measure the acrylic's depth and how far behind its front edge the panel's bottom edge sits,
+// and these two stop being guesses.
+export const SETUP_VERSION = 7;
 export const DEFAULT_SETUP = {
   version: SETUP_VERSION,
-  units: 'in',
+  units: 'cm',
   rig: {
-    monitorDiagIn: 24,          // 16:9; the only monitor number most people can actually read off the box
+    monitorDiagIn: 27,          // 16:9; the only monitor number most people can actually read off the box
     pixelW: 1920, pixelH: 1080,
-    tiltDeg: 45,                // measured: 0 would face straight down, 45 faces down and at the viewer
-    monitorDropCm: 6 * INCH_CM, // panel centre THIS far above the sheet
-    monitorForwardCm: 0,        // and this far toward the viewer; 0 = straight above the sheet centre
-    baseDropCm: 6 * INCH_CM,    // black paper below the sheet
+    tiltDeg: 45,                // stated by the rig's owner: 0 would face straight down, 45 faces down and at the viewer
+    monitorDropCm: 25.39,       // panel centre THIS far above the sheet: bottom edge 13.5 + (33.62 / 2) * sin(45)
+    monitorForwardCm: 0,        // and this far toward the viewer; 0 = straight above the sheet centre. UNMEASURED.
+    baseDropCm: 13.5,           // the mat below the sheet
+    // The acrylic is not quite level: 2 degrees, front edge low. A mirror tilted by t turns its reflection
+    // by 2t, so this is 4 degrees of pitch on the whole virtual image - about 2 cm across the volume, which
+    // is more than step 4's trim is meant to mop up and is a rotation trim cannot express anyway.
+    sheetTiltDeg: 0,            // "essentially flat". It was entered as 2 once; a mirror's tilt counts double, so ask again if it swims
     sheetWidthCm: 0, sheetDepthCm: 0,   // 0 = "as big as the panel's footprint" (sheetSizeCm below)
     fullScreen: true,
     // The picture must be mirrored once for the sheet; WHICH axis is not a free parameter and is not a
@@ -62,15 +77,25 @@ export const DEFAULT_SETUP = {
     modelFitCm: 11,
   },
   pair: {
-    baselineCm: 40 * INCH_CM,   // measured centre-to-centre
-    heightCm: 0,                // sheet height: the rig frame's origin is the sheet, so this is 0
-    depthCm: 0,                 // how far toward the viewer of the sheet centre the pair sits
-    // The toe-in and tilt are DERIVED, not measured: they are whatever points both lenses at the head
-    // spot below, which is the thing step 1 makes the user physically aim at. Storing them as independent
-    // constants is what let the shipped 14/12 contradict a 40-inch baseline and a head 45 cm away - the
-    // triangulator then decoded that head 159 cm too far away while the page reported healthy tracking.
-    // null = "work it out"; aimManual is set only when the user types an angle by hand.
-    toeInDeg: null, tiltUpDeg: null, aimManual: false,
+    // On this rig the "pair" is the ZED's own two eyes, so the baseline is a factory number and the height
+    // and depth are where the one camera stands. index.html overwrites baselineCm from the placement anyway.
+    baselineCm: 12,             // ZED 2, factory
+    // Lens centre in RIG coordinates, so negative is below the acrylic: the ZED stands on a 1.5 in block
+    // (3.81 cm) on the mat and its lenses sit ~1.5 cm up its own 3 cm body, so 5.31 cm above the mat and
+    // 13.5 - 5.31 = 8.19 cm below the sheet.
+    heightCm: -8.19,
+    depthCm: -12.5,             // under the panel's bottom edge. UNMEASURED - see monitorForwardCm above.
+    // The toe-in is DERIVED, not measured (null = "work it out"): storing it as an independent constant is
+    // what let the shipped 14/12 contradict a 40-inch baseline and a head 45 cm away - the triangulator then
+    // decoded that head 159 cm too far away while the page reported healthy tracking.
+    //
+    // The TILT is a fact about this rig and is stated: 15, propped up on its block at the back of the slot.
+    // A page that believes anything else puts every hand and every head it is told about in the wrong place
+    // - by the sine of the difference times the distance: at 0 instead of 15, a hand 25 cm out lands 6.5 cm
+    // too LOW and a head 75 cm out 19 cm too low, and no offset undoes a rotation. Deriving it ("whatever
+    // points the lens at the head", about 39 degrees here) described a camera nobody built. 15 also happens
+    // to be the angle that holds the slot and a leaning viewer's face in the frame together.
+    toeInDeg: null, tiltUpDeg: 15, aimManual: true,
     dfovDeg: 78,                // Logitech 1080p (C920-family) diagonal field of view
     // The MEASURED relative pose (rig/paircalib.js solvePair), when the user has run step 5. It beats both
     // the derived and the typed angles, because it is the only one of the three that came from data: the
@@ -78,8 +103,18 @@ export const DEFAULT_SETUP = {
     // is switched off, so "go back to the typed angles" and "use the measurement again" are both one press.
     solved: null, useSolved: true,
   },
-  head: { positionCm: [0, 40, 45], sweepXCm: 30, sweepYCm: 12 },   // where a seated viewer's eye sits
+  // Where a seated viewer's eye sits, quoted from the panel's TOP edge (y 36.0, z monitorForwardCm+12.49):
+  // 3.5 cm above it and 33 cm out. The z therefore carries monitorForwardCm's guess with it.
+  head: { positionCm: [0, 39.5, 45.49], sweepXCm: 30, sweepYCm: 12 },
   trimCm: [0, 0, 0],            // the nudge from step 4: it corrects the TRACKER's origin, not the rig
+  handTune: { offsetCm: [0, 0, 0], scale: 1 },   // manual placement of the drawn hand (P); see rig/hands.js
+  // The demo's grab (rig/demo.js makeGrab): the pinch gap, as a fraction of the palm, below which it takes
+  // hold and above which it lets go. People's pinches differ, so it is tunable on the glass (; and ').
+  demo: { grabClose: 0.40, grabOpen: 0.62 },
+  // Which frames of the hand to believe (rig/hands.js makeHandGate; tuned on the glass with Q): below minConf
+  // the hand is held where it last was, for up to holdMs. detect/track are MediaPipe's own thresholds, sent to
+  // the bridge when it connects; null leaves the bridge's command line in charge.
+  stability: { minConf: 0.45, holdMs: 1000, detect: null, track: null },
   cameras: { left: null, right: null },   // { deviceId, label, groupId } chosen in step 1
 };
 
@@ -90,6 +125,18 @@ export function mergeSetup(saved) {
     out[k] = { ...DEFAULT_SETUP[k], ...((saved || {})[k] || {}) };
   const t = (saved || {}).trimCm;
   out.trimCm = Array.isArray(t) && t.length === 3 ? t.map(Number) : [0, 0, 0];
+  const h = (saved || {}).handTune;
+  out.handTune = h && Array.isArray(h.offsetCm) && h.offsetCm.length === 3 && h.offsetCm.every(Number.isFinite)
+    && Number.isFinite(h.scale) && h.scale > 0.3 && h.scale < 3
+    ? { offsetCm: h.offsetCm.map(Number), scale: +h.scale } : { offsetCm: [0, 0, 0], scale: 1 };
+  const st = (saved || {}).stability, unit = v => (Number.isFinite(v) && v >= 0.05 && v <= 0.95 ? +v : null);
+  out.stability = st && Number.isFinite(st.minConf) && st.minConf >= 0 && st.minConf <= 1 && Number.isFinite(st.holdMs)
+    && st.holdMs >= 0 && st.holdMs <= 60000
+    ? { minConf: +st.minConf, holdMs: +st.holdMs, detect: unit(st.detect), track: unit(st.track) } : { ...DEFAULT_SETUP.stability };
+  const d = (saved || {}).demo;
+  out.demo = d && Number.isFinite(d.grabClose) && Number.isFinite(d.grabOpen) && d.grabClose >= 0.15
+    && d.grabOpen <= 1.2 && d.grabOpen > d.grabClose + 0.05
+    ? { grabClose: +d.grabClose, grabOpen: +d.grabOpen } : { ...DEFAULT_SETUP.demo };
   if (!Array.isArray(out.head.positionCm) || out.head.positionCm.length !== 3)
     out.head.positionCm = DEFAULT_SETUP.head.positionCm.slice();
   // Versions before 3 stored hand-picked pair angles that nothing kept in step with the baseline or the
@@ -97,6 +144,33 @@ export function mergeSetup(saved) {
   // forward as if they had been typed.
   if (!(Number((saved || {}).version) >= 3)) {
     out.pair.toeInDeg = null; out.pair.tiltUpDeg = null; out.pair.aimManual = false;
+  }
+  // Before version 5 the tilt was derived or A-measured against a camera assumed to be propped at the face.
+  // The camera sits flat, so a tilt saved under that assumption is a stale guess, not a measurement.
+  if (!(Number((saved || {}).version) >= 5)) {
+    out.pair.tiltUpDeg = DEFAULT_SETUP.pair.tiltUpDeg; out.pair.aimManual = true;
+  }
+  // Version 6: the owner restated the rig - monitor 45, sheet flat, camera up 15. A saved setup from before
+  // carries the old angles, and a hand placement (P) that was dialled in to fight them; both are stale.
+  if (!(Number((saved || {}).version) >= 6)) {
+    out.rig.tiltDeg = DEFAULT_SETUP.rig.tiltDeg; out.rig.monitorDropCm = DEFAULT_SETUP.rig.monitorDropCm;
+    out.rig.sheetTiltDeg = DEFAULT_SETUP.rig.sheetTiltDeg;
+    out.pair.tiltUpDeg = DEFAULT_SETUP.pair.tiltUpDeg; out.pair.aimManual = true;
+    out.handTune = { offsetCm: [0, 0, 0], scale: 1 };
+  }
+  // Version 7: EVERYTHING measured. Until now each new measurement went into DEFAULT_SETUP and reached only
+  // a browser that had never opened the page; one that had kept its saved copy of the page's OLD guesses,
+  // which the merge above prefers because a saved number looks like a typed one. On the owner's rig that was
+  // a 24 inch panel (a 10 cm square drew 11.2), the mat 6 inches down, and the ZED at the FRONT edge of the
+  // sheet (z +22) when it stands at the back (z -12.5): head and hand both placed 34 cm too near the viewer,
+  // so the drawn hand sat 12-17 degrees below the real one, fell off the picture with the hand in the slot,
+  // and moved 1.3x as far. Versions 5 and 6 each reset the two or three numbers then under suspicion and
+  // left the rest; this resets the lot. Nothing typed is lost that was not also said out loud: the defaults
+  // ARE the owner's measurements. Only the camera choice, which describes the PC and not the rig, is kept.
+  if (!(Number((saved || {}).version) >= 7)) {
+    const fresh = JSON.parse(JSON.stringify(DEFAULT_SETUP));
+    for (const k of Object.keys(out)) if (k !== 'cameras') delete out[k];
+    Object.assign(out, fresh, { cameras: out.cameras });
   }
   // A solved pose that is not shaped like one is dropped here rather than being handed to the triangulator
   // to decode into nonsense. localStorage is editable by anything, and a half-written pose is not evidence.
@@ -129,7 +203,10 @@ function buildRig(setup, sheet) {
     monitor: { widthCm: m.widthCm, heightCm: m.heightCm, pixelW: r.pixelW, pixelH: r.pixelH,
                centre: [0, r.monitorDropCm, r.monitorForwardCm], tiltDeg: r.tiltDeg,
                yawDeg: 0, rollDeg: 0, rot180: !!r.rot180, corners: null },
-    sheet: { point: [0, 0, 0], normal: [0, 1, 0], widthCm: sheet.widthCm, depthCm: sheet.depthCm },
+    // The sheet is a mirror, not scenery, so its tilt is optics: geometry.js reflects through whatever
+    // plane this is. Front edge low (the viewer's side) tips the normal toward +Z, which is +sheetTiltDeg.
+    sheet: { point: [0, 0, 0], normal: [0, Math.cos((r.sheetTiltDeg || 0) * DEG), Math.sin((r.sheetTiltDeg || 0) * DEG)],
+             widthCm: sheet.widthCm, depthCm: sheet.depthCm },
     // the model sits ON the base, not floating in the middle of nowhere: that is what the test scenes show
     model: { anchor: [0, baseY + r.modelFitCm / 2, 0], fitCm: r.modelFitCm, yawDeg: 0 },
     flipAxis: r.flipAxis,
@@ -412,7 +489,8 @@ export function bannerFor({ volume = null, warnings = [], aim = null, source = n
   if (hard.length)
     return { kind: 'bad', title: 'The rig numbers do not describe a working rig', text: hard.join(' ') };
   if (aim && !aim.ok)
-    return { kind: 'warn', title: 'The camera angles do not match where your head sits', text: aim.message };
+    // the check may name its own fault: "the angles do not match" is only one of the things it can find
+    return { kind: 'warn', title: aim.title || 'The camera angles do not match where your head sits', text: aim.message };
   if (mouse) return null;                       // the stand-in has its own flag; it is not a fault
   if (source && !source.ok)
     return { kind: source.reason === 'waiting' ? 'warn' : 'bad',
@@ -592,9 +670,15 @@ export function usableVolume(rig, eyes, { marginCm = 1, steps = 16, viewport = n
       + `Fullscreen this rig has ${(full.halfX * 2).toFixed(0)} x ${(full.halfZ * 2).toFixed(0)} cm to draw in.`;
   } else {
     v.reason = 'rig-numbers';
+    // Naming the diagonal and the tilt alone sends people to re-measure the two numbers they are most
+    // likely to have got RIGHT. What the search is really sensitive to is where the panel sits relative to
+    // the sheet: its height sets how far below the sheet the image starts, and its offset along the line of
+    // sight slides the image out from under the viewing arc. On this rig the same panel draws 17 x 13 cm or
+    // nothing at all depending on that offset alone, so it is named here rather than left to be guessed.
     v.message = 'These rig numbers leave nothing drawable from any window: at this tilt and panel size no '
       + 'part of the space under the sheet is in the picture from the whole viewing arc. '
-      + 'Check the monitor diagonal and the tilt in step 3 (press S).';
+      + 'Check, in step 3 (press S): the monitor diagonal, the tilt, how high the panel sits above the '
+      + 'sheet, and how far along your line of sight it sits - that last one moves this the hardest.';
   }
   return v;
 }
