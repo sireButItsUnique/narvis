@@ -10,9 +10,15 @@ export function displayCm() {
   const W = diag * aspect / Math.hypot(aspect, 1);
   return { W, H: W / aspect, cmPerPx: W / screen.width };
 }
+// On the hologram rig "the display" is a stage in the slot (input/bridge.js STAGE), and the picture is whatever
+// the rig camera makes of it - the browser window's size and place on a monitor say nothing about it. So in
+// stage mode the rectangle is the whole stage, always, fullscreen or not.
+let stageMode = false;
+export function useStage(on) { stageMode = !!on; }
 // The canvas rectangle in world coordinates (the "window" we look through).
 export function canvasRect() {
   const { W, H, cmPerPx } = displayCm();
+  if (stageMode) return { x0: -W / 2, x1: W / 2, y0: -H / 2, y1: H / 2, cx: 0, cy: 0, w: W, h: H, W, H };
   let leftPx = 0, topPx = 0;
   if (!document.fullscreenElement) {   // rough estimate when windowed; fullscreen is exact
     const border = Math.max(0, (outerWidth - innerWidth) / 2);

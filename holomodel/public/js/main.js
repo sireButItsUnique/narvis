@@ -2,9 +2,13 @@
 // Fable builds, versions, HUD and the frame loop.
 import * as THREE from 'three';
 import { S, saveSettings } from './settings.js';
-import { renderer, scene, camera, rect, buildRoom, applyOffAxis, renderViews, clayMaterial } from './view.js';
+import { renderer, scene, camera, rect, buildRoom, applyOffAxis, renderViews, clayMaterial, views, setRoomVisible, useStage } from './view.js';
 import { input } from './input/state.js';
-import { startCamera, track, drawDebug, eyeFilt, cam } from './input/webcam.js';
+// Hands and eyes come from the ZED tracker over a socket (input/bridge.js), not from a webcam and MediaPipe in
+// the page; and the picture goes to the hologram rig (rig/output.js), not to a window on a desk.
+import { startBridge, bridgeTick, bridgeStatus, bridgeState, STAGE, WORLD_FROM_RIG, loadSetup, rigFromSetup } from './input/bridge.js';
+import { RigView } from './rig/output.js';
+import { applyRigCamera } from './rig/geometry.js';
 import { updateInteraction, pointedPart, tool, TOOLS, SCULPT_TOOLS, setBrush, setNotify, zoomState } from './interaction.js';
 import * as sculpt from './sculpting.js';
 import { model, parts, showScene, clearScene, scaleBy, setSpin, turnBy, undo, undoDepth, resetPlacement, focusPart,
@@ -38,13 +42,9 @@ $('p-eye').addEventListener('change', () => { S.eye = $('p-eye').value; saveSett
 $('s-diag').addEventListener('change', () => { const v = parseFloat($('s-diag').value); if (v > 5) { S.diagIn = v; saveSettings(); buildRoom(); layout(); } });
 $('p-close').addEventListener('click', () => { $('htw-panel').hidden = true; });
 $('p-cal').addEventListener('click', () => {
-  if (input.mode !== 'camera' || cam.ipdHistory.length < 5 || !cam.video) { flash('Need the webcam running and your face visible'); return; }
-  const med = [...cam.ipdHistory].sort((x, y) => x - y)[Math.floor(cam.ipdHistory.length / 2)];
-  const fNew = S.knownDistCm * med / (S.ipdMm / 10);
-  S.hfovDeg = 2 * Math.atan((cam.video.videoWidth / 2) / fNew) * 180 / Math.PI;
-  S.hfovCalibrated = true;            // from here on it is a measurement, and cameras.js may believe it
-  saveSettings(); syncPanel(); eyeFilt.forEach(fl => fl.reset());
-  flash(`Calibrated: webcam FOV ≈ ${S.hfovDeg.toFixed(1)}°`);
+  // there is no webcam to calibrate any more: the rig, the ZED's place in it and the hand's placement are
+  // all set on the rig page, and saved where this page reads them
+  flash('Calibration lives on the rig page: open /rigtest3.html?bridge=1 (S setup, P hand, Q stability)', 6000);
 });
 
 let flashUntil = 0, flashMsg = '';
@@ -109,16 +109,28 @@ function setTool(mode) {
     flash(`${name} brush, ${tool.brush.toFixed(1)} cm. Pinch on the model and drag.`, 3500);
   } else flash(`${mode[0].toUpperCase()}${mode.slice(1)} mode`, 3500);
 }
+// ---------- the rig ----------
+// The app's world is a box behind "the display". On the rig that box is a stage in the slot under the sheet
+// (input/bridge.js STAGE): the display's size becomes the stage's front face, the room's walls go (every lit
+// pixel is hologram), and the camera is the rig's off-axis one, handed the stage's place in the rig.
+let rigView = null;
+const params = new URLSearchParams(location.search);
+function startRig() {
+  S.diagIn = STAGE.diagIn;
+  useStage(true);
+  const bridgeParam = params.get('bridge');
+  startBridge(/^wss?:/.test(bridgeParam || '') ? bridgeParam : undefined);
+  rigView = new RigView({ rig: rigFromSetup(loadSetup()), renderer, canvas: renderer.domElement, scene,
+                          assumeFullscreen: params.has('full') });
+  begin();
+  setRoomVisible(false);
+  rigView.enter();
+  views.length = 0;
+  views.push({ camera: rigView.camera, viewport: null });
+}
 $('btn-cam').addEventListener('click', async () => {
-  const v = parseFloat($('s-diag').value); if (v > 5) { S.diagIn = v; saveSettings(); }
-  try {
-    await startCamera(status);
-    begin();
-    try { await document.documentElement.requestFullscreen(); } catch (e) {}
-  } catch (e) {
-    console.error(e);
-    status(`Couldn't start the webcam or models (${e.name || 'error'}: ${e.message || e}). Try Mouse mode, or serve this page with "npm start".`);
-  }
+  startRig();
+  try { await document.documentElement.requestFullscreen(); } catch (e) {}
 });
 $('btn-mouse').addEventListener('click', async () => {
   const v = parseFloat($('s-diag').value); if (v > 5) { S.diagIn = v; saveSettings(); }
@@ -549,7 +561,7 @@ addEventListener('keydown', async e => {
   else if (k === 'd') { $('htw-hud').hidden = !$('htw-hud').hidden; $('htw-cam').hidden = !$('htw-cam').hidden || input.mode !== 'camera'; }
   else if (k === 'h') { S.hands = !S.hands; saveSettings(); flash(`Hands ${S.hands ? 'on' : 'off'}`); }
   else if (k === 'p') { S.popout = !S.popout; saveSettings(); layout(); flash(`Pop-out ${S.popout ? 'on: the model can come out in front of the screen' : 'off'}`); }
-  else if (k === 'e') { S.eye = { center: 'left', left: 'right', right: 'center' }[S.eye]; saveSettings(); eyeFilt.forEach(fl => fl.reset()); flash(`Tracking: ${S.eye === 'center' ? 'between eyes' : S.eye + ' eye'}`); }
+  else if (k === 'e') { S.eye = { center: 'left', left: 'right', right: 'center' }[S.eye]; saveSettings(); flash(`Tracking: ${S.eye === 'center' ? 'between eyes' : S.eye + ' eye'}`); }
   else if (k === 'r') { resetPlacement(); flash('Model back in the middle'); }
   else if (k === 'v') { if (started) { S.mic = voice.toggle(); saveSettings(); } }
   else if (k === 't') { S.talk = !S.talk; saveSettings(); if (!S.talk) speaker.stop(); flash(`Spoken replies ${S.talk ? 'on' : 'off'}`); }
@@ -561,7 +573,7 @@ addEventListener('keydown', async e => {
   else if (k === 'arrowleft' || k === 'arrowright') { if (started) { e.preventDefault(); runCommand({ type: 'turn', deg: k === 'arrowleft' ? -30 : 30 }); } }
   else if (k === 'm') {
     if (input.mode === 'camera') { input.mode = 'mouse'; flash('Mouse mode'); }
-    else if (cam.faceLm) { input.mode = 'camera'; flash('Webcam mode'); }
+    else if (input.source === 'bridge') { input.mode = 'camera'; flash('Hands from the ZED'); }
   }
 });
 const onResize = () => { renderer.setSize(innerWidth, innerHeight, false); buildRoom(); layout(); };
@@ -576,17 +588,20 @@ function frame(now) {
 }
 function tick(now) {
   const dt = Math.min(0.1, Math.max(0, now - lastT) / 1000); lastT = now;
-  if (input.mode === 'camera') {
-    try { track(now); }
+  if (input.source === 'bridge') {
+    try { bridgeTick(now); }
     catch (err) { if (now > flashUntil) { console.error('tracking failed', err); flash('Tracking error (see console). Press M for mouse mode.'); } }
   }
   if (!started) { renderViews(); return; }
 
   updateInteraction();
   updateModel(dt);
-  applyOffAxis(input.eye);
+  if (rigView) {
+    // the eye is already in rig centimetres; the scene is in the app's own frame, one translation away
+    rigView.update(bridgeState().eyeRig, { rigFrame: true });
+    applyRigCamera(rigView.camera, rigView.rc, WORLD_FROM_RIG);
+  } else applyOffAxis(input.eye);
   renderViews();
-  drawDebug($('htw-cam'));
   zoomFeedback(now);
 
   frames++;
@@ -600,7 +615,7 @@ function tick(now) {
     $('htw-hud').textContent =
       `mode   ${input.mode}   ${fps.toFixed(0)} fps   tool ${tool.mode}\n` +
       `eye    x ${eye.x.toFixed(1)}  y ${eye.y.toFixed(1)}  z ${eye.z.toFixed(1)} cm\n` +
-      `face   ${cameraMode ? (faceOk ? 'tracking' : 'LOST') : '-'}   ipd ${(cam.ipdHistory.at(-1) || 0).toFixed(1)} px\n` +
+      `face   ${cameraMode ? (faceOk ? 'tracking' : 'LOST') : '-'}   ${bridgeStatus(now).text || 'tracker live'}\n` +
       `${input.hands.map(handLine).join('\n')}\n` +
       `screen ${rect.W.toFixed(1)} x ${rect.H.toFixed(1)} cm   fov ${S.hfovDeg.toFixed(1)}°   ${document.fullscreenElement ? 'fullscreen' : 'WINDOWED'}\n` +
       `voice  ${voice.state}\n` +
@@ -617,7 +632,7 @@ function tick(now) {
   let msg = '';
   if (now < flashUntil) msg = flashMsg;
   else if (!document.fullscreenElement) msg = 'Press F for fullscreen, the 3D is only exact when the page fills the screen';
-  else if (input.mode === 'camera' && now - input.faceSeenAt > 1000) msg = 'Face not found, sit in front of the webcam';
+  else if (input.source === 'bridge' && bridgeStatus(now).text) msg = bridgeStatus(now).text;
   banner.textContent = msg; banner.hidden = !msg;
 }
 
